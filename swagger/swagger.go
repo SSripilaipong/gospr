@@ -2,7 +2,10 @@ package swagger
 
 import (
 	"encoding/json"
+	"fmt"
 	"gospr/builder"
+	"gospr/parser"
+	"strings"
 )
 
 type openAPI struct {
@@ -33,6 +36,7 @@ type parameter struct {
 	In       string `json:"in"`
 	Required bool   `json:"required"`
 	Schema   schema `json:"schema"`
+	Example  any    `json:"example,omitempty"`
 }
 
 type requestBody struct {
@@ -46,9 +50,11 @@ type mediaType struct {
 }
 
 type schema struct {
-	Type       string            `json:"type,omitempty"`
-	Properties map[string]schema `json:"properties,omitempty"`
-	Items      *schema           `json:"items,omitempty"`
+	Type          string            `json:"type,omitempty"`
+	Description   string            `json:"description,omitempty"`
+	Properties    map[string]schema `json:"properties,omitempty"`
+	Items         *schema           `json:"items,omitempty"`
+	MinimumNumber *float64          `json:"minimum,omitempty"`
 }
 
 type response struct {
@@ -80,14 +86,14 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	for _, bc := range plan.Collections {
 		switch spec := bc.Spec.(type) {
 		case builder.GCounterSpec:
-			addGetPath(paths, bc.Name, "Value")
-			addPostPath(paths, bc.Name, "Add")
+			addGetPath(paths, bc.Name, "Value", nil)
+			addPostPath(paths, bc.Name, "Add", []parser.ParamSpec{{Name: "delta", Type: "real0+"}})
 		case builder.CompositeSpec:
-			for queryName := range spec.Queries {
-				addGetPath(paths, bc.Name, queryName)
+			for queryName, qs := range spec.Queries {
+				addGetPath(paths, bc.Name, queryName, qs.Params)
 			}
-			for actionName := range spec.Updates {
-				addPostPath(paths, bc.Name, actionName)
+			for actionName, us := range spec.Updates {
+				addPostPath(paths, bc.Name, actionName, us.Params)
 			}
 		}
 	}
@@ -100,44 +106,98 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	return json.MarshalIndent(spec, "", "  ")
 }
 
-func addGetPath(paths map[string]pathItem, collection, queryName string) {
+func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec) {
 	key := "/api/collections/" + collection + "/" + queryName
-	paths[key] = pathItem{
-		Get: &operation{
-			Summary: queryName + " on " + collection,
-			Parameters: []parameter{
-				{Name: "params", In: "query", Required: false, Schema: schema{Type: "string"}},
-			},
-			Responses: map[string]response{
-				"200": {Description: "Query result"},
-				"400": {Description: "Error"},
-			},
+	op := &operation{
+		Summary: queryName + " on " + collection,
+		Responses: map[string]response{
+			"200": {Description: "Query result"},
+			"400": {Description: "Error"},
 		},
+	}
+	if len(params) > 0 {
+		parts := make([]string, len(params))
+		for i, ps := range params {
+			parts[i] = ps.Name + " (" + ps.Type + ")"
+		}
+		examples := make([]string, len(params))
+		for i, ps := range params {
+			examples[i] = fmt.Sprintf("%v", paramExample(ps))
+		}
+		op.Parameters = []parameter{{
+			Name:     "params",
+			In:       "query",
+			Required: false,
+			Schema:   schema{Type: "string", Description: strings.Join(parts, ", ")},
+			Example:  strings.Join(examples, ","),
+		}}
+	}
+	paths[key] = pathItem{Get: op}
+}
+
+func addPostPath(paths map[string]pathItem, collection, actionName string, params []parser.ParamSpec) {
+	key := "/api/collections/" + collection + "/" + actionName
+	op := &operation{
+		Summary: actionName + " on " + collection,
+		Responses: map[string]response{
+			"200": {Description: "Action applied"},
+			"400": {Description: "Error"},
+		},
+	}
+	var mt mediaType
+	if len(params) == 0 {
+		mt = mediaType{
+			Schema:  schema{Type: "object"},
+			Example: map[string]any{},
+		}
+	} else {
+		itemsSchema := &schema{}
+		if len(params) == 1 {
+			s := paramToSchema(params[0])
+			itemsSchema = &s
+		}
+		vals := make([]any, len(params))
+		for i, p := range params {
+			vals[i] = paramExample(p)
+		}
+		mt = mediaType{
+			Schema: schema{
+				Type: "object",
+				Properties: map[string]schema{
+					"params": {Type: "array", Items: itemsSchema},
+				},
+			},
+			Example: map[string]any{"params": vals},
+		}
+	}
+	op.RequestBody = &requestBody{
+		Required: len(params) > 0,
+		Content:  map[string]mediaType{"application/json": mt},
+	}
+	paths[key] = pathItem{
+		Post: op,
 	}
 }
 
-func addPostPath(paths map[string]pathItem, collection, actionName string) {
-	key := "/api/collections/" + collection + "/" + actionName
-	paths[key] = pathItem{
-		Post: &operation{
-			Summary: actionName + " on " + collection,
-			RequestBody: &requestBody{
-				Required: false,
-				Content: map[string]mediaType{
-					"application/json": {
-						Schema: schema{
-							Type: "object",
-							Properties: map[string]schema{
-								"params": {Type: "array", Items: &schema{}},
-							},
-						},
-					},
-				},
-			},
-			Responses: map[string]response{
-				"200": {Description: "Action applied"},
-				"400": {Description: "Error"},
-			},
-		},
+func paramToSchema(p parser.ParamSpec) schema {
+	switch p.Type {
+	case "int":
+		return schema{Type: "integer"}
+	case "real0+":
+		min := float64(0)
+		return schema{Type: "number", MinimumNumber: &min}
+	default:
+		return schema{}
+	}
+}
+
+func paramExample(p parser.ParamSpec) any {
+	switch p.Type {
+	case "int":
+		return 1
+	case "real0+":
+		return 1.0
+	default:
+		return nil
 	}
 }

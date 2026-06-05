@@ -49,7 +49,8 @@ node/
   node.go             node lifecycle and message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
 
 swagger/
-  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; regenerated on each /deploy
+  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; regenerated on each /deploy; param-aware schemas and examples
+  swagger_test.go
 
 gateway/
   gateway.go          HTTP: POST /api/cluster/deploy, POST /api/collections/{collection}/{action},
@@ -69,7 +70,7 @@ parser/
 ## Extension points
 
 - **New built-in CRDT:** implement `crdt.CRDT`, export a typed constructor (e.g. `NewFoo(...)`), add a case in `builder.buildPrimitive` — no other files change.
-- **New param type:** add it to `knownParamTypes` in `builder.go` and handle it in `crdt/composite.go:validateParam`.
+- **New param type:** add it to `knownParamTypes` in `builder.go`, handle it in `crdt/composite.go:validateParam`, add cases in `swagger/swagger.go:paramToSchema` and `paramExample`.
 - **New user-defined type:** use the DSL; no Go code needed.
 - **New validation rule:** add it in `builder.Build` or `buildComposite`/`buildPrimitive`.
 - **Network propagation of `deployMsg`:** `BuiltPlan` contains only data structs. Use `gob.Register(GCounterSpec{})` / `gob.Register(CompositeSpec{})` for gob, or add a type-discriminator JSON marshaler on `CollectionSpec`.
