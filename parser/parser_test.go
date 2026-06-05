@@ -151,6 +151,37 @@ func TestParse_mixedPlan(t *testing.T) {
 	}
 }
 
+func TestParse_updateDefWithParams(t *testing.T) {
+	plan, err := Parse("update MyType.Up(a real0+) = { counter: counter.Add(a) }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Updates) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(plan.Updates))
+	}
+	ud := plan.Updates[0]
+	if len(ud.Params) != 1 || ud.Params[0].Name != "a" || ud.Params[0].Type != "real0+" {
+		t.Errorf("unexpected params: %+v", ud.Params)
+	}
+	if len(ud.Body) != 1 || ud.Body[0].Call.Args[0] != "a" {
+		t.Errorf("unexpected body: %+v", ud.Body)
+	}
+}
+
+func TestParse_queryDefWithParams(t *testing.T) {
+	plan, err := Parse("query MyType.Scaled(factor real0+) = counter.Value()\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Queries) != 1 {
+		t.Fatalf("expected 1 query, got %d", len(plan.Queries))
+	}
+	qd := plan.Queries[0]
+	if len(qd.Params) != 1 || qd.Params[0].Name != "factor" || qd.Params[0].Type != "real0+" {
+		t.Errorf("unexpected params: %+v", qd.Params)
+	}
+}
+
 func TestParse_typeAndCollectionCoexist(t *testing.T) {
 	input := "# comment\n" +
 		"type T(n int) = { c: GCounter(n) }\n" +

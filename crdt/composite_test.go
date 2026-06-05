@@ -9,13 +9,13 @@ func makeTestComposite(nodeID string) *CompositeCRDT {
 	fieldFactories := map[string]func(string) CRDT{
 		"counter": func(id string) CRDT { return NewGCounter(id, 0) },
 	}
-	queryIndex := map[string]parser.MethodCall{
-		"MyValue": {Field: "counter", Method: "Value"},
+	queries := map[string]parser.QuerySpec{
+		"MyValue": {Body: parser.MethodCall{Field: "counter", Method: "Value"}},
 	}
-	updateIndex := map[string][]parser.FieldUpdate{
-		"AddOne": {{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"1"}}}},
+	updates := map[string]parser.UpdateSpec{
+		"AddOne": {Body: []parser.FieldUpdate{{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"1"}}}}},
 	}
-	return NewComposite(nodeID, fieldFactories, queryIndex, updateIndex)
+	return NewComposite(nodeID, fieldFactories, queries, updates)
 }
 
 func TestComposite_applyAndQuery(t *testing.T) {
@@ -27,7 +27,7 @@ func TestComposite_applyAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.(int64) != 1 {
+	if v.(float64) != 1 {
 		t.Errorf("expected 1, got %v", v)
 	}
 }
@@ -44,7 +44,7 @@ func TestComposite_mergeAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.(int64) != 2 {
+	if v.(float64) != 2 {
 		t.Errorf("expected 2, got %v", v)
 	}
 }

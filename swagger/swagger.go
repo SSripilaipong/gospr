@@ -83,10 +83,10 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 			addGetPath(paths, bc.Name, "Value")
 			addPostPath(paths, bc.Name, "Add")
 		case builder.CompositeSpec:
-			for queryName := range spec.QueryIndex {
+			for queryName := range spec.Queries {
 				addGetPath(paths, bc.Name, queryName)
 			}
-			for actionName := range spec.UpdateIndex {
+			for actionName := range spec.Updates {
 				addPostPath(paths, bc.Name, actionName)
 			}
 		}

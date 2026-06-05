@@ -26,8 +26,8 @@ parser  →  builder  →  node / crdt
 | Layer | Owns |
 |---|---|
 | `parser` | Syntax: text → `Plan` (flat AST slices) |
-| `builder` | Semantics: validates types/args, combines TypeDef+QueryDef+UpdateDef, parses string args to typed values, returns `BuiltPlan` with serializable `CollectionSpec` values (`GCounterSpec`, `CompositeSpec`) — no closures stored |
-| `crdt` | Runtime CRDT logic only — no string parsing, no Plan knowledge; `Query(name string, params []any)` |
+| `builder` | Semantics: validates types/args, combines TypeDef+QueryDef+UpdateDef, parses string args to typed values, returns `BuiltPlan` with serializable `CollectionSpec` values (`GCounterSpec`, `CompositeSpec`) — no closures stored; validates method param types at deploy time |
+| `crdt` | Runtime CRDT logic only — no string parsing, no Plan knowledge; `Query(name string, params []any)`; validates param values at runtime |
 | `node` | Lifecycle + message loop; calls factories from `BuiltPlan` |
 | `gateway` | HTTP; returns 400 on parse/build errors before touching node state; regenerates Swagger on deploy |
 
@@ -42,8 +42,8 @@ builder/
 
 crdt/
   crdt.go             CRDT interface (Query takes params []any) + crdt.New factory
-  gcounter.go         GCounter — NewGCounter(nodeID, initial int64); Value() = initial + sum(counts)
-  composite.go        CompositeCRDT — pre-indexed queryIndex/updateIndex maps; NewComposite takes field factories
+  gcounter.go         GCounter — NewGCounter(nodeID, initial float64); stores float64 counts; Add validates >= 0
+  composite.go        CompositeCRDT — queries/updates map[string]parser.QuerySpec/UpdateSpec; resolves named params from runtime payload
 
 node/
   node.go             node lifecycle and message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
@@ -69,6 +69,7 @@ parser/
 ## Extension points
 
 - **New built-in CRDT:** implement `crdt.CRDT`, export a typed constructor (e.g. `NewFoo(...)`), add a case in `builder.buildPrimitive` — no other files change.
+- **New param type:** add it to `knownParamTypes` in `builder.go` and handle it in `crdt/composite.go:validateParam`.
 - **New user-defined type:** use the DSL; no Go code needed.
 - **New validation rule:** add it in `builder.Build` or `buildComposite`/`buildPrimitive`.
 - **Network propagation of `deployMsg`:** `BuiltPlan` contains only data structs. Use `gob.Register(GCounterSpec{})` / `gob.Register(CompositeSpec{})` for gob, or add a type-discriminator JSON marshaler on `CollectionSpec`.
@@ -81,8 +82,22 @@ collection MyCounter = GCounter(0)
 type MyCounterType(x int) = { counter: GCounter(x) }
 query MyCounterType.MyValue() = counter.Value()
 update MyCounterType.AddOne() = { counter: counter.Add(1) }
+update MyCounterType.Up(a real0+) = { counter: counter.Add(a) }   # runtime param
 collection MyCounter = MyCounterType(0)
 ```
+
+### Method param types
+
+| Type | Meaning | Runtime validation |
+|---|---|---|
+| `int` | integer | none beyond type coercion |
+| `real0+` | non-negative real number | value must be >= 0 (float64) |
+
+- `QueryDef` and `UpdateDef` carry `Params []ParamSpec`; `parser.QuerySpec`/`parser.UpdateSpec` bundle params+body.
+- `CompositeSpec` stores `Queries map[string]parser.QuerySpec` and `Updates map[string]parser.UpdateSpec` (replaces the old `QueryIndex`/`UpdateIndex` pair).
+- Body args that are identifier strings are treated as param references at runtime; digits/floats are literals.
+- Build-time: unknown param types and unresolved body args return errors from `buildComposite`.
+- `GCounter` is float64 throughout (counts, initial, snapshot). `GCounter.Add` enforces `real0+` semantics (>= 0).
 
 ## Parser combinators
 

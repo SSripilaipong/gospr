@@ -21,7 +21,7 @@ type BuiltCollection struct {
 }
 
 type GCounterSpec struct {
-	Initial int64
+	Initial float64
 }
 
 func (s GCounterSpec) New(nodeID string) crdt.CRDT {
@@ -29,9 +29,9 @@ func (s GCounterSpec) New(nodeID string) crdt.CRDT {
 }
 
 type CompositeSpec struct {
-	Fields      map[string]CollectionSpec
-	QueryIndex  map[string]parser.MethodCall
-	UpdateIndex map[string][]parser.FieldUpdate
+	Fields  map[string]CollectionSpec
+	Queries map[string]parser.QuerySpec
+	Updates map[string]parser.UpdateSpec
 }
 
 func (s CompositeSpec) New(nodeID string) crdt.CRDT {
@@ -39,7 +39,7 @@ func (s CompositeSpec) New(nodeID string) crdt.CRDT {
 	for name, spec := range s.Fields {
 		fieldFactories[name] = spec.New
 	}
-	return crdt.NewComposite(nodeID, fieldFactories, s.QueryIndex, s.UpdateIndex)
+	return crdt.NewComposite(nodeID, fieldFactories, s.Queries, s.Updates)
 }
 
 func Build(plan parser.Plan) (BuiltPlan, error) {
@@ -76,10 +76,10 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 func buildPrimitive(name, typeName string, args []string) (BuiltCollection, error) {
 	switch typeName {
 	case "GCounter":
-		var initial int64
+		var initial float64
 		if len(args) > 0 {
 			var err error
-			initial, err = strconv.ParseInt(args[0], 10, 64)
+			initial, err = strconv.ParseFloat(args[0], 64)
 			if err != nil {
 				return BuiltCollection{}, fmt.Errorf("GCounter %q: invalid initial value %q: %w", name, args[0], err)
 			}
@@ -89,6 +89,8 @@ func buildPrimitive(name, typeName string, args []string) (BuiltCollection, erro
 		return BuiltCollection{}, fmt.Errorf("unknown CRDT type: %s", typeName)
 	}
 }
+
+var knownParamTypes = map[string]bool{"int": true, "real0+": true}
 
 func buildComposite(spec parser.CollectionSpec, def parser.TypeDef, queries []parser.QueryDef, updates []parser.UpdateDef) (BuiltCollection, error) {
 	if len(spec.Args) != len(def.Params) {
@@ -116,21 +118,64 @@ func buildComposite(spec parser.CollectionSpec, def parser.TypeDef, queries []pa
 		fieldSpecs[f.Name] = bc.Spec
 	}
 
-	queryIndex := make(map[string]parser.MethodCall, len(queries))
+	querySpecs := make(map[string]parser.QuerySpec, len(queries))
 	for _, q := range queries {
-		queryIndex[q.MethodName] = q.Body
+		for _, p := range q.Params {
+			if !knownParamTypes[p.Type] {
+				return BuiltCollection{}, fmt.Errorf("query %s.%s: unknown param type %q", q.TypeName, q.MethodName, p.Type)
+			}
+		}
+		paramNames := paramNameSet(q.Params)
+		for _, arg := range q.Body.Args {
+			if err := validateBodyArg(arg, paramNames, q.TypeName, q.MethodName); err != nil {
+				return BuiltCollection{}, err
+			}
+		}
+		querySpecs[q.MethodName] = parser.QuerySpec{Params: q.Params, Body: q.Body}
 	}
-	updateIndex := make(map[string][]parser.FieldUpdate, len(updates))
+
+	updateSpecs := make(map[string]parser.UpdateSpec, len(updates))
 	for _, u := range updates {
-		updateIndex[u.MethodName] = u.Body
+		for _, p := range u.Params {
+			if !knownParamTypes[p.Type] {
+				return BuiltCollection{}, fmt.Errorf("update %s.%s: unknown param type %q", u.TypeName, u.MethodName, p.Type)
+			}
+		}
+		paramNames := paramNameSet(u.Params)
+		for _, fu := range u.Body {
+			for _, arg := range fu.Call.Args {
+				if err := validateBodyArg(arg, paramNames, u.TypeName, u.MethodName); err != nil {
+					return BuiltCollection{}, err
+				}
+			}
+		}
+		updateSpecs[u.MethodName] = parser.UpdateSpec{Params: u.Params, Body: u.Body}
 	}
 
 	return BuiltCollection{
 		Name: spec.Name,
 		Spec: CompositeSpec{
-			Fields:      fieldSpecs,
-			QueryIndex:  queryIndex,
-			UpdateIndex: updateIndex,
+			Fields:  fieldSpecs,
+			Queries: querySpecs,
+			Updates: updateSpecs,
 		},
 	}, nil
+}
+
+func paramNameSet(params []parser.ParamSpec) map[string]bool {
+	set := make(map[string]bool, len(params))
+	for _, p := range params {
+		set[p.Name] = true
+	}
+	return set
+}
+
+func validateBodyArg(arg string, paramNames map[string]bool, typeName, methodName string) error {
+	if paramNames[arg] {
+		return nil
+	}
+	if _, err := strconv.ParseFloat(arg, 64); err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s.%s: body arg %q is neither a declared param nor a numeric literal", typeName, methodName, arg)
 }

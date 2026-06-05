@@ -8,15 +8,15 @@ import (
 
 type GCounter struct {
 	nodeID  string
-	counts  map[string]int64
-	initial int64
+	counts  map[string]float64
+	initial float64
 	mu      sync.Mutex
 }
 
-func NewGCounter(nodeID string, initial int64) *GCounter {
+func NewGCounter(nodeID string, initial float64) *GCounter {
 	return &GCounter{
 		nodeID:  nodeID,
-		counts:  make(map[string]int64),
+		counts:  make(map[string]float64),
 		initial: initial,
 	}
 }
@@ -28,9 +28,12 @@ func (g *GCounter) Apply(action string, payload []any) error {
 	if len(payload) < 1 {
 		return fmt.Errorf("Add requires one argument")
 	}
-	n, err := toInt64(payload[0])
+	n, err := toFloat64(payload[0])
 	if err != nil {
 		return err
+	}
+	if n < 0 {
+		return fmt.Errorf("Add requires a non-negative value (real0+), got %v", n)
 	}
 	g.mu.Lock()
 	g.counts[g.nodeID] += n
@@ -53,7 +56,7 @@ func (g *GCounter) Query(name string, params []any) (any, error) {
 
 func (g *GCounter) Snapshot() any {
 	g.mu.Lock()
-	copy := make(map[string]int64, len(g.counts))
+	copy := make(map[string]float64, len(g.counts))
 	for k, v := range g.counts {
 		copy[k] = v
 	}
@@ -62,7 +65,7 @@ func (g *GCounter) Snapshot() any {
 }
 
 func (g *GCounter) Merge(snapshot any) error {
-	remote, ok := snapshot.(map[string]int64)
+	remote, ok := snapshot.(map[string]float64)
 	if !ok {
 		return fmt.Errorf("invalid GCounter snapshot type")
 	}
@@ -76,17 +79,17 @@ func (g *GCounter) Merge(snapshot any) error {
 	return nil
 }
 
-func toInt64(v any) (int64, error) {
+func toFloat64(v any) (float64, error) {
 	switch x := v.(type) {
-	case int64:
-		return x, nil
 	case float64:
-		return int64(x), nil
+		return x, nil
+	case int64:
+		return float64(x), nil
 	case int:
-		return int64(x), nil
+		return float64(x), nil
 	case string:
-		return strconv.ParseInt(x, 10, 64)
+		return strconv.ParseFloat(x, 64)
 	default:
-		return 0, fmt.Errorf("cannot convert %T to int64", v)
+		return 0, fmt.Errorf("cannot convert %T to float64", v)
 	}
 }

@@ -40,12 +40,24 @@ func typeExprP() Parser[typeExpr] {
 	)
 }
 
+func typeNameP() Parser[string] {
+	plus := Or(Map(RuneP('+'), func(_ rune) string { return "+" }), Succeed(""))
+	return Map(Sequence2(IdentP(), plus), func(t Of2[string, string]) string { return t.V1 + t.V2 })
+}
+
 func paramSpecP() Parser[ParamSpec] {
 	return Map(
-		Sequence3(IdentP(), Spaces1P(), IdentP()),
+		Sequence3(IdentP(), Spaces1P(), typeNameP()),
 		func(t Of3[string, struct{}, string]) ParamSpec {
 			return ParamSpec{Name: t.V1, Type: t.V3}
 		},
+	)
+}
+
+func methodParamsP() Parser[[]ParamSpec] {
+	return Map(
+		Sequence3(RuneP('('), SepBy(paramSpecP(), sepP()), RuneP(')')),
+		func(t Of3[rune, []ParamSpec, rune]) []ParamSpec { return t.V2 },
 	)
 }
 
@@ -114,13 +126,13 @@ func typeDefLineP() Parser[lineResult] {
 
 func queryDefLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("query"), Spaces1P()))
-	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), StringP("()"))
+	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), methodParamsP())
 	eq := Sequence3(SpacesP(), RuneP('='), SpacesP())
 	end := Sequence2(SpacesP(), newlineOrEOF())
 	rest := Map(
 		Sequence2(lhs, Prefix(eq, Suffix(end, methodCallP()))),
-		func(t Of2[Of4[string, rune, string, string], MethodCall]) lineResult {
-			return lineResult{queryDef: &QueryDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Body: t.V2}}
+		func(t Of2[Of4[string, rune, string, []ParamSpec], MethodCall]) lineResult {
+			return lineResult{queryDef: &QueryDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Params: t.V1.V4, Body: t.V2}}
 		},
 	)
 	return Prefix(prefix, rest)
@@ -128,13 +140,13 @@ func queryDefLineP() Parser[lineResult] {
 
 func updateDefLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("update"), Spaces1P()))
-	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), StringP("()"))
+	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), methodParamsP())
 	eq := Sequence3(SpacesP(), RuneP('='), SpacesP())
 	end := Sequence2(SpacesP(), newlineOrEOF())
 	rest := Map(
 		Sequence2(lhs, Prefix(eq, Suffix(end, braceBodyP(fieldUpdateP())))),
-		func(t Of2[Of4[string, rune, string, string], []FieldUpdate]) lineResult {
-			return lineResult{updateDef: &UpdateDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Body: t.V2}}
+		func(t Of2[Of4[string, rune, string, []ParamSpec], []FieldUpdate]) lineResult {
+			return lineResult{updateDef: &UpdateDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Params: t.V1.V4, Body: t.V2}}
 		},
 	)
 	return Prefix(prefix, rest)

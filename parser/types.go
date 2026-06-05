@@ -34,6 +34,7 @@ type MethodCall struct {
 type QueryDef struct {
 	TypeName   string
 	MethodName string
+	Params     []ParamSpec
 	Body       MethodCall
 }
 
@@ -45,7 +46,18 @@ type FieldUpdate struct {
 type UpdateDef struct {
 	TypeName   string
 	MethodName string
+	Params     []ParamSpec
 	Body       []FieldUpdate
+}
+
+type QuerySpec struct {
+	Params []ParamSpec
+	Body   MethodCall
+}
+
+type UpdateSpec struct {
+	Params []ParamSpec
+	Body   []FieldUpdate
 }
 
 type Plan struct {
