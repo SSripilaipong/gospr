@@ -7,15 +7,17 @@ import (
 )
 
 type GCounter struct {
-	nodeID string
-	counts map[string]int64
-	mu     sync.Mutex
+	nodeID  string
+	counts  map[string]int64
+	initial int64
+	mu      sync.Mutex
 }
 
-func newGCounter(nodeID string) *GCounter {
+func newGCounter(nodeID string, initial int64) *GCounter {
 	return &GCounter{
-		nodeID: nodeID,
-		counts: make(map[string]int64),
+		nodeID:  nodeID,
+		counts:  make(map[string]int64),
+		initial: initial,
 	}
 }
 
@@ -41,7 +43,7 @@ func (g *GCounter) Query(name string) (any, error) {
 		return nil, fmt.Errorf("unknown query: %s", name)
 	}
 	g.mu.Lock()
-	var sum int64
+	sum := g.initial
 	for _, v := range g.counts {
 		sum += v
 	}
