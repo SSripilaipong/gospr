@@ -13,22 +13,40 @@ go vet ./...
 
 Three nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls.
 
-- `POST /deploy` → DSL parsed into a `Plan` → node initializes and propagates `deployMsg` to peers
+- `POST /deploy` → DSL parsed → builder validates and constructs factories → node initializes and propagates `deployMsg` to peers
 - Every ~2s each node gossips a snapshot to one random peer; peer merges via per-key max
 - Node lifecycle: `Uninitialized → Initialized` (one-way, idempotent)
+
+## Layer responsibilities
+
+```
+parser  →  builder  →  node / crdt
+```
+
+| Layer | Owns |
+|---|---|
+| `parser` | Syntax: text → `Plan` (flat AST slices) |
+| `builder` | Semantics: validates types/args, combines TypeDef+QueryDef+UpdateDef, parses string args to typed values, returns `BuiltPlan` with `func(nodeID) crdt.CRDT` factories |
+| `crdt` | Runtime CRDT logic only — no string parsing, no Plan knowledge |
+| `node` | Lifecycle + message loop; calls factories from `BuiltPlan` |
+| `gateway` | HTTP; returns 400 on parse/build errors before touching node state |
 
 ## File map
 
 ```
 main.go               wires 3 nodes + gateways, connects peer inboxes
 
+builder/
+  builder.go          Build(Plan) → BuiltPlan; all type dispatch + arg validation here
+  builder_test.go
+
 crdt/
-  crdt.go             CRDT interface + built-in factory (crdt.New)
-  gcounter.go         GCounter — counts map + initial offset; Value() = initial + sum(counts)
-  composite.go        CompositeCRDT — per-field delegation for user-defined types
+  crdt.go             CRDT interface only
+  gcounter.go         GCounter — NewGCounter(nodeID, initial int64); Value() = initial + sum(counts)
+  composite.go        CompositeCRDT — pre-indexed queryIndex/updateIndex maps; NewComposite takes field factories
 
 node/
-  node.go             node lifecycle and message loop
+  node.go             node lifecycle and message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
 
 gateway/
   gateway.go          HTTP: POST /deploy, POST /{collection}, GET /{collection}/{query}
@@ -45,8 +63,9 @@ parser/
 
 ## Extension points
 
-- **New built-in CRDT:** implement `crdt.CRDT` and add a case in `crdt.New` — no other files change.
+- **New built-in CRDT:** implement `crdt.CRDT`, export a typed constructor (e.g. `NewFoo(...)`), add a case in `builder.buildPrimitive` — no other files change.
 - **New user-defined type:** use the DSL; no Go code needed.
+- **New validation rule:** add it in `builder.Build` or `buildComposite`/`buildPrimitive`.
 
 ## DSL syntax
 

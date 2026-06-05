@@ -2,8 +2,9 @@ package gateway
 
 import (
 	"encoding/json"
-	"gospr/parser"
+	"gospr/builder"
 	"gospr/node"
+	"gospr/parser"
 	"io"
 	"log"
 	"net/http"
@@ -40,11 +41,16 @@ func (g *Gateway) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := g.node.Initialize(plan); err != nil {
+	built, err := builder.Build(plan)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := g.node.Initialize(built); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	g.node.PropagatePlan(plan)
+	g.node.PropagatePlan(built)
 	w.WriteHeader(http.StatusOK)
 }
 

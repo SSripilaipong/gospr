@@ -7,53 +7,33 @@ import (
 )
 
 type CompositeCRDT struct {
-	queries []parser.QueryDef
-	updates []parser.UpdateDef
-	fields  map[string]CRDT
-	mu      sync.RWMutex
+	fields      map[string]CRDT
+	queryIndex  map[string]parser.MethodCall
+	updateIndex map[string][]parser.FieldUpdate
+	mu          sync.RWMutex
 }
 
-func NewComposite(def parser.TypeDef, queries []parser.QueryDef, updates []parser.UpdateDef, args []string, nodeID string) (*CompositeCRDT, error) {
-	if len(args) != len(def.Params) {
-		return nil, fmt.Errorf("type %s expects %d args, got %d", def.Name, len(def.Params), len(args))
+func NewComposite(
+	nodeID string,
+	fieldFactories map[string]func(string) CRDT,
+	queryIndex map[string]parser.MethodCall,
+	updateIndex map[string][]parser.FieldUpdate,
+) *CompositeCRDT {
+	fields := make(map[string]CRDT, len(fieldFactories))
+	for name, factory := range fieldFactories {
+		fields[name] = factory(nodeID)
 	}
-	params := make(map[string]string, len(def.Params))
-	for i, p := range def.Params {
-		params[p.Name] = args[i]
-	}
-	fields := make(map[string]CRDT, len(def.Fields))
-	for _, f := range def.Fields {
-		resolved := make([]string, len(f.Args))
-		for i, a := range f.Args {
-			if v, ok := params[a]; ok {
-				resolved[i] = v
-			} else {
-				resolved[i] = a
-			}
-		}
-		c, err := New(f.CRDTType, resolved, nodeID)
-		if err != nil {
-			return nil, fmt.Errorf("field %s: %w", f.Name, err)
-		}
-		fields[f.Name] = c
-	}
-	return &CompositeCRDT{queries: queries, updates: updates, fields: fields}, nil
+	return &CompositeCRDT{fields: fields, queryIndex: queryIndex, updateIndex: updateIndex}
 }
 
 func (c *CompositeCRDT) Apply(action string, payload []any) error {
-	var ud *parser.UpdateDef
-	for i := range c.updates {
-		if c.updates[i].MethodName == action {
-			ud = &c.updates[i]
-			break
-		}
-	}
-	if ud == nil {
+	body, ok := c.updateIndex[action]
+	if !ok {
 		return fmt.Errorf("unknown action: %s", action)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, fu := range ud.Body {
+	for _, fu := range body {
 		field, ok := c.fields[fu.Field]
 		if !ok {
 			return fmt.Errorf("unknown field: %s", fu.Field)
@@ -70,23 +50,17 @@ func (c *CompositeCRDT) Apply(action string, payload []any) error {
 }
 
 func (c *CompositeCRDT) Query(name string) (any, error) {
-	var qd *parser.QueryDef
-	for i := range c.queries {
-		if c.queries[i].MethodName == name {
-			qd = &c.queries[i]
-			break
-		}
-	}
-	if qd == nil {
+	body, ok := c.queryIndex[name]
+	if !ok {
 		return nil, fmt.Errorf("unknown query: %s", name)
 	}
 	c.mu.RLock()
-	field, ok := c.fields[qd.Body.Field]
+	field, ok := c.fields[body.Field]
 	c.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown field: %s", qd.Body.Field)
+		return nil, fmt.Errorf("unknown field: %s", body.Field)
 	}
-	return field.Query(qd.Body.Method)
+	return field.Query(body.Method)
 }
 
 func (c *CompositeCRDT) Snapshot() any {

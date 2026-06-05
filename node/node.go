@@ -2,8 +2,8 @@ package node
 
 import (
 	"fmt"
+	"gospr/builder"
 	"gospr/crdt"
-	"gospr/parser"
 	"log"
 	"math/rand"
 	"sync"
@@ -23,7 +23,7 @@ type gossipMsg struct {
 }
 
 type deployMsg struct {
-	plan parser.Plan
+	built builder.BuiltPlan
 }
 
 type Node struct {
@@ -56,44 +56,22 @@ func (n *Node) Start() {
 	go n.runGossip()
 }
 
-func (n *Node) Initialize(plan parser.Plan) error {
+func (n *Node) Initialize(plan builder.BuiltPlan) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.state == Initialized {
 		return nil
 	}
-	typeMap := make(map[string]parser.TypeDef, len(plan.Types))
-	for _, td := range plan.Types {
-		typeMap[td.Name] = td
-	}
-	queryMap := make(map[string][]parser.QueryDef)
-	for _, qd := range plan.Queries {
-		queryMap[qd.TypeName] = append(queryMap[qd.TypeName], qd)
-	}
-	updateMap := make(map[string][]parser.UpdateDef)
-	for _, ud := range plan.Updates {
-		updateMap[ud.TypeName] = append(updateMap[ud.TypeName], ud)
-	}
-	for _, spec := range plan.Collections {
-		var c crdt.CRDT
-		var err error
-		if td, ok := typeMap[spec.Type]; ok {
-			c, err = crdt.NewComposite(td, queryMap[spec.Type], updateMap[spec.Type], spec.Args, n.id)
-		} else {
-			c, err = crdt.New(spec.Type, spec.Args, n.id)
-		}
-		if err != nil {
-			return fmt.Errorf("node %s: %w", n.id, err)
-		}
-		n.collections[spec.Name] = c
+	for _, bc := range plan.Collections {
+		n.collections[bc.Name] = bc.New(n.id)
 	}
 	n.state = Initialized
 	log.Printf("[%s] initialized with %d collection(s)", n.id, len(n.collections))
 	return nil
 }
 
-func (n *Node) PropagatePlan(plan parser.Plan) {
-	msg := deployMsg{plan: plan}
+func (n *Node) PropagatePlan(plan builder.BuiltPlan) {
+	msg := deployMsg{built: plan}
 	for _, peer := range n.peers {
 		peer <- msg
 	}
@@ -170,7 +148,7 @@ func (n *Node) runMessageLoop() {
 				n.MergeSnapshot(m.snapshot)
 			}
 		case deployMsg:
-			if err := n.Initialize(m.plan); err != nil {
+			if err := n.Initialize(m.built); err != nil {
 				log.Printf("[%s] deploy error: %v", n.id, err)
 			}
 		}

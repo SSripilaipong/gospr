@@ -13,7 +13,7 @@ type GCounter struct {
 	mu      sync.Mutex
 }
 
-func newGCounter(nodeID string, initial int64) *GCounter {
+func NewGCounter(nodeID string, initial int64) *GCounter {
 	return &GCounter{
 		nodeID:  nodeID,
 		counts:  make(map[string]int64),
