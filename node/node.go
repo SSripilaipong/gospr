@@ -87,14 +87,14 @@ func (n *Node) Apply(collection, action string, payload []any) error {
 	return c.Apply(action, payload)
 }
 
-func (n *Node) Query(collection, queryName string) (any, error) {
+func (n *Node) Query(collection, queryName string, params []any) (any, error) {
 	n.mu.RLock()
 	c, ok := n.collections[collection]
 	n.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("collection %q not found", collection)
 	}
-	return c.Query(queryName)
+	return c.Query(queryName, params)
 }
 
 func (n *Node) Snapshot() map[string]any {

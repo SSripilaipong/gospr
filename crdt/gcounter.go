@@ -38,7 +38,7 @@ func (g *GCounter) Apply(action string, payload []any) error {
 	return nil
 }
 
-func (g *GCounter) Query(name string) (any, error) {
+func (g *GCounter) Query(name string, params []any) (any, error) {
 	if name != "Value" {
 		return nil, fmt.Errorf("unknown query: %s", name)
 	}

@@ -23,7 +23,7 @@ func TestComposite_applyAndQuery(t *testing.T) {
 	if err := c.Apply("AddOne", nil); err != nil {
 		t.Fatal(err)
 	}
-	v, err := c.Query("MyValue")
+	v, err := c.Query("MyValue", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestComposite_mergeAndSnapshot(t *testing.T) {
 	if err := c1.Merge(c2.Snapshot()); err != nil {
 		t.Fatal(err)
 	}
-	v, err := c1.Query("MyValue")
+	v, err := c1.Query("MyValue", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestComposite_unknownAction(t *testing.T) {
 
 func TestComposite_unknownQuery(t *testing.T) {
 	c := makeTestComposite("node1")
-	if _, err := c.Query("NoSuchQuery"); err == nil {
+	if _, err := c.Query("NoSuchQuery", nil); err == nil {
 		t.Fatal("expected error for unknown query")
 	}
 }

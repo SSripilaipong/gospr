@@ -2,28 +2,40 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"gospr/builder"
 	"gospr/node"
 	"gospr/parser"
+	"gospr/swagger"
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
 )
 
 type Gateway struct {
-	node *node.Node
-	addr string
+	node        *node.Node
+	addr        string
+	swaggerJSON []byte
+	swaggerMu   sync.RWMutex
 }
 
 func New(n *node.Node, addr string) *Gateway {
-	return &Gateway{node: n, addr: addr}
+	g := &Gateway{node: n, addr: addr}
+	if data, err := swagger.Generate(builder.BuiltPlan{}); err == nil {
+		g.swaggerJSON = data
+	}
+	return g
 }
 
 func (g *Gateway) Start() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /deploy", g.handleDeploy)
-	mux.HandleFunc("POST /{collection}", g.handleApply)
-	mux.HandleFunc("GET /{collection}/{query}", g.handleQuery)
+	mux.HandleFunc("POST /api/cluster/deploy", g.handleDeploy)
+	mux.HandleFunc("POST /api/collections/{collection}/{action}", g.handleApply)
+	mux.HandleFunc("GET /api/collections/{collection}/{query}", g.handleQuery)
+	mux.HandleFunc("GET /api/swagger.json", g.handleSwagger)
+	mux.HandleFunc("GET /api/docs", g.handleDocs)
 	log.Printf("[%s] listening on %s", g.node.ID(), g.addr)
 	if err := http.ListenAndServe(g.addr, mux); err != nil {
 		log.Fatalf("gateway %s: %v", g.addr, err)
@@ -51,22 +63,27 @@ func (g *Gateway) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.node.PropagatePlan(built)
+	if data, err := swagger.Generate(built); err == nil {
+		g.swaggerMu.Lock()
+		g.swaggerJSON = data
+		g.swaggerMu.Unlock()
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
-type commandRequest struct {
-	Action  string `json:"action"`
-	Payload []any  `json:"payload"`
+type applyRequest struct {
+	Params []any `json:"params"`
 }
 
 func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
-	var cmd commandRequest
-	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+	action := r.PathValue("action")
+	var req applyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if err := g.node.Apply(collection, cmd.Action, cmd.Payload); err != nil {
+	if err := g.node.Apply(collection, action, req.Params); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -76,7 +93,13 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	query := r.PathValue("query")
-	val, err := g.node.Query(collection, query)
+	var params []any
+	if raw := r.URL.Query().Get("params"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			params = append(params, s)
+		}
+	}
+	val, err := g.node.Query(collection, query, params)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -84,3 +107,35 @@ func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(val)
 }
+
+func (g *Gateway) handleSwagger(w http.ResponseWriter, r *http.Request) {
+	g.swaggerMu.RLock()
+	data := g.swaggerJSON
+	g.swaggerMu.RUnlock()
+	if data == nil {
+		http.Error(w, "no plan deployed yet", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+func (g *Gateway) handleDocs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, swaggerUIHTML)
+}
+
+const swaggerUIHTML = `<!DOCTYPE html>
+<html>
+<head>
+  <title>gospr API</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({ url: "/api/swagger.json", dom_id: "#swagger-ui" })
+  </script>
+</body>
+</html>`

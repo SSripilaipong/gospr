@@ -13,7 +13,7 @@ go vet ./...
 
 Three nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls.
 
-- `POST /deploy` → DSL parsed → builder validates and constructs factories → node initializes and propagates `deployMsg` to peers
+- `POST /api/cluster/deploy` → DSL parsed → builder validates and constructs factories → node initializes and propagates `deployMsg` to peers
 - Every ~2s each node gossips a snapshot to one random peer; peer merges via per-key max
 - Node lifecycle: `Uninitialized → Initialized` (one-way, idempotent)
 
@@ -27,9 +27,9 @@ parser  →  builder  →  node / crdt
 |---|---|
 | `parser` | Syntax: text → `Plan` (flat AST slices) |
 | `builder` | Semantics: validates types/args, combines TypeDef+QueryDef+UpdateDef, parses string args to typed values, returns `BuiltPlan` with serializable `CollectionSpec` values (`GCounterSpec`, `CompositeSpec`) — no closures stored |
-| `crdt` | Runtime CRDT logic only — no string parsing, no Plan knowledge |
+| `crdt` | Runtime CRDT logic only — no string parsing, no Plan knowledge; `Query(name string, params []any)` |
 | `node` | Lifecycle + message loop; calls factories from `BuiltPlan` |
-| `gateway` | HTTP; returns 400 on parse/build errors before touching node state |
+| `gateway` | HTTP; returns 400 on parse/build errors before touching node state; regenerates Swagger on deploy |
 
 ## File map
 
@@ -41,15 +41,20 @@ builder/
   builder_test.go
 
 crdt/
-  crdt.go             CRDT interface only
+  crdt.go             CRDT interface (Query takes params []any) + crdt.New factory
   gcounter.go         GCounter — NewGCounter(nodeID, initial int64); Value() = initial + sum(counts)
   composite.go        CompositeCRDT — pre-indexed queryIndex/updateIndex maps; NewComposite takes field factories
 
 node/
   node.go             node lifecycle and message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
 
+swagger/
+  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; regenerated on each /deploy
+
 gateway/
-  gateway.go          HTTP: POST /deploy, POST /{collection}, GET /{collection}/{query}
+  gateway.go          HTTP: POST /api/cluster/deploy, POST /api/collections/{collection}/{action},
+                      GET /api/collections/{collection}/{query}?params=...,
+                      GET /api/swagger.json, GET /api/docs (Swagger UI)
 
 parser/
   types.go            AST types and Plan

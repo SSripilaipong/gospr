@@ -49,7 +49,7 @@ func (c *CompositeCRDT) Apply(action string, payload []any) error {
 	return nil
 }
 
-func (c *CompositeCRDT) Query(name string) (any, error) {
+func (c *CompositeCRDT) Query(name string, params []any) (any, error) {
 	body, ok := c.queryIndex[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown query: %s", name)
@@ -60,7 +60,7 @@ func (c *CompositeCRDT) Query(name string) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown field: %s", body.Field)
 	}
-	return field.Query(body.Method)
+	return field.Query(body.Method, params)
 }
 
 func (c *CompositeCRDT) Snapshot() any {
