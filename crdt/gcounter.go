@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 )
 
@@ -81,6 +82,8 @@ func toInt64(v any) (int64, error) {
 		return int64(x), nil
 	case int:
 		return int64(x), nil
+	case string:
+		return strconv.ParseInt(x, 10, 64)
 	default:
 		return 0, fmt.Errorf("cannot convert %T to int64", v)
 	}

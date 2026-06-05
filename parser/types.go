@@ -8,8 +8,51 @@ type CollectionSpec struct {
 	Args []string
 }
 
+type ParamSpec struct {
+	Name string
+	Type string
+}
+
+type FieldSpec struct {
+	Name     string
+	CRDTType string
+	Args     []string
+}
+
+type TypeDef struct {
+	Name   string
+	Params []ParamSpec
+	Fields []FieldSpec
+}
+
+type MethodCall struct {
+	Field  string
+	Method string
+	Args   []string
+}
+
+type QueryDef struct {
+	TypeName   string
+	MethodName string
+	Body       MethodCall
+}
+
+type FieldUpdate struct {
+	Field string
+	Call  MethodCall
+}
+
+type UpdateDef struct {
+	TypeName   string
+	MethodName string
+	Body       []FieldUpdate
+}
+
 type Plan struct {
 	Collections []CollectionSpec
+	Types       []TypeDef
+	Queries     []QueryDef
+	Updates     []UpdateDef
 }
 
 type ParseError struct {

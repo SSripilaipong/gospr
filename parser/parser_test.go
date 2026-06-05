@@ -81,3 +81,89 @@ func TestParse_errorHasPosition(t *testing.T) {
 		t.Errorf("expected non-zero line/col, got line=%d col=%d", pe.Line, pe.Col)
 	}
 }
+
+func TestParse_typeDef(t *testing.T) {
+	plan, err := Parse("type MyType(x int) = { counter: GCounter(x) }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Types) != 1 {
+		t.Fatalf("expected 1 type, got %d", len(plan.Types))
+	}
+	td := plan.Types[0]
+	if td.Name != "MyType" {
+		t.Errorf("unexpected type name: %s", td.Name)
+	}
+	if len(td.Params) != 1 || td.Params[0].Name != "x" || td.Params[0].Type != "int" {
+		t.Errorf("unexpected params: %+v", td.Params)
+	}
+	if len(td.Fields) != 1 || td.Fields[0].Name != "counter" || td.Fields[0].CRDTType != "GCounter" || td.Fields[0].Args[0] != "x" {
+		t.Errorf("unexpected fields: %+v", td.Fields)
+	}
+}
+
+func TestParse_queryDef(t *testing.T) {
+	plan, err := Parse("query MyType.MyValue() = counter.Value()\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Queries) != 1 {
+		t.Fatalf("expected 1 query, got %d", len(plan.Queries))
+	}
+	qd := plan.Queries[0]
+	if qd.TypeName != "MyType" || qd.MethodName != "MyValue" {
+		t.Errorf("unexpected query header: %+v", qd)
+	}
+	if qd.Body.Field != "counter" || qd.Body.Method != "Value" || len(qd.Body.Args) != 0 {
+		t.Errorf("unexpected query body: %+v", qd.Body)
+	}
+}
+
+func TestParse_updateDef(t *testing.T) {
+	plan, err := Parse("update MyType.AddOne() = { counter: counter.Add(1) }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Updates) != 1 {
+		t.Fatalf("expected 1 update, got %d", len(plan.Updates))
+	}
+	ud := plan.Updates[0]
+	if ud.TypeName != "MyType" || ud.MethodName != "AddOne" {
+		t.Errorf("unexpected update header: %+v", ud)
+	}
+	if len(ud.Body) != 1 || ud.Body[0].Field != "counter" || ud.Body[0].Call.Field != "counter" || ud.Body[0].Call.Method != "Add" || ud.Body[0].Call.Args[0] != "1" {
+		t.Errorf("unexpected update body: %+v", ud.Body)
+	}
+}
+
+func TestParse_mixedPlan(t *testing.T) {
+	input := "type MyType(x int) = { counter: GCounter(x) }\n" +
+		"query MyType.MyValue() = counter.Value()\n" +
+		"update MyType.AddOne() = { counter: counter.Add(1) }\n" +
+		"collection MyCounter = MyType(0)\n"
+	plan, err := Parse(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Types) != 1 || len(plan.Queries) != 1 || len(plan.Updates) != 1 || len(plan.Collections) != 1 {
+		t.Errorf("unexpected plan: types=%d queries=%d updates=%d collections=%d",
+			len(plan.Types), len(plan.Queries), len(plan.Updates), len(plan.Collections))
+	}
+}
+
+func TestParse_typeAndCollectionCoexist(t *testing.T) {
+	input := "# comment\n" +
+		"type T(n int) = { c: GCounter(n) }\n" +
+		"unknown line\n" +
+		"collection X = GCounter(0)\n"
+	plan, err := Parse(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Types) != 1 || plan.Types[0].Name != "T" {
+		t.Errorf("unexpected types: %+v", plan.Types)
+	}
+	if len(plan.Collections) != 1 || plan.Collections[0].Name != "X" {
+		t.Errorf("unexpected collections: %+v", plan.Collections)
+	}
+}

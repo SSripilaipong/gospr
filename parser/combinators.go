@@ -115,6 +115,32 @@ func Sequence4[A, B, C, D any](p1 Parser[A], p2 Parser[B], p3 Parser[C], p4 Pars
 	}
 }
 
+func Sequence5[A, B, C, D, E any](p1 Parser[A], p2 Parser[B], p3 Parser[C], p4 Parser[D], p5 Parser[E]) Parser[Of5[A, B, C, D, E]] {
+	return func(s Stream) ParseResult[Of5[A, B, C, D, E]] {
+		r1 := p1(s)
+		if !r1.Ok {
+			return failure[Of5[A, B, C, D, E]](r1.Err, r1.Consumed)
+		}
+		r2 := p2(r1.Next)
+		if !r2.Ok {
+			return failure[Of5[A, B, C, D, E]](r2.Err, r1.Consumed || r2.Consumed)
+		}
+		r3 := p3(r2.Next)
+		if !r3.Ok {
+			return failure[Of5[A, B, C, D, E]](r3.Err, r1.Consumed || r2.Consumed || r3.Consumed)
+		}
+		r4 := p4(r3.Next)
+		if !r4.Ok {
+			return failure[Of5[A, B, C, D, E]](r4.Err, r1.Consumed || r2.Consumed || r3.Consumed || r4.Consumed)
+		}
+		r5 := p5(r4.Next)
+		if !r5.Ok {
+			return failure[Of5[A, B, C, D, E]](r5.Err, r1.Consumed || r2.Consumed || r3.Consumed || r4.Consumed || r5.Consumed)
+		}
+		return success(Of5[A, B, C, D, E]{r1.Value, r2.Value, r3.Value, r4.Value, r5.Value}, r5.Next, r1.Consumed || r2.Consumed || r3.Consumed || r4.Consumed || r5.Consumed)
+	}
+}
+
 func Prefix[A, B any](prefix Parser[A], p Parser[B]) Parser[B] {
 	return Map(Sequence2(prefix, p), func(t Of2[A, B]) B { return t.V2 })
 }

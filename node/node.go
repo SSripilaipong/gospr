@@ -62,8 +62,26 @@ func (n *Node) Initialize(plan parser.Plan) error {
 	if n.state == Initialized {
 		return nil
 	}
+	typeMap := make(map[string]parser.TypeDef, len(plan.Types))
+	for _, td := range plan.Types {
+		typeMap[td.Name] = td
+	}
+	queryMap := make(map[string][]parser.QueryDef)
+	for _, qd := range plan.Queries {
+		queryMap[qd.TypeName] = append(queryMap[qd.TypeName], qd)
+	}
+	updateMap := make(map[string][]parser.UpdateDef)
+	for _, ud := range plan.Updates {
+		updateMap[ud.TypeName] = append(updateMap[ud.TypeName], ud)
+	}
 	for _, spec := range plan.Collections {
-		c, err := crdt.New(spec.Type, spec.Args, n.id)
+		var c crdt.CRDT
+		var err error
+		if td, ok := typeMap[spec.Type]; ok {
+			c, err = crdt.NewComposite(td, queryMap[spec.Type], updateMap[spec.Type], spec.Args, n.id)
+		} else {
+			c, err = crdt.New(spec.Type, spec.Args, n.id)
+		}
 		if err != nil {
 			return fmt.Errorf("node %s: %w", n.id, err)
 		}

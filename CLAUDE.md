@@ -24,24 +24,24 @@ gospr simulates a distributed CRDT platform inside a single process. Three nodes
 main.go               entry point — wires 3 nodes + gateways, connects peer inboxes
 
 crdt/
-  crdt.go             CRDT interface (Apply/Query/Merge/Snapshot) + New() factory
+  crdt.go             CRDT interface and built-in factory
   gcounter.go         GCounter: map[string]int64 nodeID→count, merge = per-key max
+  composite.go        CompositeCRDT for user-defined types: per-field delegation
 
 node/
-  node.go             Node struct, Initialize, PropagatePlan, Apply, Query,
-                      runMessageLoop (gossipMsg/deployMsg dispatch), runGossip
+  node.go             Node lifecycle and message loop
 
 gateway/
   gateway.go          HTTP: POST /deploy, POST /{collection}, GET /{collection}/{query}
 
 parser/
-  types.go            CollectionSpec, Plan, ParseError
-  parser.go           Parse(string) (Plan, error) — public entry
-  stream.go           value-typed Stream (Advance returns new struct, backtracking is free)
-  result.go           ParseResult[A], Parser[A], Of2/Of3/Of4 tuple types
+  types.go            AST types and Plan
+  parser.go           public Parse entry point
+  stream.go           value-typed Stream — Advance returns new struct, backtracking is free
+  result.go           ParseResult[A], Parser[A], Of2–Of5 tuple types
   combinators.go      all combinators (see below)
   dsl.go              DSL grammar built from combinators
-  parser_test.go      7 integration tests via Parse()
+  parser_test.go
 ```
 
 ## Parser combinators (`parser/combinators.go`)
@@ -53,7 +53,7 @@ Parsec-style. `Consumed bool` enables committed-choice: `Or` only retries the ri
 | `Satisfy(pred, label)` | consume one rune matching pred |
 | `Map(p, f)` | transform result |
 | `Discard(p)` | map to `struct{}` |
-| `Sequence2/3/4(p...)` | run N parsers in order, return `Of2/Of3/Of4` tuple |
+| `Sequence2/3/4/5(p...)` | run N parsers in order, return `Of2/Of3/Of4/Of5` tuple |
 | `Prefix(prefix, p)` | run prefix (discard), keep p's result |
 | `Suffix(suffix, p)` | keep p's result, then run suffix (discard) |
 | `Or(left, right)` | try left; if not consumed, try right |
@@ -61,13 +61,26 @@ Parsec-style. `Consumed bool` enables committed-choice: `Or` only retries the ri
 | `Many / Many1` | zero-or-more / one-or-more |
 | `SepBy(p, sep)` | p separated by sep |
 
-**Adding a new CRDT:** implement `crdt.CRDT` and add a case in `crdt.New` — no other files change.
+**Adding a new built-in CRDT:** implement `crdt.CRDT` and add a case in `crdt.New` — no other files change.
+
+**Adding a user-defined composite type:** use the DSL syntax; no Go code needed.
 
 ## DSL syntax
 
 ```
+# built-in collection
 collection MyCounter = GCounter(0)
-collection OtherCounter = GCounter(0)
+
+# user-defined composite type
+type MyCounterType(x int) = { counter: GCounter(x) }
+query MyCounterType.MyValue() = counter.Value()
+update MyCounterType.AddOne() = { counter: counter.Add(1) }
+collection MyCounter = MyCounterType(0)
 ```
 
-Blank and unrecognized lines are silently skipped. Malformed `collection` lines return a `ParseError`.
+- `type` — defines a named composite type with typed parameters and named CRDT fields. Parameters are substituted positionally when instantiating.
+- `query TypeName.Method()` — maps a method name to a field query (`field.QueryName()`).
+- `update TypeName.Method()` — maps a method name to one or more field updates (`{ field: field.Action(args) }`).
+- `collection` — instantiates either a built-in CRDT or a user-defined type.
+- Merging for composite types is automatic: each field merges independently via its own CRDT's `Merge`.
+- Blank and unrecognized lines are silently skipped. Malformed `collection`/`type`/`query`/`update` lines (keyword matched but syntax invalid) return a `ParseError`.
