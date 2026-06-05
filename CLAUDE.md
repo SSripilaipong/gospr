@@ -1,37 +1,67 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Commands
 
 ```bash
-go build ./...        # compile all packages
-go run .              # start all three nodes (ports 8081/8082/8083)
-go test ./...         # run all tests
-go test ./crdt/...    # run tests for a single package
-go vet ./...          # static analysis
+go build ./...                    # compile all packages
+go run .                          # start all three nodes (ports 8081/8082/8083)
+go test -timeout 10s ./...        # run all tests (always use -timeout; combinators can loop infinitely)
+go test -timeout 10s ./parser/... # run tests for a single package
+go vet ./...                      # static analysis
 ```
 
 ## Architecture
 
-gospr simulates a distributed CRDT platform inside a single process. Three independent nodes run as goroutine groups and communicate exclusively through `chan any` — no shared memory, no direct method calls across node boundaries.
+gospr simulates a distributed CRDT platform inside a single process. Three nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls.
 
-**Data flow for deployment:**
-1. Client POSTs DSL text to any node's `/deploy` HTTP endpoint
-2. `parser.Parse` turns the text into a `parser.Plan` (list of `CollectionSpec`)
-3. The receiving node calls `node.Initialize(plan)` on itself, then `node.PropagatePlan(plan)` which drops a `deployMsg` into each peer's inbox channel
-4. Peer nodes pick up the `deployMsg` in their `runMessageLoop` and call `Initialize` on themselves
+- Client POSTs DSL text to any node's `POST /deploy` → parsed into a `Plan` → node initializes itself and propagates a `deployMsg` to peers via their inbox channels
+- Every ~2s each initialized node snapshots its collections and sends a `gossipMsg` to one random peer; the peer merges via per-key max
+- Node lifecycle: `Uninitialized → Initialized` (one-way, idempotent — duplicate `deployMsg` is a no-op)
 
-**Data flow for gossip (anti-entropy):**
-- Every ~2s each initialized node calls `Snapshot()` on all its collections and sends a `gossipMsg` to one randomly chosen peer inbox
-- The receiving node merges the snapshot via `MergeSnapshot`, which calls `CRDT.Merge` per collection
-- GCounter merge is per-key max on `map[string]int64` (nodeID → count)
+## File map
 
-**Adding a new CRDT type:** implement the `crdt.CRDT` interface (`Apply`, `Query`, `Merge`, `Snapshot`) and add a case in `crdt.New`. No other files need to change.
+```
+main.go               entry point — wires 3 nodes + gateways, connects peer inboxes
 
-**Inter-node message types** (`gossipMsg`, `deployMsg`) are unexported structs in `node/node.go`. The channel carries `any`; the message loop type-switches to dispatch.
+crdt/
+  crdt.go             CRDT interface (Apply/Query/Merge/Snapshot) + New() factory
+  gcounter.go         GCounter: map[string]int64 nodeID→count, merge = per-key max
 
-**Node lifecycle:** `Uninitialized → Initialized` (one-way). `Initialize` is idempotent — a second call is a no-op, which is how duplicate `deployMsg` arrivals are handled safely.
+node/
+  node.go             Node struct, Initialize, PropagatePlan, Apply, Query,
+                      runMessageLoop (gossipMsg/deployMsg dispatch), runGossip
+
+gateway/
+  gateway.go          HTTP: POST /deploy, POST /{collection}, GET /{collection}/{query}
+
+parser/
+  types.go            CollectionSpec, Plan, ParseError
+  parser.go           Parse(string) (Plan, error) — public entry
+  stream.go           value-typed Stream (Advance returns new struct, backtracking is free)
+  result.go           ParseResult[A], Parser[A], Of2/Of3/Of4 tuple types
+  combinators.go      all combinators (see below)
+  dsl.go              DSL grammar built from combinators
+  parser_test.go      7 integration tests via Parse()
+```
+
+## Parser combinators (`parser/combinators.go`)
+
+Parsec-style. `Consumed bool` enables committed-choice: `Or` only retries the right branch if left consumed nothing. `Try` strips `Consumed` on failure to re-enable backtracking.
+
+| Combinator | What it does |
+|---|---|
+| `Satisfy(pred, label)` | consume one rune matching pred |
+| `Map(p, f)` | transform result |
+| `Discard(p)` | map to `struct{}` |
+| `Sequence2/3/4(p...)` | run N parsers in order, return `Of2/Of3/Of4` tuple |
+| `Prefix(prefix, p)` | run prefix (discard), keep p's result |
+| `Suffix(suffix, p)` | keep p's result, then run suffix (discard) |
+| `Or(left, right)` | try left; if not consumed, try right |
+| `Try(p)` | on failure, clear Consumed (enables backtracking) |
+| `Many / Many1` | zero-or-more / one-or-more |
+| `SepBy(p, sep)` | p separated by sep |
+
+**Adding a new CRDT:** implement `crdt.CRDT` and add a case in `crdt.New` — no other files change.
 
 ## DSL syntax
 
@@ -40,4 +70,4 @@ collection MyCounter = GCounter(0)
 collection OtherCounter = GCounter(0)
 ```
 
-Blank lines and unrecognized lines are silently skipped. Malformed `collection` lines return a parse error.
+Blank and unrecognized lines are silently skipped. Malformed `collection` lines return a `ParseError`.
