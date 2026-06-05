@@ -44,7 +44,7 @@ func TestBuild_gcounter(t *testing.T) {
 	if len(built.Collections) != 1 || built.Collections[0].Name != "MyCounter" {
 		t.Fatalf("unexpected collections: %v", built.Collections)
 	}
-	c := built.Collections[0].New("node1")
+	c := built.Collections[0].Spec.New("node1")
 	v, err := c.Query("Value")
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestBuild_composite(t *testing.T) {
 	if len(built.Collections) != 1 {
 		t.Fatalf("expected 1 collection, got %d", len(built.Collections))
 	}
-	c := built.Collections[0].New("node1")
+	c := built.Collections[0].Spec.New("node1")
 	if err := c.Apply("AddOne", nil); err != nil {
 		t.Fatal(err)
 	}

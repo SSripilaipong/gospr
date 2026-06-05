@@ -26,7 +26,7 @@ parser  →  builder  →  node / crdt
 | Layer | Owns |
 |---|---|
 | `parser` | Syntax: text → `Plan` (flat AST slices) |
-| `builder` | Semantics: validates types/args, combines TypeDef+QueryDef+UpdateDef, parses string args to typed values, returns `BuiltPlan` with `func(nodeID) crdt.CRDT` factories |
+| `builder` | Semantics: validates types/args, combines TypeDef+QueryDef+UpdateDef, parses string args to typed values, returns `BuiltPlan` with serializable `CollectionSpec` values (`GCounterSpec`, `CompositeSpec`) — no closures stored |
 | `crdt` | Runtime CRDT logic only — no string parsing, no Plan knowledge |
 | `node` | Lifecycle + message loop; calls factories from `BuiltPlan` |
 | `gateway` | HTTP; returns 400 on parse/build errors before touching node state |
@@ -37,7 +37,7 @@ parser  →  builder  →  node / crdt
 main.go               wires 3 nodes + gateways, connects peer inboxes
 
 builder/
-  builder.go          Build(Plan) → BuiltPlan; all type dispatch + arg validation here
+  builder.go          Build(Plan) → BuiltPlan; CollectionSpec interface + GCounterSpec/CompositeSpec (serializable, no closures)
   builder_test.go
 
 crdt/
@@ -66,6 +66,7 @@ parser/
 - **New built-in CRDT:** implement `crdt.CRDT`, export a typed constructor (e.g. `NewFoo(...)`), add a case in `builder.buildPrimitive` — no other files change.
 - **New user-defined type:** use the DSL; no Go code needed.
 - **New validation rule:** add it in `builder.Build` or `buildComposite`/`buildPrimitive`.
+- **Network propagation of `deployMsg`:** `BuiltPlan` contains only data structs. Use `gob.Register(GCounterSpec{})` / `gob.Register(CompositeSpec{})` for gob, or add a type-discriminator JSON marshaler on `CollectionSpec`.
 
 ## DSL syntax
 

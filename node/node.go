@@ -63,7 +63,7 @@ func (n *Node) Initialize(plan builder.BuiltPlan) error {
 		return nil
 	}
 	for _, bc := range plan.Collections {
-		n.collections[bc.Name] = bc.New(n.id)
+		n.collections[bc.Name] = bc.Spec.New(n.id)
 	}
 	n.state = Initialized
 	log.Printf("[%s] initialized with %d collection(s)", n.id, len(n.collections))

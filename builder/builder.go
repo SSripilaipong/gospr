@@ -7,13 +7,39 @@ import (
 	"strconv"
 )
 
+type CollectionSpec interface {
+	New(nodeID string) crdt.CRDT
+}
+
 type BuiltPlan struct {
 	Collections []BuiltCollection
 }
 
 type BuiltCollection struct {
 	Name string
-	New  func(nodeID string) crdt.CRDT
+	Spec CollectionSpec
+}
+
+type GCounterSpec struct {
+	Initial int64
+}
+
+func (s GCounterSpec) New(nodeID string) crdt.CRDT {
+	return crdt.NewGCounter(nodeID, s.Initial)
+}
+
+type CompositeSpec struct {
+	Fields      map[string]CollectionSpec
+	QueryIndex  map[string]parser.MethodCall
+	UpdateIndex map[string][]parser.FieldUpdate
+}
+
+func (s CompositeSpec) New(nodeID string) crdt.CRDT {
+	fieldFactories := make(map[string]func(string) crdt.CRDT, len(s.Fields))
+	for name, spec := range s.Fields {
+		fieldFactories[name] = spec.New
+	}
+	return crdt.NewComposite(nodeID, fieldFactories, s.QueryIndex, s.UpdateIndex)
 }
 
 func Build(plan parser.Plan) (BuiltPlan, error) {
@@ -58,10 +84,7 @@ func buildPrimitive(name, typeName string, args []string) (BuiltCollection, erro
 				return BuiltCollection{}, fmt.Errorf("GCounter %q: invalid initial value %q: %w", name, args[0], err)
 			}
 		}
-		return BuiltCollection{
-			Name: name,
-			New:  func(nodeID string) crdt.CRDT { return crdt.NewGCounter(nodeID, initial) },
-		}, nil
+		return BuiltCollection{Name: name, Spec: GCounterSpec{Initial: initial}}, nil
 	default:
 		return BuiltCollection{}, fmt.Errorf("unknown CRDT type: %s", typeName)
 	}
@@ -76,7 +99,7 @@ func buildComposite(spec parser.CollectionSpec, def parser.TypeDef, queries []pa
 		params[p.Name] = spec.Args[i]
 	}
 
-	fieldFactories := make(map[string]func(string) crdt.CRDT, len(def.Fields))
+	fieldSpecs := make(map[string]CollectionSpec, len(def.Fields))
 	for _, f := range def.Fields {
 		resolved := make([]string, len(f.Args))
 		for i, a := range f.Args {
@@ -90,8 +113,7 @@ func buildComposite(spec parser.CollectionSpec, def parser.TypeDef, queries []pa
 		if err != nil {
 			return BuiltCollection{}, fmt.Errorf("field %s: %w", f.Name, err)
 		}
-		factory := bc.New
-		fieldFactories[f.Name] = factory
+		fieldSpecs[f.Name] = bc.Spec
 	}
 
 	queryIndex := make(map[string]parser.MethodCall, len(queries))
@@ -105,8 +127,10 @@ func buildComposite(spec parser.CollectionSpec, def parser.TypeDef, queries []pa
 
 	return BuiltCollection{
 		Name: spec.Name,
-		New: func(nodeID string) crdt.CRDT {
-			return crdt.NewComposite(nodeID, fieldFactories, queryIndex, updateIndex)
+		Spec: CompositeSpec{
+			Fields:      fieldSpecs,
+			QueryIndex:  queryIndex,
+			UpdateIndex: updateIndex,
 		},
 	}, nil
 }
