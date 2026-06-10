@@ -70,8 +70,8 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 					Required: true,
 					Content: map[string]mediaType{
 						"text/plain": {
-							Schema: schema{Type: "string"},
-							Example: "collection MyCounter = MyCounterType(9)\ntype MyCounterType(x int) = { x: GCounter(x) }\nquery MyCounterType.X() = x.Value()\nupdate MyCounterType.Up() = { x: x.Add(1) }",
+							Schema:  schema{Type: "string"},
+							Example: "type T = vector real\nmerge T = zip max\nquery T.Value = reduce + 0\nupdate T.Add k::real = local (+ k)\ncollection MyVec = T",
 						},
 					},
 				},
@@ -84,15 +84,11 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	}
 
 	for _, bc := range plan.Collections {
-		switch spec := bc.Spec.(type) {
-		case builder.GCounterSpec:
-			addGetPath(paths, bc.Name, "Value", nil)
-			addPostPath(paths, bc.Name, "Add", []parser.ParamSpec{{Name: "delta", Type: "real0+"}})
-		case builder.CompositeSpec:
-			for queryName, qs := range spec.Queries {
+		if m, ok := bc.Spec.(*builder.Model); ok {
+			for queryName, qs := range m.Queries {
 				addGetPath(paths, bc.Name, queryName, qs.Params)
 			}
-			for actionName, us := range spec.Updates {
+			for actionName, us := range m.Updates {
 				addPostPath(paths, bc.Name, actionName, us.Params)
 			}
 		}
@@ -181,11 +177,8 @@ func addPostPath(paths map[string]pathItem, collection, actionName string, param
 
 func paramToSchema(p parser.ParamSpec) schema {
 	switch p.Type {
-	case "int":
-		return schema{Type: "integer"}
-	case "real0+":
-		min := float64(0)
-		return schema{Type: "number", MinimumNumber: &min}
+	case "real":
+		return schema{Type: "number"}
 	default:
 		return schema{}
 	}
@@ -193,9 +186,7 @@ func paramToSchema(p parser.ParamSpec) schema {
 
 func paramExample(p parser.ParamSpec) any {
 	switch p.Type {
-	case "int":
-		return 1
-	case "real0+":
+	case "real":
 		return 1.0
 	default:
 		return nil

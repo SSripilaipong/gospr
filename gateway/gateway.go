@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -58,6 +59,12 @@ func (g *Gateway) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Node initialization is one-way/idempotent: an empty cluster can never
+	// be populated later, so a deploy with no collections is rejected here.
+	if len(built.Collections) == 0 {
+		http.Error(w, "deploy has no collections", http.StatusBadRequest)
+		return
+	}
 	if err := g.node.Initialize(built); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -96,7 +103,12 @@ func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var params []any
 	if raw := r.URL.Query().Get("params"); raw != "" {
 		for _, s := range strings.Split(raw, ",") {
-			params = append(params, s)
+			f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("invalid param %q: must be a real number", s), http.StatusBadRequest)
+				return
+			}
+			params = append(params, f)
 		}
 	}
 	val, err := g.node.Query(collection, query, params)

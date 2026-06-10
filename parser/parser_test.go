@@ -1,200 +1,179 @@
 package parser
 
-import (
-	"testing"
-)
+import "testing"
 
-func TestParse_normal(t *testing.T) {
-	plan, err := Parse("collection MyCounter = GCounter(0)\ncollection OtherCounter = GCounter(0)\n")
+// Mandated integration test: parse the canonical snippet into the AST.
+func TestParse_integration(t *testing.T) {
+	src := `type T = vector real
+
+merge T = zip max
+
+query T.Value = reduce + 0
+
+update T.Add k::real = local (+ k)
+`
+	plan, err := Parse(src)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(plan.Collections) != 2 {
-		t.Fatalf("expected 2 collections, got %d", len(plan.Collections))
+
+	// --- types ---
+	if len(plan.Types) != 1 {
+		t.Fatalf("want 1 type, got %d", len(plan.Types))
 	}
-	if plan.Collections[0].Name != "MyCounter" || plan.Collections[0].Type != "GCounter" || plan.Collections[0].Args[0] != "0" {
-		t.Errorf("unexpected first collection: %+v", plan.Collections[0])
+	td := plan.Types[0]
+	if td.Name != "T" || td.Elem.Kind != KindReal {
+		t.Fatalf("type = %+v, want {T vector real}", td)
 	}
-	if plan.Collections[1].Name != "OtherCounter" {
-		t.Errorf("unexpected second collection: %+v", plan.Collections[1])
+
+	// --- merge ---
+	if len(plan.Merges) != 1 {
+		t.Fatalf("want 1 merge, got %d", len(plan.Merges))
+	}
+	md := plan.Merges[0]
+	if md.TypeName != "T" {
+		t.Fatalf("merge type = %q, want T", md.TypeName)
+	}
+	if md.Body.Kind != ExprZip || md.Body.Fn == nil || md.Body.Fn.Kind != ExprFuncRef || md.Body.Fn.Op != "max" {
+		t.Fatalf("merge body = %+v, want zip max", md.Body)
+	}
+
+	// --- query ---
+	if len(plan.Queries) != 1 {
+		t.Fatalf("want 1 query, got %d", len(plan.Queries))
+	}
+	qd := plan.Queries[0]
+	if qd.TypeName != "T" || qd.MethodName != "Value" || len(qd.Params) != 0 {
+		t.Fatalf("query lhs = %+v, want T.Value no params", qd)
+	}
+	if qd.Body.Kind != ExprReduce || qd.Body.Fn == nil || qd.Body.Fn.Op != "+" ||
+		qd.Body.Init == nil || qd.Body.Init.Kind != ExprNumLit || qd.Body.Init.Num != 0 {
+		t.Fatalf("query body = %+v, want reduce + 0", qd.Body)
+	}
+
+	// --- update ---
+	if len(plan.Updates) != 1 {
+		t.Fatalf("want 1 update, got %d", len(plan.Updates))
+	}
+	ud := plan.Updates[0]
+	if ud.TypeName != "T" || ud.MethodName != "Add" {
+		t.Fatalf("update lhs = %+v, want T.Add", ud)
+	}
+	if len(ud.Params) != 1 || ud.Params[0].Name != "k" || ud.Params[0].Type != "real" {
+		t.Fatalf("update params = %+v, want [k::real]", ud.Params)
+	}
+	if ud.Body.Kind != ExprLocal || ud.Body.Fn == nil {
+		t.Fatalf("update body = %+v, want local <section>", ud.Body)
+	}
+	sec := ud.Body.Fn
+	if sec.Kind != ExprSection || sec.Op != "+" || sec.Arg == nil ||
+		sec.Arg.Kind != ExprParamRef || sec.Arg.Param != "k" {
+		t.Fatalf("update section = %+v, want (+ k)", sec)
+	}
+
+	if len(plan.Collections) != 0 {
+		t.Fatalf("want 0 collections, got %d", len(plan.Collections))
 	}
 }
 
-func TestParse_skipBlanks(t *testing.T) {
-	plan, err := Parse("\n\ncollection X = GCounter(1)\n\n")
+func TestParse_collection(t *testing.T) {
+	plan, err := Parse("collection MyVec = T\n")
 	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Collections) != 1 || plan.Collections[0].Name != "X" {
-		t.Errorf("unexpected result: %+v", plan.Collections)
-	}
-}
-
-func TestParse_skipUnknownLines(t *testing.T) {
-	plan, err := Parse("# comment\ncollection A = GCounter(0)\nunknown line here\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Collections) != 1 || plan.Collections[0].Name != "A" {
-		t.Errorf("unexpected result: %+v", plan.Collections)
-	}
-}
-
-func TestParse_multiArgs(t *testing.T) {
-	plan, err := Parse("collection A = SomeType(foo, bar, 42)\n")
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(plan.Collections) != 1 {
-		t.Fatalf("expected 1 collection, got %d", len(plan.Collections))
+		t.Fatalf("want 1 collection, got %d", len(plan.Collections))
 	}
 	c := plan.Collections[0]
-	if c.Type != "SomeType" || len(c.Args) != 3 || c.Args[0] != "foo" || c.Args[1] != "bar" || c.Args[2] != "42" {
-		t.Errorf("unexpected collection: %+v", c)
+	if c.Name != "MyVec" || c.Type != "T" {
+		t.Fatalf("collection = %+v, want {MyVec T}", c)
+	}
+}
+
+func TestParse_sectionNumberLiteral(t *testing.T) {
+	plan, err := Parse("update T.Inc = local (+ 1)\n")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sec := plan.Updates[0].Body.Fn
+	if sec.Op != "+" || sec.Arg.Kind != ExprNumLit || sec.Arg.Num != 1 {
+		t.Fatalf("section = %+v, want (+ 1)", sec)
+	}
+}
+
+func TestParse_decimalLiteral(t *testing.T) {
+	plan, err := Parse("query T.V = reduce + 2.5\n")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := plan.Queries[0].Body.Init.Num; got != 2.5 {
+		t.Fatalf("init = %v, want 2.5", got)
+	}
+}
+
+func TestParse_operators(t *testing.T) {
+	cases := map[string]string{
+		"merge T = zip max\n": "max",
+		"merge T = zip min\n": "min",
+		"merge T = zip +\n":   "+",
+		"merge T = zip *\n":   "*",
+		"merge T = zip -\n":   "-",
+	}
+	for src, want := range cases {
+		plan, err := Parse(src)
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", src, err)
+		}
+		if got := plan.Merges[0].Body.Fn.Op; got != want {
+			t.Fatalf("%q: op = %q, want %q", src, got, want)
+		}
+	}
+}
+
+func TestParse_skipBlankAndUnknownLines(t *testing.T) {
+	plan, err := Parse("\n# a comment\ntype T = vector real\n\n")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(plan.Types) != 1 {
+		t.Fatalf("want 1 type, got %d", len(plan.Types))
 	}
 }
 
 func TestParse_empty(t *testing.T) {
 	plan, err := Parse("")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(plan.Collections) != 0 {
-		t.Errorf("expected 0 collections, got %d", len(plan.Collections))
+	if len(plan.Types) != 0 || len(plan.Collections) != 0 {
+		t.Fatalf("want empty plan, got %+v", plan)
 	}
 }
 
-func TestParse_malformedReturnsError(t *testing.T) {
-	_, err := Parse("collection Bad = GCounter\n")
-	if err == nil {
-		t.Fatal("expected error for malformed collection line, got nil")
+// A recognized-but-malformed line is a parse error, not silently skipped,
+// because Or is committed once the keyword prefix is consumed.
+func TestParse_malformedTypeIsError(t *testing.T) {
+	if _, err := Parse("type T = vector foo\n"); err == nil {
+		t.Fatalf("expected parse error for `vector foo`")
+	}
+}
+
+func TestParse_malformedMergeIsError(t *testing.T) {
+	if _, err := Parse("merge T = zip notAnOp\n"); err == nil {
+		t.Fatalf("expected parse error for unknown op token")
 	}
 }
 
 func TestParse_errorHasPosition(t *testing.T) {
-	_, err := Parse("collection Bad = GCounter\n")
+	_, err := Parse("type T = vector foo\n")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
 	pe, ok := err.(ParseError)
 	if !ok {
-		t.Fatalf("expected ParseError, got %T: %v", err, err)
+		t.Fatalf("error type = %T, want ParseError", err)
 	}
 	if pe.Line == 0 || pe.Col == 0 {
-		t.Errorf("expected non-zero line/col, got line=%d col=%d", pe.Line, pe.Col)
-	}
-}
-
-func TestParse_typeDef(t *testing.T) {
-	plan, err := Parse("type MyType(x int) = { counter: GCounter(x) }\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Types) != 1 {
-		t.Fatalf("expected 1 type, got %d", len(plan.Types))
-	}
-	td := plan.Types[0]
-	if td.Name != "MyType" {
-		t.Errorf("unexpected type name: %s", td.Name)
-	}
-	if len(td.Params) != 1 || td.Params[0].Name != "x" || td.Params[0].Type != "int" {
-		t.Errorf("unexpected params: %+v", td.Params)
-	}
-	if len(td.Fields) != 1 || td.Fields[0].Name != "counter" || td.Fields[0].CRDTType != "GCounter" || td.Fields[0].Args[0] != "x" {
-		t.Errorf("unexpected fields: %+v", td.Fields)
-	}
-}
-
-func TestParse_queryDef(t *testing.T) {
-	plan, err := Parse("query MyType.MyValue() = counter.Value()\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Queries) != 1 {
-		t.Fatalf("expected 1 query, got %d", len(plan.Queries))
-	}
-	qd := plan.Queries[0]
-	if qd.TypeName != "MyType" || qd.MethodName != "MyValue" {
-		t.Errorf("unexpected query header: %+v", qd)
-	}
-	if qd.Body.Field != "counter" || qd.Body.Method != "Value" || len(qd.Body.Args) != 0 {
-		t.Errorf("unexpected query body: %+v", qd.Body)
-	}
-}
-
-func TestParse_updateDef(t *testing.T) {
-	plan, err := Parse("update MyType.AddOne() = { counter: counter.Add(1) }\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Updates) != 1 {
-		t.Fatalf("expected 1 update, got %d", len(plan.Updates))
-	}
-	ud := plan.Updates[0]
-	if ud.TypeName != "MyType" || ud.MethodName != "AddOne" {
-		t.Errorf("unexpected update header: %+v", ud)
-	}
-	if len(ud.Body) != 1 || ud.Body[0].Field != "counter" || ud.Body[0].Call.Field != "counter" || ud.Body[0].Call.Method != "Add" || ud.Body[0].Call.Args[0] != "1" {
-		t.Errorf("unexpected update body: %+v", ud.Body)
-	}
-}
-
-func TestParse_mixedPlan(t *testing.T) {
-	input := "type MyType(x int) = { counter: GCounter(x) }\n" +
-		"query MyType.MyValue() = counter.Value()\n" +
-		"update MyType.AddOne() = { counter: counter.Add(1) }\n" +
-		"collection MyCounter = MyType(0)\n"
-	plan, err := Parse(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Types) != 1 || len(plan.Queries) != 1 || len(plan.Updates) != 1 || len(plan.Collections) != 1 {
-		t.Errorf("unexpected plan: types=%d queries=%d updates=%d collections=%d",
-			len(plan.Types), len(plan.Queries), len(plan.Updates), len(plan.Collections))
-	}
-}
-
-func TestParse_updateDefWithParams(t *testing.T) {
-	plan, err := Parse("update MyType.Up(a real0+) = { counter: counter.Add(a) }\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Updates) != 1 {
-		t.Fatalf("expected 1 update, got %d", len(plan.Updates))
-	}
-	ud := plan.Updates[0]
-	if len(ud.Params) != 1 || ud.Params[0].Name != "a" || ud.Params[0].Type != "real0+" {
-		t.Errorf("unexpected params: %+v", ud.Params)
-	}
-	if len(ud.Body) != 1 || ud.Body[0].Call.Args[0] != "a" {
-		t.Errorf("unexpected body: %+v", ud.Body)
-	}
-}
-
-func TestParse_queryDefWithParams(t *testing.T) {
-	plan, err := Parse("query MyType.Scaled(factor real0+) = counter.Value()\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Queries) != 1 {
-		t.Fatalf("expected 1 query, got %d", len(plan.Queries))
-	}
-	qd := plan.Queries[0]
-	if len(qd.Params) != 1 || qd.Params[0].Name != "factor" || qd.Params[0].Type != "real0+" {
-		t.Errorf("unexpected params: %+v", qd.Params)
-	}
-}
-
-func TestParse_typeAndCollectionCoexist(t *testing.T) {
-	input := "# comment\n" +
-		"type T(n int) = { c: GCounter(n) }\n" +
-		"unknown line\n" +
-		"collection X = GCounter(0)\n"
-	plan, err := Parse(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Types) != 1 || plan.Types[0].Name != "T" {
-		t.Errorf("unexpected types: %+v", plan.Types)
-	}
-	if len(plan.Collections) != 1 || plan.Collections[0].Name != "X" {
-		t.Errorf("unexpected collections: %+v", plan.Collections)
+		t.Fatalf("error has no position: %+v", pe)
 	}
 }

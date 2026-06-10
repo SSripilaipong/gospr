@@ -1,173 +1,209 @@
 package builder
 
 import (
-	"gospr/parser"
 	"testing"
+
+	"gospr/parser"
 )
 
-func gcounterPlan(initial string) parser.Plan {
-	return parser.Plan{
-		Collections: []parser.CollectionSpec{
-			{Name: "MyCounter", Type: "GCounter", Args: []string{initial}},
-		},
-	}
-}
+// canonicalPlan hard-codes the AST for:
+//
+//	type T = vector real
+//	merge T = zip max
+//	query T.Value = reduce + 0
+//	update T.Add k::real = local (+ k)
+func canonicalPlan() parser.Plan {
+	maxFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "max"}
+	plusFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "+"}
+	zero := parser.Expr{Kind: parser.ExprNumLit, Num: 0}
+	kRef := parser.Expr{Kind: parser.ExprParamRef, Param: "k"}
+	section := parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &kRef}
 
-func compositePlan() parser.Plan {
 	return parser.Plan{
-		Types: []parser.TypeDef{
-			{
-				Name:   "MyType",
-				Params: []parser.ParamSpec{{Name: "x", Type: "int"}},
-				Fields: []parser.FieldSpec{{Name: "counter", CRDTType: "GCounter", Args: []string{"x"}}},
-			},
+		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal}}},
+		Merges: []parser.MergeDef{
+			{TypeName: "T", Body: parser.Expr{Kind: parser.ExprZip, Fn: &maxFn}},
 		},
 		Queries: []parser.QueryDef{
-			{TypeName: "MyType", MethodName: "MyValue", Body: parser.MethodCall{Field: "counter", Method: "Value"}},
+			{TypeName: "T", MethodName: "Value",
+				Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plusFn, Init: &zero}},
 		},
 		Updates: []parser.UpdateDef{
-			{TypeName: "MyType", MethodName: "AddOne", Body: []parser.FieldUpdate{
-				{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"1"}}},
-			}},
-		},
-		Collections: []parser.CollectionSpec{
-			{Name: "MyCounter", Type: "MyType", Args: []string{"0"}},
+			{TypeName: "T", MethodName: "Add",
+				Params: []parser.ParamSpec{{Name: "k", Type: "real"}},
+				Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &section}},
 		},
 	}
 }
 
-func TestBuild_gcounter(t *testing.T) {
-	built, err := Build(gcounterPlan("42"))
+// Mandated integration test: hard-coded AST -> a correct model.
+func TestBuild_integration(t *testing.T) {
+	built, err := Build(canonicalPlan())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(built.Collections) != 1 || built.Collections[0].Name != "MyCounter" {
-		t.Fatalf("unexpected collections: %v", built.Collections)
+	m, ok := built.Models["T"]
+	if !ok {
+		t.Fatalf("model T not built; models = %v", built.Models)
 	}
-	c := built.Collections[0].Spec.New("node1")
-	v, err := c.Query("Value", nil)
+	if m.Elem.Kind != parser.KindReal {
+		t.Fatalf("elem kind = %v, want real", m.Elem.Kind)
+	}
+	if m.Merge.Kind != parser.ExprZip || m.Merge.Fn.Op != "max" {
+		t.Fatalf("merge = %+v, want zip max", m.Merge)
+	}
+	if _, ok := m.Queries["Value"]; !ok {
+		t.Fatalf("missing query Value")
+	}
+	if _, ok := m.Updates["Add"]; !ok {
+		t.Fatalf("missing update Add")
+	}
+
+	// The built model must produce a working runtime instance.
+	c := m.New("nodeA")
+	if err := c.Apply("Add", []any{3.0}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	got, err := c.Query("Value", nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Value: %v", err)
 	}
-	if v.(float64) != 42 {
-		t.Errorf("expected initial 42, got %v", v)
-	}
-}
-
-func TestBuild_composite(t *testing.T) {
-	built, err := Build(compositePlan())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(built.Collections) != 1 {
-		t.Fatalf("expected 1 collection, got %d", len(built.Collections))
-	}
-	c := built.Collections[0].Spec.New("node1")
-	if err := c.Apply("AddOne", nil); err != nil {
-		t.Fatal(err)
-	}
-	v, err := c.Query("MyValue", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.(float64) != 1 {
-		t.Errorf("expected 1, got %v", v)
+	if got != 3.0 {
+		t.Fatalf("Value = %v, want 3", got)
 	}
 }
 
-func TestBuild_unknownType(t *testing.T) {
-	plan := parser.Plan{
-		Collections: []parser.CollectionSpec{
-			{Name: "X", Type: "NoSuchType", Args: []string{}},
-		},
-	}
-	_, err := Build(plan)
-	if err == nil {
-		t.Fatal("expected error for unknown type")
-	}
-}
-
-func TestBuild_wrongArgCount(t *testing.T) {
-	plan := parser.Plan{
-		Types: []parser.TypeDef{
-			{
-				Name:   "MyType",
-				Params: []parser.ParamSpec{{Name: "x", Type: "int"}},
-				Fields: []parser.FieldSpec{{Name: "counter", CRDTType: "GCounter", Args: []string{"x"}}},
-			},
-		},
-		Collections: []parser.CollectionSpec{
-			{Name: "X", Type: "MyType", Args: []string{}},
-		},
-	}
-	_, err := Build(plan)
-	if err == nil {
-		t.Fatal("expected error for wrong arg count")
-	}
-}
-
-func TestBuild_invalidInitialArg(t *testing.T) {
-	_, err := Build(gcounterPlan("notanumber"))
-	if err == nil {
-		t.Fatal("expected error for invalid initial value")
-	}
-}
-
-func TestBuild_real0PlusParam(t *testing.T) {
-	plan := parser.Plan{
-		Types: []parser.TypeDef{
-			{
-				Name:   "MyType",
-				Params: []parser.ParamSpec{{Name: "x", Type: "int"}},
-				Fields: []parser.FieldSpec{{Name: "counter", CRDTType: "GCounter", Args: []string{"x"}}},
-			},
-		},
-		Queries: []parser.QueryDef{
-			{TypeName: "MyType", MethodName: "MyValue", Body: parser.MethodCall{Field: "counter", Method: "Value"}},
-		},
-		Updates: []parser.UpdateDef{
-			{TypeName: "MyType", MethodName: "Up", Params: []parser.ParamSpec{{Name: "a", Type: "real0+"}},
-				Body: []parser.FieldUpdate{
-					{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"a"}}},
-				}},
-		},
-		Collections: []parser.CollectionSpec{
-			{Name: "MyCounter", Type: "MyType", Args: []string{"0"}},
-		},
-	}
+func TestBuild_collectionReferencesType(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Collections = []parser.CollectionSpec{{Name: "MyVec", Type: "T"}}
 	built, err := Build(plan)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	c := built.Collections[0].Spec.New("node1")
-	if err := c.Apply("Up", []any{2.5}); err != nil {
-		t.Fatal(err)
+	if len(built.Collections) != 1 || built.Collections[0].Name != "MyVec" {
+		t.Fatalf("collections = %+v", built.Collections)
 	}
-	v, err := c.Query("MyValue", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.(float64) != 2.5 {
-		t.Errorf("expected 2.5, got %v", v)
+	// The collection spec is the model.
+	c := built.Collections[0].Spec.New("nodeA")
+	if _, err := c.Query("Value", nil); err != nil {
+		t.Fatalf("query via collection: %v", err)
 	}
 }
 
-func TestBuild_unknownParamType(t *testing.T) {
-	plan := parser.Plan{
-		Types: []parser.TypeDef{
-			{Name: "MyType", Params: []parser.ParamSpec{{Name: "x", Type: "int"}},
-				Fields: []parser.FieldSpec{{Name: "counter", CRDTType: "GCounter", Args: []string{"x"}}}},
-		},
-		Updates: []parser.UpdateDef{
-			{TypeName: "MyType", MethodName: "Up", Params: []parser.ParamSpec{{Name: "a", Type: "badtype"}},
-				Body: []parser.FieldUpdate{
-					{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"a"}}},
-				}},
-		},
-		Collections: []parser.CollectionSpec{{Name: "C", Type: "MyType", Args: []string{"0"}}},
+func TestBuild_unknownTypeForMerge(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Merges = append(plan.Merges, parser.MergeDef{
+		TypeName: "Ghost",
+		Body:     plan.Merges[0].Body,
+	})
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for merge on unknown type")
 	}
-	_, err := Build(plan)
-	if err == nil {
-		t.Fatal("expected error for unknown param type")
+}
+
+func TestBuild_missingMerge(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Merges = nil
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for type without merge")
+	}
+}
+
+func TestBuild_unknownOp(t *testing.T) {
+	plan := canonicalPlan()
+	bad := parser.Expr{Kind: parser.ExprFuncRef, Op: "wat"}
+	plan.Merges[0].Body = parser.Expr{Kind: parser.ExprZip, Fn: &bad}
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for unknown op")
+	}
+}
+
+func TestBuild_badParamType(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Updates[0].Params = []parser.ParamSpec{{Name: "k", Type: "int"}}
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for non-real param type")
+	}
+}
+
+func TestBuild_queryParamsRejected(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Queries[0].Params = []parser.ParamSpec{{Name: "m", Type: "real"}}
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error: query params not yet supported")
+	}
+}
+
+func TestBuild_duplicateMerge(t *testing.T) {
+	plan := canonicalPlan()
+	minFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "min"}
+	plan.Merges = append(plan.Merges, parser.MergeDef{
+		TypeName: "T",
+		Body:     parser.Expr{Kind: parser.ExprZip, Fn: &minFn},
+	})
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for duplicate merge on T")
+	}
+}
+
+func TestBuild_duplicateQuery(t *testing.T) {
+	plan := canonicalPlan()
+	starFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "*"}
+	one := parser.Expr{Kind: parser.ExprNumLit, Num: 1}
+	plan.Queries = append(plan.Queries, parser.QueryDef{
+		TypeName: "T", MethodName: "Value",
+		Body: parser.Expr{Kind: parser.ExprReduce, Fn: &starFn, Init: &one},
+	})
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for duplicate query T.Value")
+	}
+}
+
+func TestBuild_duplicateUpdate(t *testing.T) {
+	plan := canonicalPlan()
+	two := parser.Expr{Kind: parser.ExprNumLit, Num: 2}
+	plan.Updates = append(plan.Updates, parser.UpdateDef{
+		TypeName: "T", MethodName: "Add",
+		Body: parser.Expr{Kind: parser.ExprLocal,
+			Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &two}},
+	})
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for duplicate update T.Add")
+	}
+}
+
+func TestBuild_duplicateCollection(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Collections = []parser.CollectionSpec{
+		{Name: "MyVec", Type: "T"},
+		{Name: "MyVec", Type: "T"},
+	}
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for duplicate collection MyVec")
+	}
+}
+
+func TestBuild_sameQueryAndUpdateNameAllowed(t *testing.T) {
+	// query and update live in separate namespaces (GET vs POST), so a query
+	// and an update may share a name.
+	plan := canonicalPlan()
+	plusFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "+"}
+	zero := parser.Expr{Kind: parser.ExprNumLit, Num: 0}
+	plan.Queries = append(plan.Queries, parser.QueryDef{
+		TypeName: "T", MethodName: "Add", // same name as the update
+		Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plusFn, Init: &zero},
+	})
+	if _, err := Build(plan); err != nil {
+		t.Fatalf("query and update sharing a name should be allowed, got: %v", err)
+	}
+}
+
+func TestBuild_sectionUnknownParam(t *testing.T) {
+	plan := canonicalPlan()
+	badRef := parser.Expr{Kind: parser.ExprParamRef, Param: "nope"}
+	plan.Updates[0].Body = parser.Expr{Kind: parser.ExprLocal,
+		Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &badRef}}
+	if _, err := Build(plan); err == nil {
+		t.Fatalf("expected error for unresolved section param")
 	}
 }

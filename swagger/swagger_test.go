@@ -2,38 +2,44 @@ package swagger
 
 import (
 	"encoding/json"
-	"gospr/builder"
-	"gospr/parser"
 	"testing"
+
+	"gospr/builder"
+	"gospr/crdt"
+	"gospr/parser"
 )
 
-func makeParamPlan() builder.BuiltPlan {
-	min := float64(0)
-	queries := map[string]parser.QuerySpec{
-		"MyValue": {Body: parser.MethodCall{Field: "counter", Method: "Value"}},
-	}
-	updates := map[string]parser.UpdateSpec{
-		"AddOne": {Body: []parser.FieldUpdate{{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"1"}}}}},
-		"Up": {
-			Params: []parser.ParamSpec{{Name: "a", Type: "real0+"}},
-			Body:   []parser.FieldUpdate{{Field: "counter", Call: parser.MethodCall{Method: "Add", Args: []string{"a"}}}},
+func makeModelPlan() builder.BuiltPlan {
+	plusFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "+"}
+	zero := parser.Expr{Kind: parser.ExprNumLit, Num: 0}
+	one := parser.Expr{Kind: parser.ExprNumLit, Num: 1}
+	aRef := parser.Expr{Kind: parser.ExprParamRef, Param: "a"}
+	maxFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "max"}
+
+	model := &builder.Model{
+		Name:  "MyVec",
+		Elem:  parser.ElemType{Kind: parser.KindReal},
+		Merge: parser.Expr{Kind: parser.ExprZip, Fn: &maxFn},
+		Queries: map[string]crdt.Method{
+			"Value": {Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plusFn, Init: &zero}},
+		},
+		Updates: map[string]crdt.Method{
+			"AddOne": {Body: parser.Expr{Kind: parser.ExprLocal,
+				Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &one}}},
+			"Add": {
+				Params: []parser.ParamSpec{{Name: "a", Type: "real"}},
+				Body: parser.Expr{Kind: parser.ExprLocal,
+					Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &aRef}},
+			},
 		},
 	}
-	spec := builder.CompositeSpec{
-		Fields:  map[string]builder.CollectionSpec{"counter": builder.GCounterSpec{Initial: 0}},
-		Queries: queries,
-		Updates: updates,
-	}
-	_ = min
 	return builder.BuiltPlan{
-		Collections: []builder.BuiltCollection{
-			{Name: "MyCounter", Spec: spec},
-		},
+		Collections: []builder.BuiltCollection{{Name: "MyVec", Spec: model}},
 	}
 }
 
 func TestGenerate_paramSchemas(t *testing.T) {
-	data, err := Generate(makeParamPlan())
+	data, err := Generate(makeModelPlan())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,11 +49,10 @@ func TestGenerate_paramSchemas(t *testing.T) {
 	}
 	paths := doc["paths"].(map[string]any)
 
-	upPath := paths["/api/collections/MyCounter/Up"].(map[string]any)
-	post := upPath["post"].(map[string]any)
+	addPath := paths["/api/collections/MyVec/Add"].(map[string]any)
+	post := addPath["post"].(map[string]any)
 	rb := post["requestBody"].(map[string]any)
-	content := rb["content"].(map[string]any)
-	mt := content["application/json"].(map[string]any)
+	mt := rb["content"].(map[string]any)["application/json"].(map[string]any)
 
 	example := mt["example"].(map[string]any)
 	params := example["params"].([]any)
@@ -62,13 +67,10 @@ func TestGenerate_paramSchemas(t *testing.T) {
 	if items["type"] != "number" {
 		t.Errorf("expected items.type=number, got %v", items["type"])
 	}
-	if items["minimum"] != float64(0) {
-		t.Errorf("expected items.minimum=0, got %v", items["minimum"])
-	}
 }
 
 func TestGenerate_zeroParamPost(t *testing.T) {
-	data, err := Generate(makeParamPlan())
+	data, err := Generate(makeModelPlan())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +80,7 @@ func TestGenerate_zeroParamPost(t *testing.T) {
 	}
 	paths := doc["paths"].(map[string]any)
 
-	addOnePath := paths["/api/collections/MyCounter/AddOne"].(map[string]any)
+	addOnePath := paths["/api/collections/MyVec/AddOne"].(map[string]any)
 	post := addOnePath["post"].(map[string]any)
 	rb := post["requestBody"].(map[string]any)
 	if rb["required"] != false {
@@ -92,7 +94,7 @@ func TestGenerate_zeroParamPost(t *testing.T) {
 }
 
 func TestGenerate_getZeroParamQuery(t *testing.T) {
-	data, err := Generate(makeParamPlan())
+	data, err := Generate(makeModelPlan())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,48 +104,9 @@ func TestGenerate_getZeroParamQuery(t *testing.T) {
 	}
 	paths := doc["paths"].(map[string]any)
 
-	getPath := paths["/api/collections/MyCounter/MyValue"].(map[string]any)
+	getPath := paths["/api/collections/MyVec/Value"].(map[string]any)
 	get := getPath["get"].(map[string]any)
 	if _, hasParams := get["parameters"]; hasParams {
 		t.Error("expected no parameters for zero-param query")
-	}
-}
-
-func TestGenerate_getParamQuery(t *testing.T) {
-	plan := builder.BuiltPlan{
-		Collections: []builder.BuiltCollection{
-			{Name: "MyCounter", Spec: builder.CompositeSpec{
-				Fields: map[string]builder.CollectionSpec{"counter": builder.GCounterSpec{}},
-				Queries: map[string]parser.QuerySpec{
-					"Scaled": {
-						Params: []parser.ParamSpec{{Name: "factor", Type: "real0+"}},
-						Body:   parser.MethodCall{Field: "counter", Method: "Value"},
-					},
-				},
-				Updates: map[string]parser.UpdateSpec{},
-			}},
-		},
-	}
-	data, err := Generate(plan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
-	}
-	paths := doc["paths"].(map[string]any)
-	getPath := paths["/api/collections/MyCounter/Scaled"].(map[string]any)
-	get := getPath["get"].(map[string]any)
-	params := get["parameters"].([]any)
-	if len(params) != 1 {
-		t.Fatalf("expected 1 parameter, got %d", len(params))
-	}
-	p := params[0].(map[string]any)
-	if p["name"] != "params" || p["in"] != "query" {
-		t.Errorf("unexpected parameter: %v", p)
-	}
-	if p["example"] != "1" {
-		t.Errorf("expected example '1', got %v", p["example"])
 	}
 }

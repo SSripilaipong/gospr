@@ -1,15 +1,13 @@
 package parser
 
-type typeExpr struct {
-	name string
-	args []string
-}
+import "strconv"
 
 type lineResult struct {
-	collection *CollectionSpec
 	typeDef    *TypeDef
+	mergeDef   *MergeDef
 	queryDef   *QueryDef
 	updateDef  *UpdateDef
+	collection *CollectionSpec
 }
 
 func newlineOrEOF() Parser[struct{}] {
@@ -23,130 +21,162 @@ func digitsP() Parser[string] {
 	)
 }
 
-func argValueP() Parser[string] {
-	return Or(IdentP(), digitsP())
-}
-
-func sepP() Parser[Of3[struct{}, rune, struct{}]] {
-	return Sequence3(SpacesP(), RuneP(','), SpacesP())
-}
-
-func typeExprP() Parser[typeExpr] {
-	return Map(
-		Sequence4(IdentP(), RuneP('('), SepBy(argValueP(), sepP()), RuneP(')')),
-		func(t Of4[string, rune, []string, rune]) typeExpr {
-			return typeExpr{name: t.V1, args: t.V3}
-		},
+// numberP parses a non-negative decimal literal (a leading '-' is the '-'
+// operator, never a literal sign; negative literals are deferred).
+func numberP() Parser[float64] {
+	frac := Or(
+		Try(Map(Sequence2(RuneP('.'), digitsP()), func(t Of2[rune, string]) string { return "." + t.V2 })),
+		Succeed(""),
 	)
+	return func(s Stream) ParseResult[float64] {
+		r := Sequence2(digitsP(), frac)(s)
+		if !r.Ok {
+			return failure[float64](r.Err, r.Consumed)
+		}
+		text := r.Value.V1 + r.Value.V2
+		f, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			line, col := runePos(s.Items, s.Pos)
+			return failure[float64](ParseError{Pos: s.Pos, Line: line, Col: col, Message: "invalid number: " + text}, r.Consumed)
+		}
+		return success(f, r.Next, r.Consumed)
+	}
 }
 
-func typeNameP() Parser[string] {
-	plus := Or(Map(RuneP('+'), func(_ rune) string { return "+" }), Succeed(""))
-	return Map(Sequence2(IdentP(), plus), func(t Of2[string, string]) string { return t.V1 + t.V2 })
+// opP parses a known binary operator token. Each alternative is Try-wrapped
+// so a partial StringP match (e.g. "max" against "min") resets Consumed and
+// Or falls through to the next alternative.
+func opP() Parser[string] {
+	lit := func(str string) Parser[string] { return Try(StringP(str)) }
+	return Or(lit("max"), Or(lit("min"), Or(lit("+"), Or(lit("*"), lit("-")))))
 }
 
-func paramSpecP() Parser[ParamSpec] {
+// paramP parses `name::type`, e.g. `k::real`.
+func paramP() Parser[ParamSpec] {
+	dcolon := Sequence2(RuneP(':'), RuneP(':'))
 	return Map(
-		Sequence3(IdentP(), Spaces1P(), typeNameP()),
-		func(t Of3[string, struct{}, string]) ParamSpec {
+		Sequence3(IdentP(), dcolon, IdentP()),
+		func(t Of3[string, Of2[rune, rune], string]) ParamSpec {
 			return ParamSpec{Name: t.V1, Type: t.V3}
 		},
 	)
 }
 
-func methodParamsP() Parser[[]ParamSpec] {
-	return Map(
-		Sequence3(RuneP('('), SepBy(paramSpecP(), sepP()), RuneP(')')),
-		func(t Of3[rune, []ParamSpec, rune]) []ParamSpec { return t.V2 },
-	)
+// paramsP parses zero-or-more space-separated params after a method name.
+// Each param is Try-wrapped so Many stops cleanly when the next token is the
+// `=` header terminator rather than another param.
+func paramsP() Parser[[]ParamSpec] {
+	return Many(Try(Prefix(Spaces1P(), paramP())))
 }
 
-func methodCallP() Parser[MethodCall] {
-	argsAndClose := Sequence2(SepBy(argValueP(), sepP()), RuneP(')'))
+// operandP parses a section's bound argument: a number literal or a param ref.
+func operandP() Parser[Expr] {
+	num := Map(Try(numberP()), func(f float64) Expr { return Expr{Kind: ExprNumLit, Num: f} })
+	ref := Map(IdentP(), func(n string) Expr { return Expr{Kind: ExprParamRef, Param: n} })
+	return Or(num, ref)
+}
+
+// sectionP parses `( op operand )`, e.g. `(+ k)` or `(* m)`.
+func sectionP() Parser[Expr] {
 	return Map(
-		Sequence5(IdentP(), RuneP('.'), IdentP(), RuneP('('), argsAndClose),
-		func(t Of5[string, rune, string, rune, Of2[[]string, rune]]) MethodCall {
-			return MethodCall{Field: t.V1, Method: t.V3, Args: t.V5.V1}
+		Sequence5(RuneP('('), Prefix(SpacesP(), opP()), Prefix(SpacesP(), operandP()), SpacesP(), RuneP(')')),
+		func(t Of5[rune, string, Expr, struct{}, rune]) Expr {
+			arg := t.V3
+			return Expr{Kind: ExprSection, Op: t.V2, Arg: &arg}
 		},
 	)
 }
 
-func fieldSpecP() Parser[FieldSpec] {
-	colon := Sequence3(SpacesP(), RuneP(':'), SpacesP())
+// elemTypeP parses the vector element type. Only `vector real` for now.
+func elemTypeP() Parser[ElemType] {
 	return Map(
-		Sequence3(IdentP(), colon, typeExprP()),
-		func(t Of3[string, Of3[struct{}, rune, struct{}], typeExpr]) FieldSpec {
-			return FieldSpec{Name: t.V1, CRDTType: t.V3.name, Args: t.V3.args}
-		},
+		Sequence3(StringP("vector"), Spaces1P(), StringP("real")),
+		func(_ Of3[string, struct{}, string]) ElemType { return ElemType{Kind: KindReal} },
 	)
 }
 
-func fieldUpdateP() Parser[FieldUpdate] {
-	colon := Sequence3(SpacesP(), RuneP(':'), SpacesP())
-	return Map(
-		Sequence3(IdentP(), colon, methodCallP()),
-		func(t Of3[string, Of3[struct{}, rune, struct{}], MethodCall]) FieldUpdate {
-			return FieldUpdate{Field: t.V1, Call: t.V3}
-		},
-	)
+func eqP() Parser[Of3[struct{}, rune, struct{}]] {
+	return Sequence3(SpacesP(), RuneP('='), SpacesP())
 }
 
-func braceBodyP[A any](p Parser[A]) Parser[[]A] {
-	open := Sequence2(RuneP('{'), SpacesP())
-	close := Sequence2(SpacesP(), RuneP('}'))
-	return Prefix(open, Suffix(close, SepBy(p, Try(sepP()))))
-}
-
-func collectionLineP() Parser[lineResult] {
-	prefix := Try(Sequence2(StringP("collection"), Spaces1P()))
-	eq := Sequence3(SpacesP(), RuneP('='), SpacesP())
-	end := Sequence2(SpacesP(), newlineOrEOF())
-	rest := Map(
-		Sequence2(IdentP(), Prefix(eq, Suffix(end, typeExprP()))),
-		func(t Of2[string, typeExpr]) lineResult {
-			return lineResult{collection: &CollectionSpec{Name: t.V1, Type: t.V2.name, Args: t.V2.args}}
-		},
-	)
-	return Prefix(prefix, rest)
+func endP() Parser[Of2[struct{}, struct{}]] {
+	return Sequence2(SpacesP(), newlineOrEOF())
 }
 
 func typeDefLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("type"), Spaces1P()))
-	params := Sequence3(RuneP('('), SepBy(paramSpecP(), sepP()), RuneP(')'))
-	eq := Sequence3(SpacesP(), RuneP('='), SpacesP())
-	end := Sequence2(SpacesP(), newlineOrEOF())
 	rest := Map(
-		Sequence3(IdentP(), params, Prefix(eq, Suffix(end, braceBodyP(fieldSpecP())))),
-		func(t Of3[string, Of3[rune, []ParamSpec, rune], []FieldSpec]) lineResult {
-			return lineResult{typeDef: &TypeDef{Name: t.V1, Params: t.V2.V2, Fields: t.V3}}
+		Sequence2(IdentP(), Prefix(eqP(), Suffix(endP(), elemTypeP()))),
+		func(t Of2[string, ElemType]) lineResult {
+			return lineResult{typeDef: &TypeDef{Name: t.V1, Elem: t.V2}}
 		},
 	)
 	return Prefix(prefix, rest)
 }
 
-func queryDefLineP() Parser[lineResult] {
-	prefix := Try(Sequence2(StringP("query"), Spaces1P()))
-	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), methodParamsP())
-	eq := Sequence3(SpacesP(), RuneP('='), SpacesP())
-	end := Sequence2(SpacesP(), newlineOrEOF())
+func mergeLineP() Parser[lineResult] {
+	prefix := Try(Sequence2(StringP("merge"), Spaces1P()))
+	zipExpr := Map(
+		Prefix(Sequence2(StringP("zip"), Spaces1P()), opP()),
+		func(op string) Expr {
+			fn := Expr{Kind: ExprFuncRef, Op: op}
+			return Expr{Kind: ExprZip, Fn: &fn}
+		},
+	)
 	rest := Map(
-		Sequence2(lhs, Prefix(eq, Suffix(end, methodCallP()))),
-		func(t Of2[Of4[string, rune, string, []ParamSpec], MethodCall]) lineResult {
+		Sequence2(IdentP(), Prefix(eqP(), Suffix(endP(), zipExpr))),
+		func(t Of2[string, Expr]) lineResult {
+			return lineResult{mergeDef: &MergeDef{TypeName: t.V1, Body: t.V2}}
+		},
+	)
+	return Prefix(prefix, rest)
+}
+
+func queryLineP() Parser[lineResult] {
+	prefix := Try(Sequence2(StringP("query"), Spaces1P()))
+	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), paramsP())
+	reduceExpr := Map(
+		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), opP()), Spaces1P(), numberP()),
+		func(t Of3[string, struct{}, float64]) Expr {
+			fn := Expr{Kind: ExprFuncRef, Op: t.V1}
+			init := Expr{Kind: ExprNumLit, Num: t.V3}
+			return Expr{Kind: ExprReduce, Fn: &fn, Init: &init}
+		},
+	)
+	rest := Map(
+		Sequence2(lhs, Prefix(eqP(), Suffix(endP(), reduceExpr))),
+		func(t Of2[Of4[string, rune, string, []ParamSpec], Expr]) lineResult {
 			return lineResult{queryDef: &QueryDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Params: t.V1.V4, Body: t.V2}}
 		},
 	)
 	return Prefix(prefix, rest)
 }
 
-func updateDefLineP() Parser[lineResult] {
+func updateLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("update"), Spaces1P()))
-	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), methodParamsP())
-	eq := Sequence3(SpacesP(), RuneP('='), SpacesP())
-	end := Sequence2(SpacesP(), newlineOrEOF())
+	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), paramsP())
+	localExpr := Map(
+		Prefix(Sequence2(StringP("local"), Spaces1P()), sectionP()),
+		func(sec Expr) Expr {
+			fn := sec
+			return Expr{Kind: ExprLocal, Fn: &fn}
+		},
+	)
 	rest := Map(
-		Sequence2(lhs, Prefix(eq, Suffix(end, braceBodyP(fieldUpdateP())))),
-		func(t Of2[Of4[string, rune, string, []ParamSpec], []FieldUpdate]) lineResult {
+		Sequence2(lhs, Prefix(eqP(), Suffix(endP(), localExpr))),
+		func(t Of2[Of4[string, rune, string, []ParamSpec], Expr]) lineResult {
 			return lineResult{updateDef: &UpdateDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Params: t.V1.V4, Body: t.V2}}
+		},
+	)
+	return Prefix(prefix, rest)
+}
+
+func collectionLineP() Parser[lineResult] {
+	prefix := Try(Sequence2(StringP("collection"), Spaces1P()))
+	rest := Map(
+		Sequence2(IdentP(), Prefix(eqP(), Suffix(endP(), IdentP()))),
+		func(t Of2[string, string]) lineResult {
+			return lineResult{collection: &CollectionSpec{Name: t.V1, Type: t.V2}}
 		},
 	)
 	return Prefix(prefix, rest)
@@ -158,10 +188,11 @@ func skipLineP() Parser[lineResult] {
 
 func lineP() Parser[lineResult] {
 	return Or(typeDefLineP(),
-		Or(queryDefLineP(),
-			Or(updateDefLineP(),
-				Or(collectionLineP(),
-					skipLineP()))))
+		Or(mergeLineP(),
+			Or(queryLineP(),
+				Or(updateLineP(),
+					Or(collectionLineP(),
+						skipLineP())))))
 }
 
 func dslParser() Parser[Plan] {
@@ -171,14 +202,16 @@ func dslParser() Parser[Plan] {
 			var plan Plan
 			for _, r := range results {
 				switch {
-				case r.collection != nil:
-					plan.Collections = append(plan.Collections, *r.collection)
 				case r.typeDef != nil:
 					plan.Types = append(plan.Types, *r.typeDef)
+				case r.mergeDef != nil:
+					plan.Merges = append(plan.Merges, *r.mergeDef)
 				case r.queryDef != nil:
 					plan.Queries = append(plan.Queries, *r.queryDef)
 				case r.updateDef != nil:
 					plan.Updates = append(plan.Updates, *r.updateDef)
+				case r.collection != nil:
+					plan.Collections = append(plan.Collections, *r.collection)
 				}
 			}
 			return plan

@@ -2,17 +2,29 @@ package builder
 
 import (
 	"fmt"
+
 	"gospr/crdt"
 	"gospr/parser"
-	"strconv"
 )
 
+// CollectionSpec produces a runtime CRDT instance for a node.
 type CollectionSpec interface {
 	New(nodeID string) crdt.CRDT
 }
 
-type BuiltPlan struct {
-	Collections []BuiltCollection
+// Model is the validated semantic representation of one vector type — the
+// "proper AST". It is pure data (no closures), so later optimization passes
+// can walk it. Model implements CollectionSpec.
+type Model struct {
+	Name    string
+	Elem    parser.ElemType
+	Merge   parser.Expr            // a Zip expr
+	Queries map[string]crdt.Method // Reduce methods
+	Updates map[string]crdt.Method // Local methods
+}
+
+func (m *Model) New(nodeID string) crdt.CRDT {
+	return crdt.NewVector(nodeID, m.Merge, m.Queries, m.Updates)
 }
 
 type BuiltCollection struct {
@@ -20,162 +32,178 @@ type BuiltCollection struct {
 	Spec CollectionSpec
 }
 
-type GCounterSpec struct {
-	Initial float64
+// BuiltPlan carries per-type models (present even when no collection is
+// declared, so a model can be tested directly) plus instantiated collections.
+type BuiltPlan struct {
+	Models      map[string]*Model
+	Collections []BuiltCollection
 }
 
-func (s GCounterSpec) New(nodeID string) crdt.CRDT {
-	return crdt.NewGCounter(nodeID, s.Initial)
-}
-
-type CompositeSpec struct {
-	Fields  map[string]CollectionSpec
-	Queries map[string]parser.QuerySpec
-	Updates map[string]parser.UpdateSpec
-}
-
-func (s CompositeSpec) New(nodeID string) crdt.CRDT {
-	fieldFactories := make(map[string]func(string) crdt.CRDT, len(s.Fields))
-	for name, spec := range s.Fields {
-		fieldFactories[name] = spec.New
-	}
-	return crdt.NewComposite(nodeID, fieldFactories, s.Queries, s.Updates)
-}
+var knownOps = map[string]bool{"+": true, "*": true, "-": true, "max": true, "min": true}
 
 func Build(plan parser.Plan) (BuiltPlan, error) {
-	typeMap := make(map[string]parser.TypeDef, len(plan.Types))
+	models := make(map[string]*Model, len(plan.Types))
 	for _, td := range plan.Types {
-		typeMap[td.Name] = td
+		if _, dup := models[td.Name]; dup {
+			return BuiltPlan{}, fmt.Errorf("type %s declared twice", td.Name)
+		}
+		if td.Elem.Kind != parser.KindReal {
+			return BuiltPlan{}, fmt.Errorf("type %s: only `vector real` is supported", td.Name)
+		}
+		models[td.Name] = &Model{
+			Name:    td.Name,
+			Elem:    td.Elem,
+			Queries: map[string]crdt.Method{},
+			Updates: map[string]crdt.Method{},
+		}
 	}
-	queryMap := make(map[string][]parser.QueryDef)
+
+	mergeSeen := make(map[string]bool)
+	for _, md := range plan.Merges {
+		m, ok := models[md.TypeName]
+		if !ok {
+			return BuiltPlan{}, fmt.Errorf("merge for unknown type %s", md.TypeName)
+		}
+		if mergeSeen[md.TypeName] {
+			return BuiltPlan{}, fmt.Errorf("type %s has merge defined twice", md.TypeName)
+		}
+		if err := validateZip(md.Body); err != nil {
+			return BuiltPlan{}, fmt.Errorf("merge %s: %w", md.TypeName, err)
+		}
+		m.Merge = md.Body
+		mergeSeen[md.TypeName] = true
+	}
+
 	for _, qd := range plan.Queries {
-		queryMap[qd.TypeName] = append(queryMap[qd.TypeName], qd)
+		m, ok := models[qd.TypeName]
+		if !ok {
+			return BuiltPlan{}, fmt.Errorf("query for unknown type %s", qd.TypeName)
+		}
+		if _, dup := m.Queries[qd.MethodName]; dup {
+			return BuiltPlan{}, fmt.Errorf("query %s.%s defined twice", qd.TypeName, qd.MethodName)
+		}
+		if len(qd.Params) != 0 {
+			return BuiltPlan{}, fmt.Errorf("query %s.%s: query params are not yet supported", qd.TypeName, qd.MethodName)
+		}
+		if err := validateReduce(qd.Body); err != nil {
+			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
+		}
+		m.Queries[qd.MethodName] = crdt.Method{Params: qd.Params, Body: qd.Body}
 	}
-	updateMap := make(map[string][]parser.UpdateDef)
+
 	for _, ud := range plan.Updates {
-		updateMap[ud.TypeName] = append(updateMap[ud.TypeName], ud)
+		m, ok := models[ud.TypeName]
+		if !ok {
+			return BuiltPlan{}, fmt.Errorf("update for unknown type %s", ud.TypeName)
+		}
+		if _, dup := m.Updates[ud.MethodName]; dup {
+			return BuiltPlan{}, fmt.Errorf("update %s.%s defined twice", ud.TypeName, ud.MethodName)
+		}
+		if err := validateParams(ud.Params); err != nil {
+			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
+		}
+		if err := validateLocal(ud.Body, paramSet(ud.Params)); err != nil {
+			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
+		}
+		m.Updates[ud.MethodName] = crdt.Method{Params: ud.Params, Body: ud.Body}
+	}
+
+	// Every type must define a merge — a vector without a join isn't a CRDT.
+	for name := range models {
+		if !mergeSeen[name] {
+			return BuiltPlan{}, fmt.Errorf("type %s has no merge defined", name)
+		}
 	}
 
 	collections := make([]BuiltCollection, 0, len(plan.Collections))
-	for _, spec := range plan.Collections {
-		var bc BuiltCollection
-		var err error
-		if td, ok := typeMap[spec.Type]; ok {
-			bc, err = buildComposite(spec, td, queryMap[spec.Type], updateMap[spec.Type])
-		} else {
-			bc, err = buildPrimitive(spec.Name, spec.Type, spec.Args)
+	seenCollection := make(map[string]bool, len(plan.Collections))
+	for _, cs := range plan.Collections {
+		if seenCollection[cs.Name] {
+			return BuiltPlan{}, fmt.Errorf("collection %s declared twice", cs.Name)
 		}
-		if err != nil {
-			return BuiltPlan{}, err
+		m, ok := models[cs.Type]
+		if !ok {
+			return BuiltPlan{}, fmt.Errorf("collection %s references unknown type %s", cs.Name, cs.Type)
 		}
-		collections = append(collections, bc)
+		seenCollection[cs.Name] = true
+		collections = append(collections, BuiltCollection{Name: cs.Name, Spec: m})
 	}
-	return BuiltPlan{Collections: collections}, nil
+
+	return BuiltPlan{Models: models, Collections: collections}, nil
 }
 
-func buildPrimitive(name, typeName string, args []string) (BuiltCollection, error) {
-	switch typeName {
-	case "GCounter":
-		var initial float64
-		if len(args) > 0 {
-			var err error
-			initial, err = strconv.ParseFloat(args[0], 64)
-			if err != nil {
-				return BuiltCollection{}, fmt.Errorf("GCounter %q: invalid initial value %q: %w", name, args[0], err)
-			}
+// ---- validators ----------------------------------------------------
+
+func validateParams(ps []parser.ParamSpec) error {
+	for _, p := range ps {
+		if p.Type != "real" {
+			return fmt.Errorf("param %s: unknown type %q (only real)", p.Name, p.Type)
 		}
-		return BuiltCollection{Name: name, Spec: GCounterSpec{Initial: initial}}, nil
+	}
+	return nil
+}
+
+func paramSet(ps []parser.ParamSpec) map[string]bool {
+	s := make(map[string]bool, len(ps))
+	for _, p := range ps {
+		s[p.Name] = true
+	}
+	return s
+}
+
+func validateFuncRef(e parser.Expr) error {
+	if e.Kind != parser.ExprFuncRef {
+		return fmt.Errorf("expected a binary function")
+	}
+	if !knownOps[e.Op] {
+		return fmt.Errorf("unknown function %q", e.Op)
+	}
+	return nil
+}
+
+func validateZip(e parser.Expr) error {
+	if e.Kind != parser.ExprZip || e.Fn == nil {
+		return fmt.Errorf("merge must be `zip <fn>`")
+	}
+	return validateFuncRef(*e.Fn)
+}
+
+func validateReduce(e parser.Expr) error {
+	if e.Kind != parser.ExprReduce || e.Fn == nil || e.Init == nil {
+		return fmt.Errorf("query must be `reduce <fn> <init>`")
+	}
+	if err := validateFuncRef(*e.Fn); err != nil {
+		return err
+	}
+	if e.Init.Kind != parser.ExprNumLit {
+		return fmt.Errorf("reduce init must be a number")
+	}
+	return nil
+}
+
+func validateLocal(e parser.Expr, params map[string]bool) error {
+	if e.Kind != parser.ExprLocal || e.Fn == nil {
+		return fmt.Errorf("update must be `local <fn>`")
+	}
+	return validateSection(*e.Fn, params)
+}
+
+func validateSection(e parser.Expr, params map[string]bool) error {
+	if e.Kind != parser.ExprSection || e.Arg == nil {
+		return fmt.Errorf("expected a section like (+ k)")
+	}
+	if !knownOps[e.Op] {
+		return fmt.Errorf("unknown operator %q in section", e.Op)
+	}
+	switch e.Arg.Kind {
+	case parser.ExprNumLit:
+		return nil
+	case parser.ExprParamRef:
+		if !params[e.Arg.Param] {
+			return fmt.Errorf("section references unknown param %q", e.Arg.Param)
+		}
+		return nil
 	default:
-		return BuiltCollection{}, fmt.Errorf("unknown CRDT type: %s", typeName)
+		return fmt.Errorf("section argument must be a number or param ref")
 	}
-}
-
-var knownParamTypes = map[string]bool{"int": true, "real0+": true}
-
-func buildComposite(spec parser.CollectionSpec, def parser.TypeDef, queries []parser.QueryDef, updates []parser.UpdateDef) (BuiltCollection, error) {
-	if len(spec.Args) != len(def.Params) {
-		return BuiltCollection{}, fmt.Errorf("type %s expects %d args, got %d", def.Name, len(def.Params), len(spec.Args))
-	}
-	params := make(map[string]string, len(def.Params))
-	for i, p := range def.Params {
-		params[p.Name] = spec.Args[i]
-	}
-
-	fieldSpecs := make(map[string]CollectionSpec, len(def.Fields))
-	for _, f := range def.Fields {
-		resolved := make([]string, len(f.Args))
-		for i, a := range f.Args {
-			if v, ok := params[a]; ok {
-				resolved[i] = v
-			} else {
-				resolved[i] = a
-			}
-		}
-		bc, err := buildPrimitive(f.Name, f.CRDTType, resolved)
-		if err != nil {
-			return BuiltCollection{}, fmt.Errorf("field %s: %w", f.Name, err)
-		}
-		fieldSpecs[f.Name] = bc.Spec
-	}
-
-	querySpecs := make(map[string]parser.QuerySpec, len(queries))
-	for _, q := range queries {
-		for _, p := range q.Params {
-			if !knownParamTypes[p.Type] {
-				return BuiltCollection{}, fmt.Errorf("query %s.%s: unknown param type %q", q.TypeName, q.MethodName, p.Type)
-			}
-		}
-		paramNames := paramNameSet(q.Params)
-		for _, arg := range q.Body.Args {
-			if err := validateBodyArg(arg, paramNames, q.TypeName, q.MethodName); err != nil {
-				return BuiltCollection{}, err
-			}
-		}
-		querySpecs[q.MethodName] = parser.QuerySpec{Params: q.Params, Body: q.Body}
-	}
-
-	updateSpecs := make(map[string]parser.UpdateSpec, len(updates))
-	for _, u := range updates {
-		for _, p := range u.Params {
-			if !knownParamTypes[p.Type] {
-				return BuiltCollection{}, fmt.Errorf("update %s.%s: unknown param type %q", u.TypeName, u.MethodName, p.Type)
-			}
-		}
-		paramNames := paramNameSet(u.Params)
-		for _, fu := range u.Body {
-			for _, arg := range fu.Call.Args {
-				if err := validateBodyArg(arg, paramNames, u.TypeName, u.MethodName); err != nil {
-					return BuiltCollection{}, err
-				}
-			}
-		}
-		updateSpecs[u.MethodName] = parser.UpdateSpec{Params: u.Params, Body: u.Body}
-	}
-
-	return BuiltCollection{
-		Name: spec.Name,
-		Spec: CompositeSpec{
-			Fields:  fieldSpecs,
-			Queries: querySpecs,
-			Updates: updateSpecs,
-		},
-	}, nil
-}
-
-func paramNameSet(params []parser.ParamSpec) map[string]bool {
-	set := make(map[string]bool, len(params))
-	for _, p := range params {
-		set[p.Name] = true
-	}
-	return set
-}
-
-func validateBodyArg(arg string, paramNames map[string]bool, typeName, methodName string) error {
-	if paramNames[arg] {
-		return nil
-	}
-	if _, err := strconv.ParseFloat(arg, 64); err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s.%s: body arg %q is neither a declared param nor a numeric literal", typeName, methodName, arg)
 }
