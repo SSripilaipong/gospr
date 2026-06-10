@@ -3,6 +3,9 @@ package crdt
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"gospr/parser"
 )
 
@@ -35,27 +38,24 @@ func newT(nodeID string) *VectorCRDT {
 
 func TestVector_addAndValue(t *testing.T) {
 	v := newT("nodeA")
-	if got, _ := v.Query("Value", nil); got != 0.0 {
-		t.Fatalf("empty Value = %v, want 0", got)
-	}
-	if err := v.Apply("Add", []any{3.0}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	if err := v.Apply("Add", []any{2.0}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	if got, _ := v.Query("Value", nil); got != 5.0 {
-		t.Fatalf("Value = %v, want 5", got)
-	}
+	got, err := v.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0.0, got)
+
+	require.NoError(t, v.Apply("Add", []any{3.0}))
+	require.NoError(t, v.Apply("Add", []any{2.0}))
+
+	got, err = v.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 5.0, got)
 }
 
 func TestVector_localOnlyAffectsLocalSlot(t *testing.T) {
 	v := newT("nodeA")
 	v.Apply("Add", []any{4.0})
 	snap := v.Snapshot().(map[string]float64)
-	if len(snap) != 1 || snap["nodeA"] != 4.0 {
-		t.Fatalf("snapshot = %v, want {nodeA:4}", snap)
-	}
+	assert.Len(t, snap, 1)
+	assert.Equal(t, 4.0, snap["nodeA"])
 }
 
 func TestVector_mergeIsElementwiseMax(t *testing.T) {
@@ -64,37 +64,28 @@ func TestVector_mergeIsElementwiseMax(t *testing.T) {
 	a.Apply("Add", []any{3.0}) // a: {nodeA:3}
 	b.Apply("Add", []any{5.0}) // b: {nodeB:5}
 
-	if err := a.Merge(b.Snapshot()); err != nil {
-		t.Fatalf("merge: %v", err)
-	}
+	require.NoError(t, a.Merge(b.Snapshot()))
 	// union: {nodeA:3, nodeB:5} -> reduce + = 8
-	if got, _ := a.Query("Value", nil); got != 8.0 {
-		t.Fatalf("Value after merge = %v, want 8", got)
-	}
+	got, err := a.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 8.0, got)
 
 	// merge is max per slot: a re-adds, then a stale lower snapshot must not lower it.
 	a.Apply("Add", []any{10.0}) // nodeA: 13
 	stale := map[string]float64{"nodeA": 1.0}
 	a.Merge(stale)
 	snap := a.Snapshot().(map[string]float64)
-	if snap["nodeA"] != 13.0 {
-		t.Fatalf("nodeA slot = %v, want 13 (max wins)", snap["nodeA"])
-	}
+	assert.Equal(t, 13.0, snap["nodeA"])
 }
 
 func TestVector_unknownActionAndQuery(t *testing.T) {
 	v := newT("nodeA")
-	if err := v.Apply("Nope", nil); err == nil {
-		t.Fatalf("expected error for unknown action")
-	}
-	if _, err := v.Query("Nope", nil); err == nil {
-		t.Fatalf("expected error for unknown query")
-	}
+	require.Error(t, v.Apply("Nope", nil))
+	_, err := v.Query("Nope", nil)
+	require.Error(t, err)
 }
 
 func TestVector_paramCountMismatch(t *testing.T) {
 	v := newT("nodeA")
-	if err := v.Apply("Add", nil); err == nil {
-		t.Fatalf("expected error for missing param")
-	}
+	require.Error(t, v.Apply("Add", nil))
 }

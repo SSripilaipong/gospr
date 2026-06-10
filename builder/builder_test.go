@@ -3,6 +3,9 @@ package builder
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"gospr/parser"
 )
 
@@ -39,55 +42,37 @@ func canonicalPlan() parser.Plan {
 // Mandated integration test: hard-coded AST -> a correct model.
 func TestBuild_integration(t *testing.T) {
 	built, err := Build(canonicalPlan())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	m, ok := built.Models["T"]
-	if !ok {
-		t.Fatalf("model T not built; models = %v", built.Models)
-	}
-	if m.Elem.Kind != parser.KindReal {
-		t.Fatalf("elem kind = %v, want real", m.Elem.Kind)
-	}
-	if m.Merge.Kind != parser.ExprZip || m.Merge.Fn.Op != "max" {
-		t.Fatalf("merge = %+v, want zip max", m.Merge)
-	}
-	if _, ok := m.Queries["Value"]; !ok {
-		t.Fatalf("missing query Value")
-	}
-	if _, ok := m.Updates["Add"]; !ok {
-		t.Fatalf("missing update Add")
-	}
+	require.NoError(t, err)
+
+	require.Contains(t, built.Models, "T")
+	m := built.Models["T"]
+
+	assert.Equal(t, parser.KindReal, m.Elem.Kind)
+	assert.Equal(t, parser.ExprZip, m.Merge.Kind)
+	require.NotNil(t, m.Merge.Fn)
+	assert.Equal(t, "max", m.Merge.Fn.Op)
+	assert.Contains(t, m.Queries, "Value")
+	assert.Contains(t, m.Updates, "Add")
 
 	// The built model must produce a working runtime instance.
 	c := m.New("nodeA")
-	if err := c.Apply("Add", []any{3.0}); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
+	require.NoError(t, c.Apply("Add", []any{3.0}))
 	got, err := c.Query("Value", nil)
-	if err != nil {
-		t.Fatalf("Value: %v", err)
-	}
-	if got != 3.0 {
-		t.Fatalf("Value = %v, want 3", got)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 3.0, got)
 }
 
 func TestBuild_collectionReferencesType(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Collections = []parser.CollectionSpec{{Name: "MyVec", Type: "T"}}
 	built, err := Build(plan)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(built.Collections) != 1 || built.Collections[0].Name != "MyVec" {
-		t.Fatalf("collections = %+v", built.Collections)
-	}
+	require.NoError(t, err)
+	require.Len(t, built.Collections, 1)
+	assert.Equal(t, "MyVec", built.Collections[0].Name)
 	// The collection spec is the model.
 	c := built.Collections[0].Spec.New("nodeA")
-	if _, err := c.Query("Value", nil); err != nil {
-		t.Fatalf("query via collection: %v", err)
-	}
+	_, err = c.Query("Value", nil)
+	require.NoError(t, err)
 }
 
 func TestBuild_unknownTypeForMerge(t *testing.T) {
@@ -96,42 +81,37 @@ func TestBuild_unknownTypeForMerge(t *testing.T) {
 		TypeName: "Ghost",
 		Body:     plan.Merges[0].Body,
 	})
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for merge on unknown type")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_missingMerge(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Merges = nil
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for type without merge")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_unknownOp(t *testing.T) {
 	plan := canonicalPlan()
 	bad := parser.Expr{Kind: parser.ExprFuncRef, Op: "wat"}
 	plan.Merges[0].Body = parser.Expr{Kind: parser.ExprZip, Fn: &bad}
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for unknown op")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_badParamType(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Updates[0].Params = []parser.ParamSpec{{Name: "k", Type: "int"}}
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for non-real param type")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_queryParamsRejected(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Queries[0].Params = []parser.ParamSpec{{Name: "m", Type: "real"}}
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error: query params not yet supported")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_duplicateMerge(t *testing.T) {
@@ -141,9 +121,8 @@ func TestBuild_duplicateMerge(t *testing.T) {
 		TypeName: "T",
 		Body:     parser.Expr{Kind: parser.ExprZip, Fn: &minFn},
 	})
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for duplicate merge on T")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_duplicateQuery(t *testing.T) {
@@ -154,9 +133,8 @@ func TestBuild_duplicateQuery(t *testing.T) {
 		TypeName: "T", MethodName: "Value",
 		Body: parser.Expr{Kind: parser.ExprReduce, Fn: &starFn, Init: &one},
 	})
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for duplicate query T.Value")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_duplicateUpdate(t *testing.T) {
@@ -167,9 +145,8 @@ func TestBuild_duplicateUpdate(t *testing.T) {
 		Body: parser.Expr{Kind: parser.ExprLocal,
 			Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &two}},
 	})
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for duplicate update T.Add")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_duplicateCollection(t *testing.T) {
@@ -178,9 +155,8 @@ func TestBuild_duplicateCollection(t *testing.T) {
 		{Name: "MyVec", Type: "T"},
 		{Name: "MyVec", Type: "T"},
 	}
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for duplicate collection MyVec")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }
 
 func TestBuild_sameQueryAndUpdateNameAllowed(t *testing.T) {
@@ -193,9 +169,8 @@ func TestBuild_sameQueryAndUpdateNameAllowed(t *testing.T) {
 		TypeName: "T", MethodName: "Add", // same name as the update
 		Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plusFn, Init: &zero},
 	})
-	if _, err := Build(plan); err != nil {
-		t.Fatalf("query and update sharing a name should be allowed, got: %v", err)
-	}
+	_, err := Build(plan)
+	require.NoError(t, err)
 }
 
 func TestBuild_sectionUnknownParam(t *testing.T) {
@@ -203,7 +178,6 @@ func TestBuild_sectionUnknownParam(t *testing.T) {
 	badRef := parser.Expr{Kind: parser.ExprParamRef, Param: "nope"}
 	plan.Updates[0].Body = parser.Expr{Kind: parser.ExprLocal,
 		Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &badRef}}
-	if _, err := Build(plan); err == nil {
-		t.Fatalf("expected error for unresolved section param")
-	}
+	_, err := Build(plan)
+	require.Error(t, err)
 }

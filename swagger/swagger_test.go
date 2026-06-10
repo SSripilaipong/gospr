@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"gospr/builder"
 	"gospr/crdt"
 	"gospr/parser"
@@ -40,15 +43,11 @@ func makeModelPlan() builder.BuiltPlan {
 
 func TestGenerate_paramSchemas(t *testing.T) {
 	data, err := Generate(makeModelPlan())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var doc map[string]any
-	if err := json.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
-	}
-	paths := doc["paths"].(map[string]any)
+	require.NoError(t, json.Unmarshal(data, &doc))
 
+	paths := doc["paths"].(map[string]any)
 	addPath := paths["/api/collections/MyVec/Add"].(map[string]any)
 	post := addPath["post"].(map[string]any)
 	rb := post["requestBody"].(map[string]any)
@@ -56,57 +55,40 @@ func TestGenerate_paramSchemas(t *testing.T) {
 
 	example := mt["example"].(map[string]any)
 	params := example["params"].([]any)
-	if len(params) != 1 || params[0] != float64(1) {
-		t.Errorf("expected example params [1], got %v", params)
-	}
+	assert.Equal(t, []any{float64(1)}, params)
 
 	schemaObj := mt["schema"].(map[string]any)
 	propsObj := schemaObj["properties"].(map[string]any)
 	paramsSchema := propsObj["params"].(map[string]any)
 	items := paramsSchema["items"].(map[string]any)
-	if items["type"] != "number" {
-		t.Errorf("expected items.type=number, got %v", items["type"])
-	}
+	assert.Equal(t, "number", items["type"])
 }
 
 func TestGenerate_zeroParamPost(t *testing.T) {
 	data, err := Generate(makeModelPlan())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var doc map[string]any
-	if err := json.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
-	}
-	paths := doc["paths"].(map[string]any)
+	require.NoError(t, json.Unmarshal(data, &doc))
 
+	paths := doc["paths"].(map[string]any)
 	addOnePath := paths["/api/collections/MyVec/AddOne"].(map[string]any)
 	post := addOnePath["post"].(map[string]any)
 	rb := post["requestBody"].(map[string]any)
-	if rb["required"] != false {
-		t.Error("expected required=false for zero-param update")
-	}
+	assert.Equal(t, false, rb["required"])
 	mt := rb["content"].(map[string]any)["application/json"].(map[string]any)
 	example := mt["example"].(map[string]any)
-	if len(example) != 0 {
-		t.Errorf("expected empty example {}, got %v", example)
-	}
+	assert.Empty(t, example)
 }
 
 func TestGenerate_getZeroParamQuery(t *testing.T) {
 	data, err := Generate(makeModelPlan())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var doc map[string]any
-	if err := json.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
-	}
-	paths := doc["paths"].(map[string]any)
+	require.NoError(t, json.Unmarshal(data, &doc))
 
+	paths := doc["paths"].(map[string]any)
 	getPath := paths["/api/collections/MyVec/Value"].(map[string]any)
 	get := getPath["get"].(map[string]any)
-	if _, hasParams := get["parameters"]; hasParams {
-		t.Error("expected no parameters for zero-param query")
-	}
+	_, hasParams := get["parameters"]
+	assert.False(t, hasParams)
 }

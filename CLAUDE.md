@@ -121,6 +121,13 @@ collection MyVec = T            # named runtime instance of a type (no args)
 - **New expression form** (e.g. enable `Compose`, query params, struct vectors): add/realize an `ExprKind`/`ElemKind` in `parser/types.go`, parse it in `dsl.go`, validate in `builder.Build`, evaluate in `crdt/vector.go`.
 - **Network propagation of `deployMsg`:** `BuiltPlan` is data-only; gob/JSON-encode `Model` (it holds `parser.Expr` trees, no closures).
 
+## Testing conventions
+
+Tests use `github.com/stretchr/testify` (`assert` + `require`):
+- `require.*` — fatal (stops test immediately); use for error checks and preconditions where subsequent code would panic or be meaningless
+- `assert.*` — non-fatal (continues test); use for terminal value comparisons
+- Typical pattern: `require.NoError(t, err)` for pipeline steps, `assert.Equal(t, want, got)` for value checks
+
 ## Gotchas / conventions
 
 - **Committed-choice:** once a line's keyword prefix is consumed, `Or` commits — a recognized-but-malformed line (e.g. `type T = vector foo`) is a **parse error**, not skipped. `Try` strips `Consumed` on failure to re-enable backtracking; every `opP` alternative is `Try`-wrapped.
