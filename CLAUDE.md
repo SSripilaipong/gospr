@@ -105,7 +105,8 @@ parser/
   parser_test.go      canonical-snippet integration test + cases
 
 e2e/
-  e2e_test.go         string → Parse → Build → Model.New → Add/Value/merge behaviors
+  e2e_test.go         model-level: string → Parse → Build → Model.New → Add/Value/merge behaviors
+  cluster_http_test.go blackbox: real 3-node cluster (nodes+gossip+httptest gateways), driven ONLY via HTTP; deploy→Add on one node→poll until value gossips to another (node.WithGossipInterval for speed, require.Eventually for convergence)
 ```
 
 ## DSL syntax

@@ -30,15 +30,21 @@ func New(n *node.Node, addr string) *Gateway {
 	return g
 }
 
-func (g *Gateway) Start() {
+// Handler builds the HTTP routing for this gateway. Exposed so tests can wrap
+// it in httptest.NewServer; Start uses it for the real listener.
+func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/cluster/deploy", g.handleDeploy)
 	mux.HandleFunc("POST /api/collections/{collection}/{action}", g.handleApply)
 	mux.HandleFunc("GET /api/collections/{collection}/{query}", g.handleQuery)
 	mux.HandleFunc("GET /api/swagger.json", g.handleSwagger)
 	mux.HandleFunc("GET /api/docs", g.handleDocs)
+	return mux
+}
+
+func (g *Gateway) Start() {
 	log.Printf("[%s] listening on %s", g.node.ID(), g.addr)
-	if err := http.ListenAndServe(g.addr, mux); err != nil {
+	if err := http.ListenAndServe(g.addr, g.Handler()); err != nil {
 		log.Fatalf("gateway %s: %v", g.addr, err)
 	}
 }

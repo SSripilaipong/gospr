@@ -27,20 +27,35 @@ type deployMsg struct {
 }
 
 type Node struct {
-	id          string
-	state       State
-	inbox       chan any
-	peers       []chan any
-	collections map[string]crdt.CRDT
-	mu          sync.RWMutex
+	id             string
+	state          State
+	inbox          chan any
+	peers          []chan any
+	collections    map[string]crdt.CRDT
+	gossipInterval time.Duration
+	mu             sync.RWMutex
 }
 
-func New(id string) *Node {
-	return &Node{
-		id:          id,
-		inbox:       make(chan any, 64),
-		collections: make(map[string]crdt.CRDT),
+// Option configures a Node at construction.
+type Option func(*Node)
+
+// WithGossipInterval overrides the default 2s gossip ticker; tests use a short
+// interval so propagation converges quickly.
+func WithGossipInterval(d time.Duration) Option {
+	return func(n *Node) { n.gossipInterval = d }
+}
+
+func New(id string, opts ...Option) *Node {
+	n := &Node{
+		id:             id,
+		inbox:          make(chan any, 64),
+		collections:    make(map[string]crdt.CRDT),
+		gossipInterval: 2 * time.Second,
 	}
+	for _, opt := range opts {
+		opt(n)
+	}
+	return n
 }
 
 func (n *Node) ID() string { return n.id }
@@ -122,7 +137,7 @@ func (n *Node) MergeSnapshot(snap map[string]any) {
 }
 
 func (n *Node) runGossip() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(n.gossipInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		n.mu.RLock()
