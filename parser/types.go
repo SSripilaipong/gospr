@@ -10,8 +10,8 @@ import "fmt"
 type ElemKind int
 
 const (
-	KindReal ElemKind = iota
-	KindStruct // reserved, NOT parsed yet
+	KindReal   ElemKind = iota
+	KindStruct          // reserved, NOT parsed yet
 )
 
 // ElemType describes what each vector slot holds. For `vector real`,
@@ -38,14 +38,41 @@ type ExprKind int
 
 const (
 	ExprNumLit ExprKind = iota // numeric literal: 0, 1, 2.5
+	ExprStrLit                 // string literal: "hello"
 	ExprName                   // PARSER-ONLY: unresolved identifier or operator token
 	ExprVar                    // BUILT-ONLY: a bound parameter reference
 	ExprRef                    // BUILT-ONLY: a function symbol (primitive or user fn)
 	ExprApp                    // application f a b ... (possibly partial)
+	ExprGuards                 // guarded body: | cond = result ... | otherwise = result
 	ExprReduce                 // reduce <fn> <init>
 	ExprZip                    // zip <fn>
 	ExprLocal                  // local <fn>
 )
+
+// ValType is a value's type. The language has three: a real number, a boolean
+// (produced only by comparison operators), and a string (produced only by
+// string literals). Params are real-only; bool/string arise from comparisons,
+// string literals, and inferred function return types.
+type ValType int
+
+const (
+	TypeReal ValType = iota
+	TypeBool
+	TypeString
+)
+
+func (t ValType) String() string {
+	switch t {
+	case TypeReal:
+		return "real"
+	case TypeBool:
+		return "bool"
+	case TypeString:
+		return "string"
+	default:
+		return "unknown"
+	}
+}
 
 // RefKind distinguishes a built-in primitive operator from a user-defined
 // function. Only set on a resolved ExprRef.
@@ -70,6 +97,9 @@ type Expr struct {
 	// ExprNumLit
 	Num float64
 
+	// ExprStrLit
+	Str string
+
 	// ExprName / ExprVar / ExprRef: the identifier or operator symbol.
 	Name string
 
@@ -87,6 +117,19 @@ type Expr struct {
 	// (a Ref or a partial App). Reduce additionally uses Init (a NumLit).
 	Fn   *Expr
 	Init *Expr
+
+	// ExprGuards: ordered guard cases, the last of which must be `otherwise`.
+	Cases []GuardCase
+}
+
+// GuardCase is one `| cond = result` line of a guarded function body. The
+// terminal `| otherwise = result` is represented with Otherwise == true and a
+// nil Cond — `otherwise` is a syntactic marker, never an expression, so it
+// cannot be forged by an always-true condition.
+type GuardCase struct {
+	Cond      *Expr // nil when Otherwise
+	Result    *Expr
+	Otherwise bool
 }
 
 // ---- Method params -------------------------------------------------

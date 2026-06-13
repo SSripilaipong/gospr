@@ -58,7 +58,8 @@ type schema struct {
 }
 
 type response struct {
-	Description string `json:"description"`
+	Description string               `json:"description"`
+	Content     map[string]mediaType `json:"content,omitempty"`
 }
 
 func Generate(plan builder.BuiltPlan) ([]byte, error) {
@@ -86,7 +87,7 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	for _, bc := range plan.Collections {
 		if m, ok := bc.Spec.(*builder.Model); ok {
 			for queryName, qs := range m.Queries {
-				addGetPath(paths, bc.Name, queryName, qs.Params)
+				addGetPath(paths, bc.Name, queryName, qs.Params, qs.Result)
 			}
 			for actionName, us := range m.Updates {
 				addPostPath(paths, bc.Name, actionName, us.Params)
@@ -102,12 +103,15 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	return json.MarshalIndent(spec, "", "  ")
 }
 
-func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec) {
+func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType) {
 	key := "/api/collections/" + collection + "/" + queryName
 	op := &operation{
 		Summary: queryName + " on " + collection,
 		Responses: map[string]response{
-			"200": {Description: "Query result"},
+			"200": {
+				Description: "Query result",
+				Content:     map[string]mediaType{"application/json": {Schema: valTypeSchema(result)}},
+			},
 			"400": {Description: "Error"},
 		},
 	}
@@ -172,6 +176,18 @@ func addPostPath(paths map[string]pathItem, collection, actionName string, param
 	}
 	paths[key] = pathItem{
 		Post: op,
+	}
+}
+
+// valTypeSchema maps a query's result value type to an OpenAPI schema.
+func valTypeSchema(t parser.ValType) schema {
+	switch t {
+	case parser.TypeBool:
+		return schema{Type: "boolean"}
+	case parser.TypeString:
+		return schema{Type: "string"}
+	default:
+		return schema{Type: "number"}
 	}
 }
 

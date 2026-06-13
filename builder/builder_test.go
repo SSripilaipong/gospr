@@ -34,6 +34,18 @@ func local(fn parser.Expr) parser.Expr {
 	f := fn
 	return parser.Expr{Kind: parser.ExprLocal, Fn: &f}
 }
+func str(s string) parser.Expr { return parser.Expr{Kind: parser.ExprStrLit, Str: s} }
+func guards(cases ...parser.GuardCase) parser.Expr {
+	return parser.Expr{Kind: parser.ExprGuards, Cases: cases}
+}
+func gcase(cond, result parser.Expr) parser.GuardCase {
+	c, r := cond, result
+	return parser.GuardCase{Cond: &c, Result: &r}
+}
+func gotherwise(result parser.Expr) parser.GuardCase {
+	r := result
+	return parser.GuardCase{Otherwise: true, Result: &r}
+}
 
 // canonicalPlan hard-codes the (unresolved) AST for:
 //
@@ -252,12 +264,116 @@ func TestBuild_combinatorArityMismatch(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestBuild_recursionBuildsOK(t *testing.T) {
+func TestBuild_unanchoredRecursionRejected(t *testing.T) {
 	plan := canonicalPlan()
-	// fn loop a b = loop a b  (self-referential; allowed at build time)
+	// fn loop a b = loop a b  — Option A: return type can't be inferred, rejected.
 	plan.Functions = append(plan.Functions, parser.FnDef{Name: "loop",
 		Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
 		Body:   app(name("loop"), name("a"), name("b"))})
 	_, err := Build(plan)
+	require.Error(t, err)
+}
+
+func TestBuild_anchoredRecursionBuildsOK(t *testing.T) {
+	plan := canonicalPlan()
+	// fn f x | (> x 0) = f (- x 1) | otherwise = 0  — anchored by the real base case.
+	body := guards(
+		gcase(app(name(">"), name("x"), num(0)), app(name("f"), app(name("-"), name("x"), num(1)))),
+		gotherwise(num(0)),
+	)
+	plan.Functions = append(plan.Functions, parser.FnDef{Name: "f",
+		Params: []parser.ParamSpec{{Name: "x", Type: "real"}},
+		Body:   body})
+	_, err := Build(plan)
 	require.NoError(t, err)
+}
+
+// ---- guards / bool / string type checking --------------------------
+
+// mustParse parses DSL source, failing the test on a parse error.
+func mustParse(t *testing.T, src string) parser.Plan {
+	t.Helper()
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	return plan
+}
+
+// Integration: build the guarded grade program and assert the inferred query
+// result type is string.
+func TestBuild_guardedProgram(t *testing.T) {
+	src := `type T = vector real
+fn myScore x::real
+| (> x 90) = "You got a A"
+| (>= x 80) = "You got a B"
+| otherwise = "You got a F"
+merge T = zip max
+query T.Grade = myScore (reduce max 0)
+update T.Add k::real = local (+ k)
+collection Scores = T
+`
+	built, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+
+	m := built.Models["T"]
+	require.NotNil(t, m)
+	grade, ok := m.Queries["Grade"]
+	require.True(t, ok)
+	assert.Equal(t, parser.TypeString, grade.Result)
+}
+
+func TestBuild_boolReturningFnOK(t *testing.T) {
+	_, err := Build(mustParse(t, "fn adult x::real = >= x 18\n"))
+	require.NoError(t, err)
+}
+
+func TestBuild_guardTypeErrors(t *testing.T) {
+	cases := map[string]string{
+		"guard cond not bool": `fn bad x::real
+| (+ x 1) = "a"
+| otherwise = "b"
+`,
+		"mismatched branch types": `fn bad x::real
+| (> x 1) = "a"
+| otherwise = 0
+`,
+		"missing final otherwise": `fn bad x::real
+| (> x 1) = "a"
+| (> x 2) = "b"
+`,
+		"otherwise not last": `fn bad x::real
+| otherwise = "a"
+| (> x 1) = "b"
+`,
+		"bool passed to arithmetic": "fn bad x::real = + (> x 1) 2\n",
+		"reduce in fn body":         "fn bad x::real = reduce + 0\n",
+	}
+	for nameStr, src := range cases {
+		t.Run(nameStr, func(t *testing.T) {
+			_, err := Build(mustParse(t, src))
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestBuild_applicationTypeMismatch(t *testing.T) {
+	// g expects a real; passing it a bool (> x 1) is a type error.
+	src := `fn g y::real = y
+fn bad x::real = g (> x 1)
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+}
+
+func TestBuild_stringFnInLocalRejected(t *testing.T) {
+	// an update's local fn must return real; a string-returning fn is rejected.
+	src := `type T = vector real
+fn label x::real
+| (> x 0) = "pos"
+| otherwise = "neg"
+merge T = zip max
+update T.Set k::real = local label
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
 }

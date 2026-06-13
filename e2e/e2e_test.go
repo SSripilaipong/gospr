@@ -74,6 +74,46 @@ func TestE2E_vectorModel(t *testing.T) {
 	assert.Equal(t, 18.0, got) // 13 (nodeA) + 5 (nodeB)
 }
 
+// End-to-end: a guarded, string-returning function consumed by a query that
+// maps the reduced vector to a grade. Exercises guards, comparisons, string
+// results, otherwise, and reduce-in-a-query-expression together.
+func TestE2E_guardedGradeQuery(t *testing.T) {
+	src := `type Scores = vector real
+fn myScore x::real
+| (> x 90) = "You got a A"
+| (> x 80) = "You got a B"
+| (> x 70) = "You got a C"
+| otherwise = "You got a F"
+merge Scores = zip max
+query Scores.Grade = myScore (reduce max 0)
+update Scores.Add k::real = local (+ k)
+collection Scores = Scores
+`
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	built, err := builder.Build(plan)
+	require.NoError(t, err)
+	m := built.Models["Scores"]
+
+	// empty vector folds to 0 -> otherwise branch
+	got, err := m.New("nodeA").Query("Grade", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "You got a F", got)
+
+	v := m.New("nodeA")
+	require.NoError(t, v.Apply("Add", []any{95.0}))
+	got, err = v.Query("Grade", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "You got a A", got)
+
+	// lower the working set: a fresh node summing to 75 -> grade C
+	w := m.New("nodeB")
+	require.NoError(t, w.Apply("Add", []any{75.0}))
+	got, err = w.Query("Grade", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "You got a C", got)
+}
+
 // Partial application binds the LEFT operand first, so `local (- k)` means
 // \x -> k - x (k minus the current slot), NOT a right-section x - k. This is
 // intentional: the language has one uniform application rule, no special

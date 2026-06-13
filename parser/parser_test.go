@@ -90,6 +90,111 @@ update T.Add k::real = local (+ k)
 	assert.Empty(t, plan.Collections)
 }
 
+// Integration: a full program with a multi-line guarded function (comparisons
+// + string results + otherwise) and a query that wraps reduce.
+func TestParse_guardedFunctionProgram(t *testing.T) {
+	src := `type T = vector real
+fn myScore x::real
+| (> x 90) = "You got a A"
+| (>= x 80) = "You got a B"
+| otherwise = "You got a F"
+merge T = zip max
+query T.Grade = myScore (reduce max 0)
+update T.Add k::real = local (+ k)
+collection Scores = T
+`
+	plan, err := Parse(src)
+	require.NoError(t, err)
+
+	// --- guarded function ---
+	require.Len(t, plan.Functions, 1)
+	fn := plan.Functions[0]
+	assert.Equal(t, "myScore", fn.Name)
+	require.Len(t, fn.Params, 1)
+	require.Equal(t, ExprGuards, fn.Body.Kind)
+	require.Len(t, fn.Body.Cases, 3)
+
+	c0 := fn.Body.Cases[0]
+	assert.False(t, c0.Otherwise)
+	require.NotNil(t, c0.Cond)
+	require.Equal(t, ExprApp, c0.Cond.Kind)
+	assert.Equal(t, ">", c0.Cond.Head.Name)
+	require.Equal(t, ExprStrLit, c0.Result.Kind)
+	assert.Equal(t, "You got a A", c0.Result.Str)
+
+	assert.Equal(t, ">=", fn.Body.Cases[1].Cond.Head.Name)
+
+	cLast := fn.Body.Cases[2]
+	assert.True(t, cLast.Otherwise)
+	assert.Nil(t, cLast.Cond)
+	assert.Equal(t, "You got a F", cLast.Result.Str)
+
+	// --- query body: myScore (reduce max 0) ---
+	require.Len(t, plan.Queries, 1)
+	qb := plan.Queries[0].Body
+	require.Equal(t, ExprApp, qb.Kind)
+	assert.Equal(t, "myScore", qb.Head.Name)
+	require.Len(t, qb.Args, 1)
+	require.Equal(t, ExprReduce, qb.Args[0].Kind)
+	assert.Equal(t, "max", qb.Args[0].Fn.Name)
+	assert.Equal(t, float64(0), qb.Args[0].Init.Num)
+
+	require.Len(t, plan.Collections, 1)
+	assert.Equal(t, "Scores", plan.Collections[0].Name)
+}
+
+func TestParse_singleLineFnStillWorks(t *testing.T) {
+	plan, err := Parse("fn lub a::real b::real = max a b\n")
+	require.NoError(t, err)
+	require.Len(t, plan.Functions, 1)
+	assert.Equal(t, ExprApp, plan.Functions[0].Body.Kind)
+}
+
+func TestParse_stringLiteralEscapes(t *testing.T) {
+	plan, err := Parse("fn f x::real = \"a\\\"b\\\\c\"\n")
+	require.NoError(t, err)
+	body := plan.Functions[0].Body
+	require.Equal(t, ExprStrLit, body.Kind)
+	assert.Equal(t, "a\"b\\c", body.Str)
+}
+
+func TestParse_unterminatedStringIsError(t *testing.T) {
+	_, err := Parse("fn f x::real = \"oops\n")
+	require.Error(t, err)
+}
+
+func TestParse_comparisonOperators(t *testing.T) {
+	for _, op := range []string{">", "<", ">=", "<=", "==", "/="} {
+		plan, err := Parse("fn f x::real = " + op + " x 1\n")
+		require.NoError(t, err, "op %q", op)
+		body := plan.Functions[0].Body
+		require.Equal(t, ExprApp, body.Kind, "op %q", op)
+		assert.Equal(t, op, body.Head.Name, "op %q", op)
+	}
+}
+
+func TestParse_queryWrapsReduceAtom(t *testing.T) {
+	plan, err := Parse("query T.Grade = f (reduce max 0)\n")
+	require.NoError(t, err)
+	qb := plan.Queries[0].Body
+	require.Equal(t, ExprApp, qb.Kind)
+	require.Len(t, qb.Args, 1)
+	assert.Equal(t, ExprReduce, qb.Args[0].Kind)
+}
+
+// A stray `| ...` line — a malformed guard after `otherwise`, or a `|` with no
+// `fn` header — is a parse error, never silently skipped.
+func TestParse_strayBarIsError(t *testing.T) {
+	cases := []string{
+		"fn f x::real\n| otherwise = \"a\"\n| broken\n", // malformed guard after otherwise
+		"type T = vector real\n| broken\n",              // `|` with no fn header
+	}
+	for _, src := range cases {
+		_, err := Parse(src)
+		require.Error(t, err, "src: %q", src)
+	}
+}
+
 func TestParse_collection(t *testing.T) {
 	plan, err := Parse("collection MyVec = T\n")
 	require.NoError(t, err)

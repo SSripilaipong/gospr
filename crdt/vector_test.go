@@ -122,7 +122,7 @@ func TestEval_application(t *testing.T) {
 
 	got, err := v.eval(app(fnRef("add", 2), lit(2), lit(3)), nil, 0)
 	require.NoError(t, err)
-	require.False(t, got.isFunc)
+	require.Equal(t, kNum, got.kind)
 	assert.Equal(t, 5.0, got.num)
 }
 
@@ -131,9 +131,9 @@ func TestEval_partialApplication(t *testing.T) {
 	// (+ 1) is a unary function value
 	got, err := v.eval(app(prim("+"), lit(1)), nil, 0)
 	require.NoError(t, err)
-	require.True(t, got.isFunc)
+	require.Equal(t, kFunc, got.kind)
 	assert.Equal(t, 1, got.arity)
-	r, err := got.call([]float64{4})
+	r, err := got.call([]rtVal{numVal(4)})
 	require.NoError(t, err)
 	assert.Equal(t, 5.0, r.num)
 }
@@ -142,10 +142,80 @@ func TestEval_primitiveRef(t *testing.T) {
 	v := NewVector("n", zipMax(), nil, nil, nil)
 	got, err := v.eval(prim("max"), nil, 0)
 	require.NoError(t, err)
-	require.True(t, got.isFunc)
-	r, err := got.call([]float64{3, 7})
+	require.Equal(t, kFunc, got.kind)
+	r, err := got.call([]rtVal{numVal(3), numVal(7)})
 	require.NoError(t, err)
 	assert.Equal(t, 7.0, r.num)
+}
+
+// ---- bool / string / guards / reduce-in-expression -----------------
+
+func str(s string) parser.Expr { return parser.Expr{Kind: parser.ExprStrLit, Str: s} }
+func guards(cases ...parser.GuardCase) parser.Expr {
+	return parser.Expr{Kind: parser.ExprGuards, Cases: cases}
+}
+func gcase(cond, result parser.Expr) parser.GuardCase {
+	c, r := cond, result
+	return parser.GuardCase{Cond: &c, Result: &r}
+}
+func gotherwise(result parser.Expr) parser.GuardCase {
+	r := result
+	return parser.GuardCase{Otherwise: true, Result: &r}
+}
+
+func TestEval_comparisonReturnsBool(t *testing.T) {
+	v := NewVector("n", zipMax(), nil, nil, nil)
+	got, err := v.eval(app(prim(">"), lit(5), lit(3)), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, kBool, got.kind)
+	assert.True(t, got.b)
+
+	got, err = v.eval(app(prim(">"), lit(2), lit(3)), nil, 0)
+	require.NoError(t, err)
+	assert.False(t, got.b)
+}
+
+func TestEval_stringLiteral(t *testing.T) {
+	v := NewVector("n", zipMax(), nil, nil, nil)
+	got, err := v.eval(str("hi"), nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, kStr, got.kind)
+	assert.Equal(t, "hi", got.str)
+}
+
+func TestEval_guardsSelectFirstTrueElseOtherwise(t *testing.T) {
+	// fn grade x | (>= x 90) = "A" | (>= x 80) = "B" | otherwise = "F"
+	body := guards(
+		gcase(app(prim(">="), vr("x"), lit(90)), str("A")),
+		gcase(app(prim(">="), vr("x"), lit(80)), str("B")),
+		gotherwise(str("F")),
+	)
+	grade := Function{Name: "grade", Params: []parser.ParamSpec{{Name: "x", Type: "real"}}, Body: body}
+	v := NewVector("n", zipMax(), nil, nil, map[string]Function{"grade": grade})
+
+	call := func(x float64) string {
+		got, err := v.eval(app(fnRef("grade", 1), lit(x)), nil, 0)
+		require.NoError(t, err)
+		require.Equal(t, kStr, got.kind)
+		return got.str
+	}
+	assert.Equal(t, "A", call(95))
+	assert.Equal(t, "B", call(85))
+	assert.Equal(t, "F", call(50)) // otherwise fall-through
+}
+
+func TestEval_reduceInExpression(t *testing.T) {
+	// query body `+ 1 (reduce + 0)` folds the vector then adds 1.
+	fn := prim("+")
+	init := lit(0)
+	reduceBody := parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}
+	body := app(prim("+"), lit(1), reduceBody)
+	v := NewVector("n", zipMax(), map[string]Method{"Q": {Body: body, Result: parser.TypeReal}}, nil, nil)
+	v.state["a"] = 2
+	v.state["b"] = 3
+	got, err := v.Query("Q", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 6.0, got) // 1 + (2 + 3)
 }
 
 // A non-terminating recursive merge fn must error (depth guard), not hang,

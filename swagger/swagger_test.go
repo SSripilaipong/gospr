@@ -81,6 +81,29 @@ func TestGenerate_zeroParamPost(t *testing.T) {
 	assert.Empty(t, example)
 }
 
+func TestGenerate_queryResponseType(t *testing.T) {
+	plan := makeModelPlan()
+	model := plan.Collections[0].Spec.(*builder.Model)
+	model.Queries["Grade"] = crdt.Method{Body: parser.Expr{Kind: parser.ExprStrLit, Str: "A"}, Result: parser.TypeString}
+
+	data, err := Generate(plan)
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	paths := doc["paths"].(map[string]any)
+	get := paths["/api/collections/MyVec/Grade"].(map[string]any)["get"].(map[string]any)
+	resp := get["responses"].(map[string]any)["200"].(map[string]any)
+	mt := resp["content"].(map[string]any)["application/json"].(map[string]any)
+	assert.Equal(t, "string", mt["schema"].(map[string]any)["type"])
+
+	// the real-typed Value query reports number
+	getValue := paths["/api/collections/MyVec/Value"].(map[string]any)["get"].(map[string]any)
+	respValue := getValue["responses"].(map[string]any)["200"].(map[string]any)
+	mtValue := respValue["content"].(map[string]any)["application/json"].(map[string]any)
+	assert.Equal(t, "number", mtValue["schema"].(map[string]any)["type"])
+}
+
 func TestGenerate_getZeroParamQuery(t *testing.T) {
 	data, err := Generate(makeModelPlan())
 	require.NoError(t, err)
