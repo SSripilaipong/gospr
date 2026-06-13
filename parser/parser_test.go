@@ -7,11 +7,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Mandated integration test: parse the canonical snippet into the AST.
+// Mandated integration test: parse the canonical snippet (now including a
+// user-defined function used in merge) into the AST.
 func TestParse_integration(t *testing.T) {
 	src := `type T = vector real
 
-merge T = zip max
+fn lub a::real b::real = max a b
+
+merge T = zip lub
 
 query T.Value = reduce + 0
 
@@ -26,16 +29,34 @@ update T.Add k::real = local (+ k)
 	assert.Equal(t, "T", td.Name)
 	assert.Equal(t, KindReal, td.Elem.Kind)
 
-	// --- merge ---
+	// --- function: fn lub a b = max a b ---
+	require.Len(t, plan.Functions, 1)
+	fn := plan.Functions[0]
+	assert.Equal(t, "lub", fn.Name)
+	require.Len(t, fn.Params, 2)
+	assert.Equal(t, "a", fn.Params[0].Name)
+	assert.Equal(t, "real", fn.Params[0].Type)
+	assert.Equal(t, "b", fn.Params[1].Name)
+	// body is `max a b` == App(Name max, [Name a, Name b]) (unresolved)
+	require.Equal(t, ExprApp, fn.Body.Kind)
+	require.NotNil(t, fn.Body.Head)
+	assert.Equal(t, ExprName, fn.Body.Head.Kind)
+	assert.Equal(t, "max", fn.Body.Head.Name)
+	require.Len(t, fn.Body.Args, 2)
+	assert.Equal(t, ExprName, fn.Body.Args[0].Kind)
+	assert.Equal(t, "a", fn.Body.Args[0].Name)
+	assert.Equal(t, "b", fn.Body.Args[1].Name)
+
+	// --- merge: zip lub (a name atom) ---
 	require.Len(t, plan.Merges, 1)
 	md := plan.Merges[0]
 	assert.Equal(t, "T", md.TypeName)
 	assert.Equal(t, ExprZip, md.Body.Kind)
 	require.NotNil(t, md.Body.Fn)
-	assert.Equal(t, ExprFuncRef, md.Body.Fn.Kind)
-	assert.Equal(t, "max", md.Body.Fn.Op)
+	assert.Equal(t, ExprName, md.Body.Fn.Kind)
+	assert.Equal(t, "lub", md.Body.Fn.Name)
 
-	// --- query ---
+	// --- query: reduce + 0 ---
 	require.Len(t, plan.Queries, 1)
 	qd := plan.Queries[0]
 	assert.Equal(t, "T", qd.TypeName)
@@ -43,27 +64,28 @@ update T.Add k::real = local (+ k)
 	assert.Empty(t, qd.Params)
 	assert.Equal(t, ExprReduce, qd.Body.Kind)
 	require.NotNil(t, qd.Body.Fn)
-	assert.Equal(t, "+", qd.Body.Fn.Op)
+	assert.Equal(t, ExprName, qd.Body.Fn.Kind)
+	assert.Equal(t, "+", qd.Body.Fn.Name)
 	require.NotNil(t, qd.Body.Init)
 	assert.Equal(t, ExprNumLit, qd.Body.Init.Kind)
 	assert.Equal(t, float64(0), qd.Body.Init.Num)
 
-	// --- update ---
+	// --- update: local (+ k) == local applied to a partial application ---
 	require.Len(t, plan.Updates, 1)
 	ud := plan.Updates[0]
 	assert.Equal(t, "T", ud.TypeName)
 	assert.Equal(t, "Add", ud.MethodName)
 	require.Len(t, ud.Params, 1)
 	assert.Equal(t, "k", ud.Params[0].Name)
-	assert.Equal(t, "real", ud.Params[0].Type)
 	assert.Equal(t, ExprLocal, ud.Body.Kind)
 	require.NotNil(t, ud.Body.Fn)
 	sec := ud.Body.Fn
-	assert.Equal(t, ExprSection, sec.Kind)
-	assert.Equal(t, "+", sec.Op)
-	require.NotNil(t, sec.Arg)
-	assert.Equal(t, ExprParamRef, sec.Arg.Kind)
-	assert.Equal(t, "k", sec.Arg.Param)
+	require.Equal(t, ExprApp, sec.Kind)
+	require.NotNil(t, sec.Head)
+	assert.Equal(t, "+", sec.Head.Name)
+	require.Len(t, sec.Args, 1)
+	assert.Equal(t, ExprName, sec.Args[0].Kind)
+	assert.Equal(t, "k", sec.Args[0].Name)
 
 	assert.Empty(t, plan.Collections)
 }
@@ -81,10 +103,11 @@ func TestParse_sectionNumberLiteral(t *testing.T) {
 	plan, err := Parse("update T.Inc = local (+ 1)\n")
 	require.NoError(t, err)
 	sec := plan.Updates[0].Body.Fn
-	assert.Equal(t, "+", sec.Op)
-	require.NotNil(t, sec.Arg)
-	assert.Equal(t, ExprNumLit, sec.Arg.Kind)
-	assert.Equal(t, float64(1), sec.Arg.Num)
+	require.Equal(t, ExprApp, sec.Kind)
+	assert.Equal(t, "+", sec.Head.Name)
+	require.Len(t, sec.Args, 1)
+	assert.Equal(t, ExprNumLit, sec.Args[0].Kind)
+	assert.Equal(t, float64(1), sec.Args[0].Num)
 }
 
 func TestParse_decimalLiteral(t *testing.T) {
@@ -104,8 +127,51 @@ func TestParse_operators(t *testing.T) {
 	for src, want := range cases {
 		plan, err := Parse(src)
 		require.NoError(t, err, "src: %q", src)
-		assert.Equal(t, want, plan.Merges[0].Body.Fn.Op, "src: %q", src)
+		assert.Equal(t, want, plan.Merges[0].Body.Fn.Name, "src: %q", src)
 	}
+}
+
+// fn body with nested parenthesised application: + a (max b c)
+func TestParse_nestedApplication(t *testing.T) {
+	plan, err := Parse("fn f a::real b::real c::real = + a (max b c)\n")
+	require.NoError(t, err)
+	require.Len(t, plan.Functions, 1)
+	body := plan.Functions[0].Body
+	require.Equal(t, ExprApp, body.Kind)
+	assert.Equal(t, "+", body.Head.Name)
+	require.Len(t, body.Args, 2)
+	assert.Equal(t, "a", body.Args[0].Name)
+	// second arg is (max b c)
+	inner := body.Args[1]
+	require.Equal(t, ExprApp, inner.Kind)
+	assert.Equal(t, "max", inner.Head.Name)
+	require.Len(t, inner.Args, 2)
+	assert.Equal(t, "b", inner.Args[0].Name)
+	assert.Equal(t, "c", inner.Args[1].Name)
+}
+
+// An identifier with a primitive prefix must parse as one name, not as the
+// operator token max/min followed by a remainder.
+func TestParse_primitivePrefixedIdentifier(t *testing.T) {
+	plan, err := Parse("fn f maximum::real = maximum\n")
+	require.NoError(t, err)
+	fn := plan.Functions[0]
+	require.Len(t, fn.Params, 1)
+	assert.Equal(t, "maximum", fn.Params[0].Name)
+	require.Equal(t, ExprName, fn.Body.Kind)
+	assert.Equal(t, "maximum", fn.Body.Name)
+}
+
+// `reduce + 0`: the fn slot is a single atom, so the init number is not
+// swallowed as an argument to `+`.
+func TestParse_reduceFnIsAtomNotApplication(t *testing.T) {
+	plan, err := Parse("query T.V = reduce + 0\n")
+	require.NoError(t, err)
+	body := plan.Queries[0].Body
+	require.Equal(t, ExprReduce, body.Kind)
+	assert.Equal(t, ExprName, body.Fn.Kind) // not an ExprApp
+	assert.Equal(t, "+", body.Fn.Name)
+	assert.Equal(t, float64(0), body.Init.Num)
 }
 
 func TestParse_skipBlankAndUnknownLines(t *testing.T) {
@@ -128,8 +194,9 @@ func TestParse_malformedTypeIsError(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestParse_malformedMergeIsError(t *testing.T) {
-	_, err := Parse("merge T = zip notAnOp\n")
+// `fn` with no params is rejected (zero-arg functions are not allowed).
+func TestParse_fnWithoutParamsIsError(t *testing.T) {
+	_, err := Parse("fn five = 5\n")
 	require.Error(t, err)
 }
 

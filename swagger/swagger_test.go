@@ -13,26 +13,27 @@ import (
 )
 
 func makeModelPlan() builder.BuiltPlan {
-	plusFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "+"}
+	plus := parser.Expr{Kind: parser.ExprRef, Name: "+", Arity: 2, Ref: parser.RefPrimitive}
+	max := parser.Expr{Kind: parser.ExprRef, Name: "max", Arity: 2, Ref: parser.RefPrimitive}
 	zero := parser.Expr{Kind: parser.ExprNumLit, Num: 0}
+	// (+ 1) and (+ a) as resolved partial applications.
 	one := parser.Expr{Kind: parser.ExprNumLit, Num: 1}
-	aRef := parser.Expr{Kind: parser.ExprParamRef, Param: "a"}
-	maxFn := parser.Expr{Kind: parser.ExprFuncRef, Op: "max"}
+	aVar := parser.Expr{Kind: parser.ExprVar, Name: "a"}
+	addOneFn := parser.Expr{Kind: parser.ExprApp, Head: &plus, Args: []*parser.Expr{&one}}
+	addAFn := parser.Expr{Kind: parser.ExprApp, Head: &plus, Args: []*parser.Expr{&aVar}}
 
 	model := &builder.Model{
 		Name:  "MyVec",
 		Elem:  parser.ElemType{Kind: parser.KindReal},
-		Merge: parser.Expr{Kind: parser.ExprZip, Fn: &maxFn},
+		Merge: parser.Expr{Kind: parser.ExprZip, Fn: &max},
 		Queries: map[string]crdt.Method{
-			"Value": {Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plusFn, Init: &zero}},
+			"Value": {Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plus, Init: &zero}},
 		},
 		Updates: map[string]crdt.Method{
-			"AddOne": {Body: parser.Expr{Kind: parser.ExprLocal,
-				Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &one}}},
+			"AddOne": {Body: parser.Expr{Kind: parser.ExprLocal, Fn: &addOneFn}},
 			"Add": {
 				Params: []parser.ParamSpec{{Name: "a", Type: "real"}},
-				Body: parser.Expr{Kind: parser.ExprLocal,
-					Fn: &parser.Expr{Kind: parser.ExprSection, Op: "+", Arg: &aRef}},
+				Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &addAFn},
 			},
 		},
 	}

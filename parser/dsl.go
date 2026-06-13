@@ -4,6 +4,7 @@ import "strconv"
 
 type lineResult struct {
 	typeDef    *TypeDef
+	fnDef      *FnDef
 	mergeDef   *MergeDef
 	queryDef   *QueryDef
 	updateDef  *UpdateDef
@@ -43,12 +44,14 @@ func numberP() Parser[float64] {
 	}
 }
 
-// opP parses a known binary operator token. Each alternative is Try-wrapped
-// so a partial StringP match (e.g. "max" against "min") resets Consumed and
-// Or falls through to the next alternative.
-func opP() Parser[string] {
+// symOpP parses a punctuation operator token: + * -. The word-shaped
+// primitives (max, min) are NOT tokenised here — they parse as ordinary
+// identifiers (see nameP) and are recognised as primitives by the builder.
+// Tokenising them here would misparse identifiers like `maxValue`, since
+// StringP("max") has no word boundary.
+func symOpP() Parser[string] {
 	lit := func(str string) Parser[string] { return Try(StringP(str)) }
-	return Or(lit("max"), Or(lit("min"), Or(lit("+"), Or(lit("*"), lit("-")))))
+	return Or(lit("+"), Or(lit("*"), lit("-")))
 }
 
 // paramP parses `name::type`, e.g. `k::real`.
@@ -69,22 +72,59 @@ func paramsP() Parser[[]ParamSpec] {
 	return Many(Try(Prefix(Spaces1P(), paramP())))
 }
 
-// operandP parses a section's bound argument: a number literal or a param ref.
-func operandP() Parser[Expr] {
-	num := Map(Try(numberP()), func(f float64) Expr { return Expr{Kind: ExprNumLit, Num: f} })
-	ref := Map(IdentP(), func(n string) Expr { return Expr{Kind: ExprParamRef, Param: n} })
-	return Or(num, ref)
+// paramsP1 is paramsP but requires at least one param. Used by `fn`, which
+// rejects zero-arg functions (every fn is real^n -> real, n >= 1).
+func paramsP1() Parser[[]ParamSpec] {
+	return Many1(Try(Prefix(Spaces1P(), paramP())))
 }
 
-// sectionP parses `( op operand )`, e.g. `(+ k)` or `(* m)`.
-func sectionP() Parser[Expr] {
+// nameP parses an applicative leaf: an operator token (+ * -) or an
+// identifier (which may be a primitive name like max/min, a user fn, or a
+// bound variable — the builder resolves which). Emits an unresolved Name.
+func nameP() Parser[Expr] {
+	return Map(Or(symOpP(), IdentP()), func(n string) Expr { return Expr{Kind: ExprName, Name: n} })
+}
+
+// atomP parses a single argument-position term: a number, a parenthesised
+// expression, or a name. Application is built from a head atom + trailing
+// atoms (see applicationP).
+func atomP() Parser[Expr] {
+	num := Map(Try(numberP()), func(f float64) Expr { return Expr{Kind: ExprNumLit, Num: f} })
+	paren := Map(
+		Sequence3(RuneP('('), Prefix(SpacesP(), exprP()), Sequence2(SpacesP(), RuneP(')'))),
+		func(t Of3[rune, Expr, Of2[struct{}, rune]]) Expr { return t.V2 },
+	)
+	return Or(num, Or(paren, nameP()))
+}
+
+// applicationP parses `head arg1 arg2 ...` (prefix application). A bare atom
+// with no trailing args is returned as-is; otherwise an ExprApp. Args may
+// under-saturate the head (partial application) — checked at build time.
+func applicationP() Parser[Expr] {
 	return Map(
-		Sequence5(RuneP('('), Prefix(SpacesP(), opP()), Prefix(SpacesP(), operandP()), SpacesP(), RuneP(')')),
-		func(t Of5[rune, string, Expr, struct{}, rune]) Expr {
-			arg := t.V3
-			return Expr{Kind: ExprSection, Op: t.V2, Arg: &arg}
+		Sequence2(atomP(), Many(Try(Prefix(Spaces1P(), atomP())))),
+		func(t Of2[Expr, []Expr]) Expr {
+			if len(t.V2) == 0 {
+				return t.V1
+			}
+			head := t.V1
+			args := make([]*Expr, len(t.V2))
+			for i := range t.V2 {
+				a := t.V2[i]
+				args[i] = &a
+			}
+			return Expr{Kind: ExprApp, Head: &head, Args: args}
 		},
 	)
+}
+
+// exprP parses a full applicative expression. It is recursive (parenthesised
+// atoms contain expressions), so the body is deferred to parse time to break
+// the parser-construction cycle.
+func exprP() Parser[Expr] {
+	return func(s Stream) ParseResult[Expr] {
+		return applicationP()(s)
+	}
 }
 
 // elemTypeP parses the vector element type. Only `vector real` for now.
@@ -114,13 +154,28 @@ func typeDefLineP() Parser[lineResult] {
 	return Prefix(prefix, rest)
 }
 
+// fnLineP parses `fn name p1::real p2::real = <expr>`. The body is a full
+// applicative expression; at least one param is required.
+func fnLineP() Parser[lineResult] {
+	prefix := Try(Sequence2(StringP("fn"), Spaces1P()))
+	rest := Map(
+		Sequence2(Sequence2(IdentP(), paramsP1()), Prefix(eqP(), Suffix(endP(), exprP()))),
+		func(t Of2[Of2[string, []ParamSpec], Expr]) lineResult {
+			return lineResult{fnDef: &FnDef{Name: t.V1.V1, Params: t.V1.V2, Body: t.V2}}
+		},
+	)
+	return Prefix(prefix, rest)
+}
+
 func mergeLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("merge"), Spaces1P()))
+	// `zip <atom>`: the function is a single atom (a name or a parenthesised
+	// term), never a bare application — keeps the line grammar unambiguous.
 	zipExpr := Map(
-		Prefix(Sequence2(StringP("zip"), Spaces1P()), opP()),
-		func(op string) Expr {
-			fn := Expr{Kind: ExprFuncRef, Op: op}
-			return Expr{Kind: ExprZip, Fn: &fn}
+		Prefix(Sequence2(StringP("zip"), Spaces1P()), atomP()),
+		func(fn Expr) Expr {
+			f := fn
+			return Expr{Kind: ExprZip, Fn: &f}
 		},
 	)
 	rest := Map(
@@ -135,10 +190,12 @@ func mergeLineP() Parser[lineResult] {
 func queryLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("query"), Spaces1P()))
 	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), paramsP())
+	// `reduce <atom> <number>`: atom (not full application) for the fn so the
+	// trailing init number is not swallowed as an argument.
 	reduceExpr := Map(
-		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), opP()), Spaces1P(), numberP()),
-		func(t Of3[string, struct{}, float64]) Expr {
-			fn := Expr{Kind: ExprFuncRef, Op: t.V1}
+		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), atomP()), Spaces1P(), numberP()),
+		func(t Of3[Expr, struct{}, float64]) Expr {
+			fn := t.V1
 			init := Expr{Kind: ExprNumLit, Num: t.V3}
 			return Expr{Kind: ExprReduce, Fn: &fn, Init: &init}
 		},
@@ -155,11 +212,12 @@ func queryLineP() Parser[lineResult] {
 func updateLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("update"), Spaces1P()))
 	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), paramsP())
+	// `local <atom>`: e.g. `local (+ k)` (a parenthesised partial application).
 	localExpr := Map(
-		Prefix(Sequence2(StringP("local"), Spaces1P()), sectionP()),
-		func(sec Expr) Expr {
-			fn := sec
-			return Expr{Kind: ExprLocal, Fn: &fn}
+		Prefix(Sequence2(StringP("local"), Spaces1P()), atomP()),
+		func(fn Expr) Expr {
+			f := fn
+			return Expr{Kind: ExprLocal, Fn: &f}
 		},
 	)
 	rest := Map(
@@ -188,11 +246,12 @@ func skipLineP() Parser[lineResult] {
 
 func lineP() Parser[lineResult] {
 	return Or(typeDefLineP(),
-		Or(mergeLineP(),
-			Or(queryLineP(),
-				Or(updateLineP(),
-					Or(collectionLineP(),
-						skipLineP())))))
+		Or(fnLineP(),
+			Or(mergeLineP(),
+				Or(queryLineP(),
+					Or(updateLineP(),
+						Or(collectionLineP(),
+							skipLineP()))))))
 }
 
 func dslParser() Parser[Plan] {
@@ -204,6 +263,8 @@ func dslParser() Parser[Plan] {
 				switch {
 				case r.typeDef != nil:
 					plan.Types = append(plan.Types, *r.typeDef)
+				case r.fnDef != nil:
+					plan.Functions = append(plan.Functions, *r.fnDef)
 				case r.mergeDef != nil:
 					plan.Merges = append(plan.Merges, *r.mergeDef)
 				case r.queryDef != nil:

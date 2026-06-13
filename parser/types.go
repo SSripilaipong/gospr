@@ -30,49 +30,63 @@ type FieldSpec struct {
 
 // ---- Expression AST ------------------------------------------------
 
-// ExprKind tags the Expr closed-sum union.
+// ExprKind tags the Expr closed-sum union. The language is a small
+// applicative core: literals, variables, function references, and
+// application, plus the three CRDT combinator nodes (reduce/zip/local)
+// that carry a function-valued term.
 type ExprKind int
 
 const (
-	ExprFuncRef  ExprKind = iota // bare binary fn: + * max - min
-	ExprNumLit                   // numeric literal: 0, 1, 2.5
-	ExprParamRef                 // reference to a method param: k, m
-	ExprSection                  // partial application: (+ k), (* m)
-	ExprReduce                   // reduce <fn> <init>
-	ExprZip                      // zip <fn>
-	ExprLocal                    // local <fn>
-	ExprCompose                  // FUTURE: f . g (never produced now)
+	ExprNumLit ExprKind = iota // numeric literal: 0, 1, 2.5
+	ExprName                   // PARSER-ONLY: unresolved identifier or operator token
+	ExprVar                    // BUILT-ONLY: a bound parameter reference
+	ExprRef                    // BUILT-ONLY: a function symbol (primitive or user fn)
+	ExprApp                    // application f a b ... (possibly partial)
+	ExprReduce                 // reduce <fn> <init>
+	ExprZip                    // zip <fn>
+	ExprLocal                  // local <fn>
+)
+
+// RefKind distinguishes a built-in primitive operator from a user-defined
+// function. Only set on a resolved ExprRef.
+type RefKind int
+
+const (
+	RefPrimitive RefKind = iota
+	RefFunction
 )
 
 // Expr is a closed sum type. Only the fields relevant to Kind are set.
-// No closures — fully serializable, so later optimization passes can
-// walk it.
+// No closures — fully serializable, so later optimization/proof passes
+// can walk it.
+//
+// Invariant: ExprName appears ONLY in parser output (pre-Build); ExprVar
+// and ExprRef appear ONLY after Build resolves names against scope. A
+// built term therefore has no unresolved leaves — every leaf is a Var
+// (a bound variable) or a Ref (a function symbol), unambiguously.
 type Expr struct {
 	Kind ExprKind
-
-	// ExprFuncRef / ExprSection: Op is one of "+","*","max","-","min".
-	Op string
 
 	// ExprNumLit
 	Num float64
 
-	// ExprParamRef
-	Param string
+	// ExprName / ExprVar / ExprRef: the identifier or operator symbol.
+	Name string
 
-	// ExprSection: Arg is the bound right operand (a NumLit or ParamRef).
-	// Section means \x -> x Op Arg.
-	Arg *Expr
+	// ExprRef (resolved): the symbol's arity and whether it is a built-in
+	// primitive or a user-defined function.
+	Arity int
+	Ref   RefKind
 
-	// ExprReduce / ExprZip: Fn is the binary fn (a FuncRef).
-	// ExprLocal: Fn is the unary fn (a Section).
-	Fn *Expr
+	// ExprApp: Head applied to Args (currying-friendly; len(Args) may be
+	// fewer than the head's arity, i.e. a partial application).
+	Head *Expr
+	Args []*Expr
 
-	// ExprReduce only.
+	// ExprReduce / ExprZip / ExprLocal: Fn is the function-valued term
+	// (a Ref or a partial App). Reduce additionally uses Init (a NumLit).
+	Fn   *Expr
 	Init *Expr
-
-	// ExprCompose (FUTURE): Left . Right. Unused now.
-	Left  *Expr
-	Right *Expr
 }
 
 // ---- Method params -------------------------------------------------
@@ -88,6 +102,15 @@ type ParamSpec struct {
 type TypeDef struct {
 	Name string
 	Elem ElemType
+}
+
+// FnDef is a top-level user-defined function `fn name p1::real .. = body`.
+// Functions are global (not attached to a type). Body is an unresolved
+// applicative term until Build resolves it.
+type FnDef struct {
+	Name   string
+	Params []ParamSpec
+	Body   Expr
 }
 
 type MergeDef struct {
@@ -116,6 +139,7 @@ type CollectionSpec struct {
 
 type Plan struct {
 	Types       []TypeDef
+	Functions   []FnDef
 	Merges      []MergeDef
 	Queries     []QueryDef
 	Updates     []UpdateDef

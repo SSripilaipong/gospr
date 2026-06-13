@@ -12,7 +12,9 @@ import (
 
 const src = `type T = vector real
 
-merge T = zip max
+fn lub a::real b::real = max a b
+
+merge T = zip lub
 
 query T.Value = reduce + 0
 
@@ -70,4 +72,35 @@ func TestE2E_vectorModel(t *testing.T) {
 	got, err = a.Query("Value", nil)
 	require.NoError(t, err)
 	assert.Equal(t, 18.0, got) // 13 (nodeA) + 5 (nodeB)
+}
+
+// Partial application binds the LEFT operand first, so `local (- k)` means
+// \x -> k - x (k minus the current slot), NOT a right-section x - k. This is
+// intentional: the language has one uniform application rule, no special
+// section semantics. Only non-commutative ops (here `-`) are observably
+// affected. To get `current - k`, define a fn with the slot as the left
+// operand, e.g. `fn rsub k::real x::real = - x k` then `local (rsub k)`.
+func TestE2E_nonCommutativePartialApplication(t *testing.T) {
+	src := `type C = vector real
+merge C = zip max
+query C.Value = reduce + 0
+update C.Sub k::real = local (- k)
+`
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	built, err := builder.Build(plan)
+	require.NoError(t, err)
+	c := built.Models["C"].New("nodeA")
+
+	// slot starts at 0: (- 10) applied to 0 -> 10 - 0 = 10
+	require.NoError(t, c.Apply("Sub", []any{10.0}))
+	got, err := c.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 10.0, got)
+
+	// (- 3) applied to 10 -> 3 - 10 = -7
+	require.NoError(t, c.Apply("Sub", []any{3.0}))
+	got, err = c.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, -7.0, got)
 }
