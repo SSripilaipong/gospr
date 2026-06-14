@@ -1,11 +1,14 @@
 package parser
 
-import "fmt"
+import (
+	"fmt"
+	"math/big"
+)
 
 // ---- Element types -------------------------------------------------
 
 // ElemKind enumerates the element type of a vector. Only KindReal is
-// produced now; KindStruct is reserved so `vector { x real }` can be
+// produced now; KindStruct is reserved so `vector { x rat }` can be
 // added later without a Plan-shape change.
 type ElemKind int
 
@@ -16,12 +19,12 @@ const (
 
 // ElemType describes what each vector slot holds. For a scalar vector,
 // Kind == KindReal, Scalar holds the parsed numeric type name (one of the six:
-// real, real0+, real0-, int, int0+, int0-), and Fields is nil. Struct support
+// rat, rat0+, rat0-, int, int0+, int0-), and Fields is nil. Struct support
 // later fills Fields. Scalar is a syntactic name only — the builder maps it to a
 // numtype.NumType; the parser stays semantics-free.
 type ElemType struct {
 	Kind   ElemKind
-	Scalar string      // numeric type name for KindReal; "" for KindStruct
+	Scalar string      // numeric type name for KindReal (e.g. "rat"); "" for KindStruct
 	Fields []FieldSpec // nil for KindReal; reserved for KindStruct
 }
 
@@ -53,9 +56,9 @@ const (
 	ExprLocal                  // local <fn>
 )
 
-// ValType is a value's type. The language has three: a real number, a boolean
+// ValType is a value's type. The language has three: a rational number, a boolean
 // (produced only by comparison operators), and a string (produced only by
-// string literals). Params are real-only; bool/string arise from comparisons,
+// string literals). Params are numeric-only; bool/string arise from comparisons,
 // string literals, and inferred function return types.
 type ValType int
 
@@ -68,7 +71,7 @@ const (
 func (t ValType) String() string {
 	switch t {
 	case TypeReal:
-		return "real"
+		return "rat"
 	case TypeBool:
 		return "bool"
 	case TypeString:
@@ -98,8 +101,9 @@ const (
 type Expr struct {
 	Kind ExprKind
 
-	// ExprNumLit
-	Num float64
+	// ExprNumLit — an exact rational (so e.g. 0.1 is exactly 1/10, with no
+	// float rounding that could desync runtime from the convergence proof).
+	Num *big.Rat
 
 	// ExprStrLit
 	Str string
@@ -138,7 +142,7 @@ type GuardCase struct {
 
 // ---- Method params -------------------------------------------------
 
-// ParamSpec is `name::type`. Type is "real" for now.
+// ParamSpec is `name::type`. Type is one of the six numeric names (e.g. "rat").
 type ParamSpec struct {
 	Name string
 	Type string
@@ -151,7 +155,7 @@ type TypeDef struct {
 	Elem ElemType
 }
 
-// FnDef is a top-level user-defined function `fn name p1::real .. = body`.
+// FnDef is a top-level user-defined function `fn name p1::rat .. = body`.
 // Functions are global (not attached to a type). Body is an unresolved
 // applicative term until Build resolves it.
 type FnDef struct {

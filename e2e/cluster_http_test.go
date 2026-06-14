@@ -20,10 +20,10 @@ import (
 // slot (`local (+ k)`), slots merge per-node-id by max (`zip max`), and the
 // query sums every slot (`reduce + 0`). A `collection` line is required so the
 // cluster has something to instantiate and so HTTP can address it by name.
-const counterDSL = `type T = vector real0+
+const counterDSL = `type T = vector rat0+
 merge T = zip max
 query T.Value = reduce + 0
-update T.Add k::real0+ = local (+ k)
+update T.Add k::rat0+ = local (+ k)
 collection Counter = T
 `
 
@@ -40,12 +40,12 @@ func TestClusterHTTP_addPropagatesAcrossNodes(t *testing.T) {
 	deploy(t, urls[0], counterDSL)
 
 	// Add on node 0 only.
-	add(t, urls[0], "Counter", 5)
+	add(t, urls[0], "Counter", "5")
 
 	// Sanity: node 0 reads its own slot immediately-ish.
 	require.Eventually(t, func() bool {
 		v, status := queryValue(t, urls[0], "Counter")
-		return status == http.StatusOK && v == 5
+		return status == http.StatusOK && v == "5"
 	}, 5*time.Second, 25*time.Millisecond, "node 0 should reflect its own Add")
 
 	// Core assertion: a different node (node 2) eventually converges to the same
@@ -53,7 +53,7 @@ func TestClusterHTTP_addPropagatesAcrossNodes(t *testing.T) {
 	// the deploy has propagated and gossip has carried node 0's slot across.
 	require.Eventually(t, func() bool {
 		v, status := queryValue(t, urls[2], "Counter")
-		return status == http.StatusOK && v == 5
+		return status == http.StatusOK && v == "5"
 	}, 5*time.Second, 25*time.Millisecond, "value should propagate to a peer node")
 }
 
@@ -93,8 +93,9 @@ func deploy(t *testing.T, base, dsl string) {
 	require.Equal(t, http.StatusOK, resp.StatusCode, "deploy should succeed")
 }
 
-func add(t *testing.T, base, collection string, k float64) {
+func add(t *testing.T, base, collection, k string) {
 	t.Helper()
+	// Numbers cross the boundary as exact-rational strings.
 	body, err := json.Marshal(map[string]any{"params": []any{k}})
 	require.NoError(t, err)
 	resp, err := http.Post(
@@ -106,10 +107,11 @@ func add(t *testing.T, base, collection string, k float64) {
 	require.Equal(t, http.StatusOK, resp.StatusCode, "Add should succeed")
 }
 
-// queryValue returns the decoded numeric result and the HTTP status. A non-200
-// status (e.g. the brief window before a peer is initialized) is reported to the
-// caller rather than failing, so pollers can keep waiting for convergence.
-func queryValue(t *testing.T, base, collection string) (float64, int) {
+// queryValue returns the decoded numeric result (an exact-rational string like
+// "5" or "1/2") and the HTTP status. A non-200 status (e.g. the brief window
+// before a peer is initialized) is reported to the caller rather than failing,
+// so pollers can keep waiting for convergence.
+func queryValue(t *testing.T, base, collection string) (string, int) {
 	t.Helper()
 	resp, err := http.Get(fmt.Sprintf("%s/api/collections/%s/Value", base, collection))
 	require.NoError(t, err)
@@ -117,9 +119,9 @@ func queryValue(t *testing.T, base, collection string) (float64, int) {
 	data, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	if resp.StatusCode != http.StatusOK {
-		return 0, resp.StatusCode
+		return "", resp.StatusCode
 	}
-	var v float64
+	var v string
 	require.NoError(t, json.Unmarshal(data, &v))
 	return v, resp.StatusCode
 }

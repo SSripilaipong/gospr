@@ -51,12 +51,10 @@ type mediaType struct {
 }
 
 type schema struct {
-	Type          string            `json:"type,omitempty"`
-	Description   string            `json:"description,omitempty"`
-	Properties    map[string]schema `json:"properties,omitempty"`
-	Items         *schema           `json:"items,omitempty"`
-	MinimumNumber *float64          `json:"minimum,omitempty"`
-	MaximumNumber *float64          `json:"maximum,omitempty"`
+	Type        string            `json:"type,omitempty"`
+	Description string            `json:"description,omitempty"`
+	Properties  map[string]schema `json:"properties,omitempty"`
+	Items       *schema           `json:"items,omitempty"`
 }
 
 type response struct {
@@ -74,7 +72,7 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 					Content: map[string]mediaType{
 						"text/plain": {
 							Schema:  schema{Type: "string"},
-							Example: "type T = vector real0+\nmerge T = zip max\nquery T.Value = reduce + 0\nupdate T.Add k::real0+ = local (+ k)\ncollection MyVec = T",
+							Example: "type T = vector rat0+\nmerge T = zip max\nquery T.Value = reduce + 0\nupdate T.Add k::rat0+ = local (+ k)\ncollection MyVec = T",
 						},
 					},
 				},
@@ -182,8 +180,8 @@ func addPostPath(paths map[string]pathItem, collection, actionName string, param
 }
 
 // valTypeSchema maps a query's result value type to an OpenAPI schema. For a
-// numeric result the carried NumType drives the integer/number type and any
-// min/max bound.
+// numeric result the carried NumType drives the description of the string-typed
+// exact-rational schema.
 func valTypeSchema(t parser.ValType, nt numtype.NumType) schema {
 	switch t {
 	case parser.TypeBool:
@@ -195,21 +193,12 @@ func valTypeSchema(t parser.ValType, nt numtype.NumType) schema {
 	}
 }
 
-// numSchema renders a numeric type as a JSON schema: integer vs number by
-// domain, and a minimum/maximum of 0 for the non-negative/non-positive signs.
+// numSchema renders a numeric type as a JSON schema. Numbers cross the boundary
+// as exact-rational strings ("5", "1/2", "-3/4"), so the schema is string-typed;
+// the domain/sign constraint that a numeric min/max would express is carried in
+// the description instead.
 func numSchema(nt numtype.NumType) schema {
-	s := schema{Type: "number"}
-	if nt.Domain == numtype.DInt {
-		s.Type = "integer"
-	}
-	zero := 0.0
-	switch nt.Sign {
-	case numtype.SNonNeg:
-		s.MinimumNumber = &zero
-	case numtype.SNonPos:
-		s.MaximumNumber = &zero
-	}
-	return s
+	return schema{Type: "string", Description: "exact rational (" + nt.String() + ")"}
 }
 
 func paramToSchema(p parser.ParamSpec) schema {
@@ -220,17 +209,15 @@ func paramToSchema(p parser.ParamSpec) schema {
 	return numSchema(nt)
 }
 
+// paramExample returns a representative wire value: an exact-rational string,
+// since numbers cross the boundary as strings.
 func paramExample(p parser.ParamSpec) any {
 	nt, ok := numtype.Parse(p.Type)
 	if !ok {
 		return nil
 	}
-	v := 1.0
 	if nt.Sign == numtype.SNonPos {
-		v = -1.0
+		return "-1"
 	}
-	if nt.Domain == numtype.DInt {
-		return int(v)
-	}
-	return v
+	return "1"
 }

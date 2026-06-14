@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"math/big"
 
 	"gospr/crdt"
 	"gospr/numtype"
@@ -69,9 +70,9 @@ var (
 	vUnknown = vtype{kind: vkUnknown}
 	vBool    = vtype{kind: vkBool}
 	vString  = vtype{kind: vkString}
-	// numTop is the widest numeric type (`real`); a primitive accepts any
+	// numTop is the widest numeric type (`rat`); a primitive accepts any
 	// numeric operand, expressed as "operand must be <: numTop".
-	numTop = vNum(numtype.NumType{Domain: numtype.DReal, Sign: numtype.SAny})
+	numTop = vNum(numtype.NumType{Domain: numtype.DRat, Sign: numtype.SAny})
 )
 
 func vNum(nt numtype.NumType) vtype { return vtype{kind: vkNum, num: nt} }
@@ -216,12 +217,12 @@ func minSign(a, b numtype.Sign) numtype.Sign {
 }
 
 // numBin computes the result numeric type of a binary arithmetic operator over
-// two numeric operands. Domain widens to Real if either operand is Real; the
+// two numeric operands. Domain widens to Rat if either operand is Rat; the
 // sign follows the operator's sound rule.
 func numBin(op string, a, b numtype.NumType) numtype.NumType {
 	d := numtype.DInt
-	if a.Domain == numtype.DReal || b.Domain == numtype.DReal {
-		d = numtype.DReal
+	if a.Domain == numtype.DRat || b.Domain == numtype.DRat {
+		d = numtype.DRat
 	}
 	var s numtype.Sign
 	switch op {
@@ -340,7 +341,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: query params are not yet supported", qd.TypeName, qd.MethodName)
 		}
 		// A query body is a general expression that may fold the vector via
-		// `reduce` (allowReduce=true). Its result type (real/bool/string) is
+		// `reduce` (allowReduce=true). Its result type (rat/bool/string) is
 		// recorded for serialization/swagger.
 		body, err := env.resolve(qd.Body, nil, true)
 		if err != nil {
@@ -574,7 +575,7 @@ func describe(e parser.Expr) string {
 // ---- type checking -------------------------------------------------
 
 // checker type-checks resolved terms and infers function return types. Param
-// types are real-only and known up front; return types are inferred lazily via
+// types are numeric-only and known up front; return types are inferred lazily via
 // memoized DFS so functions may reference one another and recurse. A recursive
 // call caught mid-inference yields vUnknown, which unifies with any concrete
 // type — so anchored recursion resolves, while wholly unanchored recursion
@@ -665,7 +666,7 @@ func (c *checker) checkValue(e parser.Expr, elem numtype.NumType) (vtype, error)
 // checkCombinatorFn type-checks the function carried by a resolved zip/local
 // node against the element type E: applying the function to E-typed slot(s) must
 // yield a result assignable to E (Sub(result, E)). This is where non-negativity
-// is enforced — e.g. `local (- k)` on a `vector real0+` loses the sign and is
+// is enforced — e.g. `local (- k)` on a `vector rat0+` loses the sign and is
 // rejected. scope carries the method's params (a local update fn may reference
 // them, e.g. `local (+ k)`).
 func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, elem numtype.NumType) error {
@@ -762,15 +763,15 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 // literalType types a numeric literal. All literals are non-negative; the
 // literal 0 gets the internal Zero sign so it is assignable to any numeric type
 // (non-negative AND non-positive targets). Integer-valued literals are int;
-// others are real.
-func literalType(n float64) vtype {
+// others are rat.
+func literalType(n *big.Rat) vtype {
 	switch {
-	case n == 0:
+	case n.Sign() == 0:
 		return vNum(numtype.NumType{Domain: numtype.DInt, Sign: numtype.SZero})
-	case n == float64(int64(n)):
+	case n.IsInt():
 		return vNum(numtype.NumType{Domain: numtype.DInt, Sign: numtype.SNonNeg})
 	default:
-		return vNum(numtype.NumType{Domain: numtype.DReal, Sign: numtype.SNonNeg})
+		return vNum(numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonNeg})
 	}
 }
 

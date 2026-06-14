@@ -1,6 +1,6 @@
 package parser
 
-import "strconv"
+import "math/big"
 
 type lineResult struct {
 	typeDef    *TypeDef
@@ -23,24 +23,26 @@ func digitsP() Parser[string] {
 }
 
 // numberP parses a non-negative decimal literal (a leading '-' is the '-'
-// operator, never a literal sign; negative literals are deferred).
-func numberP() Parser[float64] {
+// operator, never a literal sign; negative literals are deferred). The value is
+// an exact rational: a decimal like 0.1 becomes exactly 1/10, with no float
+// rounding (so the runtime and the convergence proof reason over the same value).
+func numberP() Parser[*big.Rat] {
 	frac := Or(
 		Try(Map(Sequence2(RuneP('.'), digitsP()), func(t Of2[rune, string]) string { return "." + t.V2 })),
 		Succeed(""),
 	)
-	return func(s Stream) ParseResult[float64] {
+	return func(s Stream) ParseResult[*big.Rat] {
 		r := Sequence2(digitsP(), frac)(s)
 		if !r.Ok {
-			return failure[float64](r.Err, r.Consumed)
+			return failure[*big.Rat](r.Err, r.Consumed)
 		}
 		text := r.Value.V1 + r.Value.V2
-		f, err := strconv.ParseFloat(text, 64)
-		if err != nil {
+		q, ok := new(big.Rat).SetString(text)
+		if !ok {
 			line, col := runePos(s.Items, s.Pos)
-			return failure[float64](ParseError{Pos: s.Pos, Line: line, Col: col, Message: "invalid number: " + text}, r.Consumed)
+			return failure[*big.Rat](ParseError{Pos: s.Pos, Line: line, Col: col, Message: "invalid number: " + text}, r.Consumed)
 		}
-		return success(f, r.Next, r.Consumed)
+		return success(q, r.Next, r.Consumed)
 	}
 }
 
@@ -112,17 +114,17 @@ func symOpP() Parser[string] {
 }
 
 // numTypeNameP parses one of the six numeric type names. Longer names are tried
-// before their prefixes (`real0+` before `real`, `int0+` before `int`) so the
+// before their prefixes (`rat0+` before `rat`, `int0+` before `int`) so the
 // longest match wins; each alternative is Try-wrapped to backtrack cleanly. The
 // names contain `+`/`-`/`0`, which IdentP does not accept, so this dedicated
 // parser is required for type positions.
 func numTypeNameP() Parser[string] {
 	lit := func(str string) Parser[string] { return Try(StringP(str)) }
-	return Or(lit("real0+"), Or(lit("real0-"), Or(lit("real"),
+	return Or(lit("rat0+"), Or(lit("rat0-"), Or(lit("rat"),
 		Or(lit("int0+"), Or(lit("int0-"), lit("int"))))))
 }
 
-// paramP parses `name::type`, e.g. `k::real0+`. The type is one of the six
+// paramP parses `name::type`, e.g. `k::rat0+`. The type is one of the six
 // numeric type names; an unknown name is a parse error.
 func paramP() Parser[ParamSpec] {
 	dcolon := Sequence2(RuneP(':'), RuneP(':'))
@@ -142,7 +144,7 @@ func paramsP() Parser[[]ParamSpec] {
 }
 
 // paramsP1 is paramsP but requires at least one param. Used by `fn`, which
-// rejects zero-arg functions (every fn is real^n -> real, n >= 1).
+// rejects zero-arg functions (every fn takes n >= 1 numeric params).
 func paramsP1() Parser[[]ParamSpec] {
 	return Many1(Try(Prefix(Spaces1P(), paramP())))
 }
@@ -155,14 +157,14 @@ func nameP() Parser[Expr] {
 }
 
 // reduceFormP parses `reduce <atom> <number>`, e.g. `reduce max 0`. It is a
-// value-producing primary (it folds the vector to a real), so it may appear
+// value-producing primary (it folds the vector to a number), so it may appear
 // anywhere an atom may — but the builder restricts it to query bodies, keeping
 // global functions pure. The trailing reference to atomP is deferred to parse
 // time to break the construction cycle (atomP itself lists reduceFormP).
 func reduceFormP() Parser[Expr] {
 	return Map(
 		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), atomP()), Spaces1P(), numberP()),
-		func(t Of3[Expr, struct{}, float64]) Expr {
+		func(t Of3[Expr, struct{}, *big.Rat]) Expr {
 			fn := t.V1
 			init := Expr{Kind: ExprNumLit, Num: t.V3}
 			return Expr{Kind: ExprReduce, Fn: &fn, Init: &init}
@@ -176,7 +178,7 @@ func reduceFormP() Parser[Expr] {
 // before nameP so the keyword is not read as an identifier (Try lets a name
 // like `reducer` still parse).
 func atomP() Parser[Expr] {
-	num := Map(Try(numberP()), func(f float64) Expr { return Expr{Kind: ExprNumLit, Num: f} })
+	num := Map(Try(numberP()), func(f *big.Rat) Expr { return Expr{Kind: ExprNumLit, Num: f} })
 	str := stringLitP()
 	reduceAtom := Try(func(s Stream) ParseResult[Expr] { return reduceFormP()(s) })
 	paren := Map(
@@ -216,7 +218,7 @@ func exprP() Parser[Expr] {
 	}
 }
 
-// elemTypeP parses the vector element type, e.g. `vector real0+`. The element is
+// elemTypeP parses the vector element type, e.g. `vector rat0+`. The element is
 // a scalar numeric type (one of the six names); the struct form is deferred.
 func elemTypeP() Parser[ElemType] {
 	return Map(
@@ -271,8 +273,8 @@ func guardLineP() Parser[GuardCase] {
 }
 
 // fnLineP parses a user function definition. Two body forms:
-//   - single-line:  `fn name p1::real .. = <expr>`
-//   - guarded:      `fn name p1::real ..` then one-or-more `| cond = result`
+//   - single-line:  `fn name p1::rat .. = <expr>`
+//   - guarded:      `fn name p1::rat ..` then one-or-more `| cond = result`
 //     lines ending in `| otherwise = result`.
 //
 // The header consumes its own end-of-line in the guarded form, and each

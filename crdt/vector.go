@@ -2,7 +2,8 @@ package crdt
 
 import (
 	"fmt"
-	"strconv"
+	"math/big"
+	"strings"
 	"sync"
 
 	"gospr/numtype"
@@ -15,14 +16,15 @@ const maxEvalDepth = 10000
 
 // Method is a validated query or update: its params plus a resolved expression
 // body (a general value expression for queries — which may fold via reduce — or
-// a Local for updates). Result is the value type the method yields (always real
-// for updates; real/bool/string for queries) and drives serialization/swagger.
+// a Local for updates). Result is the value type the method yields (always rat
+// for updates; rat/bool/string for queries) and drives serialization/swagger.
 type Method struct {
 	Params []parser.ParamSpec
 	Body   parser.Expr
 	Result parser.ValType
 	// ResultNum is the numeric subtype of a query result (meaningful only when
-	// Result == TypeReal); it drives the Swagger min/max/integer constraints.
+	// Result == TypeReal); it names the domain/sign in the Swagger schema's
+	// description (numeric fields are string-typed, exact rationals on the wire).
 	ResultNum numtype.NumType
 }
 
@@ -34,12 +36,14 @@ type Function struct {
 	Body   parser.Expr
 }
 
-// VectorCRDT is a distributed-systems vector: nodeID -> real value. The
-// user-defined merge/query/update expressions are evaluated against this
-// state at runtime, in the context of the global function environment.
+// VectorCRDT is a distributed-systems vector: nodeID -> exact rational value
+// (math/big.Rat). The user-defined merge/query/update expressions are evaluated
+// against this state at runtime, in the context of the global function
+// environment. Rationals are exact, so the runtime obeys the same algebraic laws
+// the prover discharges (no float rounding to break convergence).
 type VectorCRDT struct {
 	nodeID  string
-	state   map[string]float64
+	state   map[string]*big.Rat
 	merge   parser.Expr // a Zip expr (Fn resolved)
 	queries map[string]Method
 	updates map[string]Method
@@ -50,13 +54,18 @@ type VectorCRDT struct {
 func NewVector(nodeID string, merge parser.Expr, queries, updates map[string]Method, funcs map[string]Function) *VectorCRDT {
 	return &VectorCRDT{
 		nodeID:  nodeID,
-		state:   make(map[string]float64),
+		state:   make(map[string]*big.Rat),
 		merge:   merge,
 		queries: queries,
 		updates: updates,
 		funcs:   funcs,
 	}
 }
+
+// cloneRat returns a fresh copy of r. The Snapshot/Merge boundary must deep-copy
+// because *big.Rat is mutable: sharing a pointer would let a caller (or a peer's
+// snapshot) mutate a value aliased into another CRDT's state and corrupt it.
+func cloneRat(r *big.Rat) *big.Rat { return new(big.Rat).Set(r) }
 
 // Apply runs an update's `local <unary fn>` against the local node's slot.
 func (v *VectorCRDT) Apply(action string, payload []any) error {
@@ -80,16 +89,20 @@ func (v *VectorCRDT) Apply(action string, payload []any) error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	next, err := f([]float64{v.state[v.nodeID]}) // absent slot defaults to 0
+	cur := v.state[v.nodeID]
+	if cur == nil {
+		cur = new(big.Rat) // absent slot defaults to 0
+	}
+	next, err := f([]*big.Rat{cur})
 	if err != nil {
 		return fmt.Errorf("action %s: %w", action, err)
 	}
-	v.state[v.nodeID] = next
+	v.state[v.nodeID] = cloneRat(next) // detach from any aliased operand
 	return nil
 }
 
 // Query evaluates a query's body — a general value expression that may fold the
-// vector via `reduce` — and returns the result (real, bool, or string). The
+// vector via `reduce` — and returns the result (rat, bool, or string). The
 // lock is held across eval because a `reduce` sub-expression reads v.state.
 func (v *VectorCRDT) Query(name string, params []any) (any, error) {
 	m, ok := v.queries[name]
@@ -112,7 +125,7 @@ func (v *VectorCRDT) Query(name string, params []any) (any, error) {
 // is built in a copy and swapped in only after every slot succeeds, so a
 // failing user-defined merge fn leaves state untouched.
 func (v *VectorCRDT) Merge(snapshot any) error {
-	remote, ok := snapshot.(map[string]float64)
+	remote, ok := snapshot.(map[string]*big.Rat)
 	if !ok {
 		return fmt.Errorf("invalid VectorCRDT snapshot type %T", snapshot)
 	}
@@ -125,19 +138,22 @@ func (v *VectorCRDT) Merge(snapshot any) error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	merged := make(map[string]float64, len(v.state))
+	// Deep-clone every value into the working copy: *big.Rat is mutable, so
+	// sharing pointers would alias local state with the (possibly still-live)
+	// remote snapshot or with merge-fn operands.
+	merged := make(map[string]*big.Rat, len(v.state))
 	for k, val := range v.state {
-		merged[k] = val
+		merged[k] = cloneRat(val)
 	}
 	for k, rv := range remote {
 		if cur, ok := merged[k]; ok {
-			nv, err := fn([]float64{cur, rv})
+			nv, err := fn([]*big.Rat{cur, rv})
 			if err != nil {
 				return err // state left untouched
 			}
-			merged[k] = nv
+			merged[k] = cloneRat(nv)
 		} else {
-			merged[k] = rv // slot absent locally: adopt remote
+			merged[k] = cloneRat(rv) // slot absent locally: adopt a copy of remote
 		}
 	}
 	v.state = merged
@@ -146,9 +162,9 @@ func (v *VectorCRDT) Merge(snapshot any) error {
 
 func (v *VectorCRDT) Snapshot() any {
 	v.mu.Lock()
-	cp := make(map[string]float64, len(v.state))
+	cp := make(map[string]*big.Rat, len(v.state))
 	for k, val := range v.state {
-		cp[k] = val
+		cp[k] = cloneRat(val) // hand out copies so a caller cannot mutate our state
 	}
 	v.mu.Unlock()
 	return cp
@@ -156,7 +172,7 @@ func (v *VectorCRDT) Snapshot() any {
 
 // ---- expression evaluation -----------------------------------------
 
-// rtKind tags a runtime value: a real, a string, a bool, or a function value
+// rtKind tags a runtime value: a number, a string, a bool, or a function value
 // awaiting `arity` more arguments (partial application makes this uniform).
 type rtKind int
 
@@ -170,30 +186,31 @@ const (
 // rtVal is a runtime value. Only the field(s) relevant to kind are set.
 type rtVal struct {
 	kind  rtKind
-	num   float64
+	num   *big.Rat
 	str   string
 	b     bool
 	arity int
 	call  func(args []rtVal) (rtVal, error)
 }
 
-func numVal(f float64) rtVal { return rtVal{kind: kNum, num: f} }
-func strVal(s string) rtVal  { return rtVal{kind: kStr, str: s} }
-func boolVal(x bool) rtVal   { return rtVal{kind: kBool, b: x} }
+func numVal(f *big.Rat) rtVal { return rtVal{kind: kNum, num: f} }
+func strVal(s string) rtVal   { return rtVal{kind: kStr, str: s} }
+func boolVal(x bool) rtVal    { return rtVal{kind: kBool, b: x} }
 
-func (r rtVal) asNum() (float64, error) {
+func (r rtVal) asNum() (*big.Rat, error) {
 	if r.kind != kNum {
-		return 0, fmt.Errorf("expected a real value")
+		return nil, fmt.Errorf("expected a numeric value")
 	}
 	return r.num, nil
 }
 
 // rtToAny converts a fully-evaluated (non-function) value to the JSON-encodable
-// value a query returns.
+// value a query returns. Numbers are emitted as their exact rational string
+// ("5", "1/2") so no precision is lost at the JSON boundary.
 func rtToAny(r rtVal) (any, error) {
 	switch r.kind {
 	case kNum:
-		return r.num, nil
+		return r.num.RatString(), nil
 	case kStr:
 		return r.str, nil
 	case kBool:
@@ -204,9 +221,9 @@ func rtToAny(r rtVal) (any, error) {
 }
 
 // evalFn evaluates a function-valued term into a Go closure of the wanted arity
-// over reals. Used for the zip (merge), local (update), and reduce slots, all of
-// which are real^want -> real.
-func (v *VectorCRDT) evalFn(e parser.Expr, env map[string]rtVal, want int) (func([]float64) (float64, error), error) {
+// over rationals. Used for the zip (merge), local (update), and reduce slots, all
+// of which are rat^want -> rat.
+func (v *VectorCRDT) evalFn(e parser.Expr, env map[string]rtVal, want int) (func([]*big.Rat) (*big.Rat, error), error) {
 	val, err := v.eval(e, env, 0)
 	if err != nil {
 		return nil, err
@@ -218,14 +235,14 @@ func (v *VectorCRDT) evalFn(e parser.Expr, env map[string]rtVal, want int) (func
 		}
 		return nil, fmt.Errorf("expected a function of %d argument(s), got one of %d", want, got)
 	}
-	return func(args []float64) (float64, error) {
+	return func(args []*big.Rat) (*big.Rat, error) {
 		rv := make([]rtVal, len(args))
 		for i, a := range args {
 			rv[i] = numVal(a)
 		}
 		r, err := val.call(rv)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		return r.asNum()
 	}, nil
@@ -296,9 +313,9 @@ func (v *VectorCRDT) eval(e parser.Expr, env map[string]rtVal, depth int) (rtVal
 		if err != nil {
 			return rtVal{}, err
 		}
-		acc := e.Init.Num // empty vector -> returns init
+		acc := cloneRat(e.Init.Num) // empty vector -> returns init (copy, never mutate the AST literal)
 		for _, val := range v.state {
-			acc, err = fn([]float64{acc, val})
+			acc, err = fn([]*big.Rat{acc, val})
 			if err != nil {
 				return rtVal{}, err
 			}
@@ -358,48 +375,49 @@ func apply(f rtVal, args []rtVal) (rtVal, error) {
 	}
 }
 
-// primOp returns the binary applier for a primitive. Arithmetic yields a real;
-// comparisons yield a bool.
+// primOp returns the binary applier for a primitive. Arithmetic yields an exact
+// rational; comparisons yield a bool. Every arithmetic result is a fresh
+// allocation, so operands are never mutated.
 func primOp(op string) (func(a, b rtVal) (rtVal, error), error) {
 	switch op {
 	case "+":
-		return arith(func(a, b float64) float64 { return a + b }), nil
+		return arith(func(a, b *big.Rat) *big.Rat { return new(big.Rat).Add(a, b) }), nil
 	case "*":
-		return arith(func(a, b float64) float64 { return a * b }), nil
+		return arith(func(a, b *big.Rat) *big.Rat { return new(big.Rat).Mul(a, b) }), nil
 	case "-":
-		return arith(func(a, b float64) float64 { return a - b }), nil
+		return arith(func(a, b *big.Rat) *big.Rat { return new(big.Rat).Sub(a, b) }), nil
 	case "max":
-		return arith(func(a, b float64) float64 {
-			if a > b {
-				return a
+		return arith(func(a, b *big.Rat) *big.Rat {
+			if a.Cmp(b) >= 0 {
+				return cloneRat(a)
 			}
-			return b
+			return cloneRat(b)
 		}), nil
 	case "min":
-		return arith(func(a, b float64) float64 {
-			if a < b {
-				return a
+		return arith(func(a, b *big.Rat) *big.Rat {
+			if a.Cmp(b) <= 0 {
+				return cloneRat(a)
 			}
-			return b
+			return cloneRat(b)
 		}), nil
 	case ">":
-		return cmp(func(a, b float64) bool { return a > b }), nil
+		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) > 0 }), nil
 	case "<":
-		return cmp(func(a, b float64) bool { return a < b }), nil
+		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) < 0 }), nil
 	case ">=":
-		return cmp(func(a, b float64) bool { return a >= b }), nil
+		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) >= 0 }), nil
 	case "<=":
-		return cmp(func(a, b float64) bool { return a <= b }), nil
+		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) <= 0 }), nil
 	case "==":
-		return cmp(func(a, b float64) bool { return a == b }), nil
+		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) == 0 }), nil
 	case "/=":
-		return cmp(func(a, b float64) bool { return a != b }), nil
+		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) != 0 }), nil
 	default:
 		return nil, fmt.Errorf("unknown primitive %q", op)
 	}
 }
 
-func arith(f func(a, b float64) float64) func(a, b rtVal) (rtVal, error) {
+func arith(f func(a, b *big.Rat) *big.Rat) func(a, b rtVal) (rtVal, error) {
 	return func(a, b rtVal) (rtVal, error) {
 		x, err := a.asNum()
 		if err != nil {
@@ -413,7 +431,7 @@ func arith(f func(a, b float64) float64) func(a, b rtVal) (rtVal, error) {
 	}
 }
 
-func cmp(f func(a, b float64) bool) func(a, b rtVal) (rtVal, error) {
+func cmp(f func(a, b *big.Rat) bool) func(a, b rtVal) (rtVal, error) {
 	return func(a, b rtVal) (rtVal, error) {
 		x, err := a.asNum()
 		if err != nil {
@@ -429,12 +447,12 @@ func cmp(f func(a, b float64) bool) func(a, b rtVal) (rtVal, error) {
 
 // bindParams binds method params to runtime values, validating each value
 // against its declared numeric type (sign + integrality). An out-of-domain value
-// — e.g. a negative increment on a `real0+` counter — is rejected here, which the
+// — e.g. a negative increment on a `rat0+` counter — is rejected here, which the
 // gateway surfaces as a 4xx.
 func bindParams(specs []parser.ParamSpec, vals []any) (map[string]rtVal, error) {
 	m := make(map[string]rtVal, len(specs))
 	for i, p := range specs {
-		f, err := toFloat64(vals[i])
+		f, err := toRat(vals[i])
 		if err != nil {
 			return nil, fmt.Errorf("param %s: %w", p.Name, err)
 		}
@@ -443,24 +461,38 @@ func bindParams(specs []parser.ParamSpec, vals []any) (map[string]rtVal, error) 
 			return nil, fmt.Errorf("param %s: unknown type %q", p.Name, p.Type)
 		}
 		if !numtype.Allows(nt, f) {
-			return nil, fmt.Errorf("param %s: value %v is not a valid %s", p.Name, f, p.Type)
+			return nil, fmt.Errorf("param %s: value %s is not a valid %s", p.Name, f.RatString(), p.Type)
 		}
 		m[p.Name] = numVal(f)
 	}
 	return m, nil
 }
 
-func toFloat64(v any) (float64, error) {
+// toRat converts an inbound param value to an exact rational. Strings are the
+// canonical wire form (parsed exactly, so "0.1" is 1/10 and "1/3" is exact);
+// float64/int are accepted for in-process callers, with float64 being the only
+// lossy path (it carries the IEEE value, since the original decimal is gone).
+func toRat(v any) (*big.Rat, error) {
 	switch x := v.(type) {
-	case float64:
+	case *big.Rat:
 		return x, nil
-	case int64:
-		return float64(x), nil
-	case int:
-		return float64(x), nil
 	case string:
-		return strconv.ParseFloat(x, 64)
+		q, ok := new(big.Rat).SetString(strings.TrimSpace(x))
+		if !ok {
+			return nil, fmt.Errorf("invalid number %q", x)
+		}
+		return q, nil
+	case float64:
+		q := new(big.Rat).SetFloat64(x)
+		if q == nil {
+			return nil, fmt.Errorf("value %v is not a finite number", x)
+		}
+		return q, nil
+	case int64:
+		return new(big.Rat).SetInt64(x), nil
+	case int:
+		return new(big.Rat).SetInt64(int64(x)), nil
 	default:
-		return 0, fmt.Errorf("cannot convert %T to float64", v)
+		return nil, fmt.Errorf("cannot convert %T to a number", v)
 	}
 }

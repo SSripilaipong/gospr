@@ -18,6 +18,7 @@ package prover
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 
 	"gospr/crdt"
@@ -43,14 +44,14 @@ const (
 
 type sym struct {
 	kind symKind
-	num  float64
+	num  *big.Rat
 	name string
 	op   string
 	cond *sym
 	a, b *sym
 }
 
-func cst(f float64) sym  { return sym{kind: symConst, num: f} }
+func cst(f *big.Rat) sym { return sym{kind: symConst, num: f} }
 func vr(name string) sym { return sym{kind: symVar, name: name} }
 func bin(op string, a, b sym) sym {
 	return sym{kind: symBin, op: op, a: &a, b: &b}

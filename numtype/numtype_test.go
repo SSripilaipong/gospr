@@ -1,20 +1,29 @@
 package numtype
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func rat(s string) *big.Rat {
+	r, ok := new(big.Rat).SetString(s)
+	if !ok {
+		panic("bad rat: " + s)
+	}
+	return r
+}
+
 func TestParse_sixNames(t *testing.T) {
 	cases := map[string]NumType{
-		"real":   {DReal, SAny},
-		"real0+": {DReal, SNonNeg},
-		"real0-": {DReal, SNonPos},
-		"int":    {DInt, SAny},
-		"int0+":  {DInt, SNonNeg},
-		"int0-":  {DInt, SNonPos},
+		"rat":   {DRat, SAny},
+		"rat0+": {DRat, SNonNeg},
+		"rat0-": {DRat, SNonPos},
+		"int":   {DInt, SAny},
+		"int0+": {DInt, SNonNeg},
+		"int0-": {DInt, SNonPos},
 	}
 	for name, want := range cases {
 		got, ok := Parse(name)
@@ -26,45 +35,45 @@ func TestParse_sixNames(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestZeroValueIsTopReal(t *testing.T) {
-	// The zero value must be the widest type so an unset NumType reads as `real`.
-	assert.Equal(t, NumType{DReal, SAny}, NumType{})
+func TestZeroValueIsTopRat(t *testing.T) {
+	// The zero value must be the widest type so an unset NumType reads as `rat`.
+	assert.Equal(t, NumType{DRat, SAny}, NumType{})
 }
 
 func TestSub(t *testing.T) {
-	real := NumType{DReal, SAny}
-	realNN := NumType{DReal, SNonNeg}
+	r := NumType{DRat, SAny}
+	rNN := NumType{DRat, SNonNeg}
 	intNN := NumType{DInt, SNonNeg}
 	zero := NumType{DInt, SZero}
 
-	assert.True(t, Sub(intNN, real))    // int0+ <: real (domain + sign widen)
-	assert.True(t, Sub(intNN, realNN))  // int0+ <: real0+
-	assert.True(t, Sub(realNN, real))   // real0+ <: real
-	assert.False(t, Sub(real, realNN))  // real is NOT <: real0+
-	assert.False(t, Sub(realNN, intNN)) // real0+ is NOT <: int0+ (domain)
+	assert.True(t, Sub(intNN, r))     // int0+ <: rat (domain + sign widen)
+	assert.True(t, Sub(intNN, rNN))   // int0+ <: rat0+
+	assert.True(t, Sub(rNN, r))       // rat0+ <: rat
+	assert.False(t, Sub(r, rNN))      // rat is NOT <: rat0+
+	assert.False(t, Sub(rNN, intNN))  // rat0+ is NOT <: int0+ (domain)
 
 	// The literal-0 type is below every numeric type, including non-positive ones.
-	assert.True(t, Sub(zero, realNN))
-	assert.True(t, Sub(zero, NumType{DReal, SNonPos}))
+	assert.True(t, Sub(zero, rNN))
+	assert.True(t, Sub(zero, NumType{DRat, SNonPos}))
 	assert.True(t, Sub(zero, NumType{DInt, SNonPos}))
 }
 
 func TestJoin(t *testing.T) {
-	assert.Equal(t, NumType{DReal, SAny},
-		Join(NumType{DReal, SNonNeg}, NumType{DReal, SNonPos})) // NonNeg ⊔ NonPos = Any
-	assert.Equal(t, NumType{DReal, SNonNeg},
-		Join(NumType{DInt, SZero}, NumType{DReal, SNonNeg})) // Zero ⊔ real0+ = real0+
-	assert.Equal(t, NumType{DReal, SNonNeg},
-		Join(NumType{DInt, SNonNeg}, NumType{DReal, SNonNeg})) // domain widens to real
+	assert.Equal(t, NumType{DRat, SAny},
+		Join(NumType{DRat, SNonNeg}, NumType{DRat, SNonPos})) // NonNeg ⊔ NonPos = Any
+	assert.Equal(t, NumType{DRat, SNonNeg},
+		Join(NumType{DInt, SZero}, NumType{DRat, SNonNeg})) // Zero ⊔ rat0+ = rat0+
+	assert.Equal(t, NumType{DRat, SNonNeg},
+		Join(NumType{DInt, SNonNeg}, NumType{DRat, SNonNeg})) // domain widens to rat
 }
 
 func TestAllows(t *testing.T) {
-	assert.True(t, Allows(NumType{DReal, SNonNeg}, 0))
-	assert.True(t, Allows(NumType{DReal, SNonNeg}, 2.5))
-	assert.False(t, Allows(NumType{DReal, SNonNeg}, -1))
-	assert.False(t, Allows(NumType{DInt, SAny}, 2.5)) // non-integral
-	assert.True(t, Allows(NumType{DInt, SAny}, -3))
-	assert.False(t, Allows(NumType{DInt, SNonPos}, 1))
-	assert.True(t, Allows(NumType{DInt, SZero}, 0))
-	assert.False(t, Allows(NumType{DInt, SZero}, 1))
+	assert.True(t, Allows(NumType{DRat, SNonNeg}, rat("0")))
+	assert.True(t, Allows(NumType{DRat, SNonNeg}, rat("5/2")))
+	assert.False(t, Allows(NumType{DRat, SNonNeg}, rat("-1")))
+	assert.False(t, Allows(NumType{DInt, SAny}, rat("5/2"))) // non-integral
+	assert.True(t, Allows(NumType{DInt, SAny}, rat("-3")))
+	assert.False(t, Allows(NumType{DInt, SNonPos}, rat("1")))
+	assert.True(t, Allows(NumType{DInt, SZero}, rat("0")))
+	assert.False(t, Allows(NumType{DInt, SZero}, rat("1")))
 }

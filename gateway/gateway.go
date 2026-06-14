@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -84,8 +83,11 @@ func (g *Gateway) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// applyRequest carries action params. Numbers must be exact-rational strings
+// (e.g. "0.1", "1/3") — a bare JSON number fails to decode here and is rejected,
+// so no value is silently routed through float64 at the boundary.
 type applyRequest struct {
-	Params []any `json:"params"`
+	Params []string `json:"params"`
 }
 
 func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -93,10 +95,14 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	action := r.PathValue("action")
 	var req applyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		http.Error(w, "invalid JSON (numeric params must be strings, e.g. \"0.1\")", http.StatusBadRequest)
 		return
 	}
-	if err := g.node.Apply(collection, action, req.Params); err != nil {
+	params := make([]any, len(req.Params))
+	for i, s := range req.Params {
+		params[i] = s
+	}
+	if err := g.node.Apply(collection, action, params); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -108,13 +114,10 @@ func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	query := r.PathValue("query")
 	var params []any
 	if raw := r.URL.Query().Get("params"); raw != "" {
+		// Pass each param through as a string; the CRDT parses it into an exact
+		// rational (so "0.1" is 1/10), and rejects malformed/out-of-domain values.
 		for _, s := range strings.Split(raw, ",") {
-			f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("invalid param %q: must be a real number", s), http.StatusBadRequest)
-				return
-			}
-			params = append(params, f)
+			params = append(params, strings.TrimSpace(s))
 		}
 	}
 	val, err := g.node.Query(collection, query, params)

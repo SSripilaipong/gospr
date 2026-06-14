@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,15 +11,15 @@ import (
 	"gospr/parser"
 )
 
-const src = `type T = vector real0+
+const src = `type T = vector rat0+
 
-fn lub a::real0+ b::real0+ = max a b
+fn lub a::rat0+ b::rat0+ = max a b
 
 merge T = zip lub
 
 query T.Value = reduce + 0
 
-update T.Add k::real0+ = local (+ k)
+update T.Add k::rat0+ = local (+ k)
 `
 
 // End-to-end: code string -> parse -> build -> model instance -> behaviors.
@@ -38,19 +39,19 @@ func TestE2E_vectorModel(t *testing.T) {
 	// Empty vector reduces to the init (0).
 	got, err := a.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 0.0, got)
+	assert.Equal(t, "0", got)
 
 	// `local (+ k)` updates only the calling node's slot.
-	require.NoError(t, a.Apply("Add", []any{3.0}))
-	require.NoError(t, b.Apply("Add", []any{5.0}))
+	require.NoError(t, a.Apply("Add", []any{"3"}))
+	require.NoError(t, b.Apply("Add", []any{"5"}))
 
 	got, err = a.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 3.0, got)
+	assert.Equal(t, "3", got)
 
 	got, err = b.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 5.0, got)
+	assert.Equal(t, "5", got)
 
 	// `zip max` merge unions the slots elementwise; reduce + sums them.
 	require.NoError(t, a.Merge(b.Snapshot()))
@@ -58,35 +59,35 @@ func TestE2E_vectorModel(t *testing.T) {
 
 	got, err = a.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 8.0, got)
+	assert.Equal(t, "8", got)
 
 	got, err = b.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 8.0, got)
+	assert.Equal(t, "8", got)
 
 	// Merge takes per-slot max: a stale lower value must not lower a slot.
-	a.Apply("Add", []any{10.0}) // nodeA slot -> 13
-	stale := map[string]float64{"nodeA": 1.0}
+	a.Apply("Add", []any{"10"}) // nodeA slot -> 13
+	stale := map[string]*big.Rat{"nodeA": big.NewRat(1, 1)}
 	require.NoError(t, a.Merge(stale))
 
 	got, err = a.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 18.0, got) // 13 (nodeA) + 5 (nodeB)
+	assert.Equal(t, "18", got) // 13 (nodeA) + 5 (nodeB)
 }
 
 // End-to-end: a guarded, string-returning function consumed by a query that
 // maps the reduced vector to a grade. Exercises guards, comparisons, string
 // results, otherwise, and reduce-in-a-query-expression together.
 func TestE2E_guardedGradeQuery(t *testing.T) {
-	src := `type Scores = vector real0+
-fn myScore x::real
+	src := `type Scores = vector rat0+
+fn myScore x::rat
 | (> x 90) = "You got a A"
 | (> x 80) = "You got a B"
 | (> x 70) = "You got a C"
 | otherwise = "You got a F"
 merge Scores = zip max
 query Scores.Grade = myScore (reduce max 0)
-update Scores.Add k::real0+ = local (+ k)
+update Scores.Add k::rat0+ = local (+ k)
 collection Scores = Scores
 `
 	plan, err := parser.Parse(src)
@@ -101,14 +102,14 @@ collection Scores = Scores
 	assert.Equal(t, "You got a F", got)
 
 	v := m.New("nodeA")
-	require.NoError(t, v.Apply("Add", []any{95.0}))
+	require.NoError(t, v.Apply("Add", []any{"95"}))
 	got, err = v.Query("Grade", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "You got a A", got)
 
 	// lower the working set: a fresh node summing to 75 -> grade C
 	w := m.New("nodeB")
-	require.NoError(t, w.Apply("Add", []any{75.0}))
+	require.NoError(t, w.Apply("Add", []any{"75"}))
 	got, err = w.Query("Grade", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "You got a C", got)
@@ -121,10 +122,10 @@ collection Scores = Scores
 // (The left-binding application semantics themselves are exercised at the
 // runtime level in crdt/vector_test.go's TestEval_partialApplication.)
 func TestE2E_nonInflationaryUpdateRejected(t *testing.T) {
-	src := `type C = vector real
+	src := `type C = vector rat
 merge C = zip max
 query C.Value = reduce + 0
-update C.Sub k::real = local (- k)
+update C.Sub k::rat = local (- k)
 `
 	plan, err := parser.Parse(src)
 	require.NoError(t, err)

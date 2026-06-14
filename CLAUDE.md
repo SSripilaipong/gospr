@@ -40,15 +40,16 @@ from <https://github.com/Z3Prover/z3> or `pip install z3-solver`.
 A toy distributed CRDT engine driven by a small functional DSL. A type is a
 **vector** (distributed-systems vector clock: `nodeID -> value`). Merge, query,
 and update behaviors are written as Haskell-style functional expressions. MVP
-Slots hold numbers typed by a small **numeric subtype lattice** (six types:
-`real, real0+, real0-, int, int0+, int0-` — domain {real,int} × sign {any,≥0,≤0};
-see the `numtype` package). Value types are `numeric` (carrying a `NumType`),
-`bool` (from comparisons), and `string` (from string literals). Built-in
-operators accept *any* numeric operand and each computes the *tightest sound*
-result type (`int + int0+ → int`, `real0+ - real0+ → real`); a `vector real0+`
-counter thus rejects `local (- k)` at build time and a negative `Add` at runtime.
-Users define functions (`fn add a::real b::real = + a b`, or multi-line **guarded**
-`fn grade x::real | (> x 90) = "A" | otherwise = "F"`) over a small applicative
+Slots hold **exact rational** numbers (`math/big.Rat`) typed by a small **numeric
+subtype lattice** (six types: `rat, rat0+, rat0-, int, int0+, int0-` — domain
+{rat,int} × sign {any,≥0,≤0}; see the `numtype` package). Value types are
+`numeric` (carrying a `NumType`), `bool` (from comparisons), and `string` (from
+string literals). Built-in operators accept *any* numeric operand and each
+computes the *tightest sound* result type (`int + int0+ → int`, `rat0+ - rat0+ →
+rat`); a `vector rat0+` counter thus rejects `local (- k)` at build time and a
+negative `Add` at runtime. Users define functions (`fn add a::rat b::rat = + a b`,
+or multi-line **guarded** `fn grade x::rat | (> x 90) = "A" | otherwise = "F"`)
+over a small applicative
 core (variables, literals, function references, application). `reduce`/`zip`/`local`
 remain combinator keywords carrying a function-valued term; `reduce` may also
 appear as a value sub-expression inside a **query** body (e.g. `myScore (reduce max 0)`),
@@ -62,8 +63,11 @@ associative, idempotent) and every update must be inflationary in merge's
 induced order (`merge(x, h(x)) = h(x)`). Both decompose to scalar SMT obligations
 discharged by Z3; an unprovable merge/update pair is rejected at build time. This
 is **not** a merge-monotonicity-only heuristic — it is the full SEC obligation
-pair, modulo idealized real/int arithmetic (the proof reasons over ℝ/ℤ, not
-IEEE floats). Query params and struct vectors (`vector { x real }`) are
+pair. The proof is **faithful to the runtime**: the runtime computes in exact
+rationals (`big.Rat`), and Z3's `Real` sort over-approximates ℚ (ℚ ⊆ ℝ), so a
+universally-quantified obligation proved over ℝ holds for every rational — there
+is no float-rounding gap (there is no division primitive, so ℚ stays closed; ints
+are exact too). Query params and struct vectors (`vector { x rat }`) are
 designed-for but not implemented.
 
 ## Architecture
@@ -84,8 +88,8 @@ parser  →  builder → prover  →  node / crdt
 |---|---|
 | `parser` | Syntax: text → `Plan` (flat AST slices, incl. `FnDef`s). Bodies are an applicative `Expr` sum type (`NumLit`/`StrLit`/`Name`/`App` + `Guards` + `Reduce`/`Zip`/`Local` combinators). A guarded `fn` body is `ExprGuards{Cases}`; `otherwise` is a `GuardCase.Otherwise` marker, not an expression. Leaves are emitted as **unresolved** `Name`s — the parser knows no scope. |
 | `builder` | Semantics: folds flat `TypeDef`+`FnDef`+`MergeDef`+`QueryDef`+`UpdateDef` into validated `*Model`s + a global `Functions` table, **resolves** every `Name` → `Var`/`Ref`, and **type-checks** every term (a small `checker`: `typeOf` over numeric (carrying `numtype.NumType`)/`bool`/`string`, **assignability via `numtype.Sub`** instead of equality, per-operator result rules, combinator boundary checks `Sub(result, elemType)`, memoized DFS return-type inference). Rejects duplicate/primitive-shadowing/zero-param fns, duplicate params, unknown identifiers, arity/type mismatches, results not assignable to the element type, guards without a final `otherwise` (or an `otherwise` not last), `reduce` outside a query, unanchored recursion, unknown param types, query params, missing merge. `Model` implements `CollectionSpec.New`; queries carry an inferred `Result` `ValType` + `ResultNum` `NumType`. |
-| `prover` | Proves CvRDT convergence for each `*Model` at the end of `Build` (imports `parser`/`numtype`/`crdt`, never `builder`). Lowers the merge fn and each update fn to a symbolic IR (`sym`, mirroring crdt's eval/apply with user-fn inlining + recursion rejection), builds scalar obligations — merge comm/assoc/idempotence + per-update `merge(x,h(x))=h(x)` — and discharges each by **negation** through Z3 (`z3 -smt2 -in`). Every var is declared `Real` with `is_int`/sign constraints from its own `NumType` (slot from the element type, update params from their declared types), so mixed Int/Real arithmetic stays well-sorted. No pure-Go fast path → `z3` is mandatory. |
-| `crdt` | Runtime only — no string parsing, no `Plan` knowledge. `VectorCRDT` evaluates resolved `Expr` trees against `map[string]float64` via a small applicative interpreter (tagged `rtVal` = num/str/bool/func, `[]rtVal` calling convention, partial application, recursion-depth guard). `Query` evals the body to an `rtVal` (a `reduce` sub-node folds `v.state` under the lock) and converts via `rtToAny`; `Merge` is atomic (build-copy-then-swap). |
+| `prover` | Proves CvRDT convergence for each `*Model` at the end of `Build` (imports `parser`/`numtype`/`crdt`, never `builder`). Lowers the merge fn and each update fn to a symbolic IR (`sym`, mirroring crdt's eval/apply with user-fn inlining + recursion rejection), builds scalar obligations — merge comm/assoc/idempotence + per-update `merge(x,h(x))=h(x)` — and discharges each by **negation** through Z3 (`z3 -smt2 -in`). Every var is declared `Real` with `is_int`/sign constraints from its own `NumType` (slot from the element type, update params from their declared types), so mixed Int/Rat arithmetic stays well-sorted. `Real` over-approximates the ℚ runtime soundly (unsat over ℝ ⇒ no rational counterexample); rational literals serialize as `(/ p.0 q.0)`. No pure-Go fast path → `z3` is mandatory. |
+| `crdt` | Runtime only — no string parsing, no `Plan` knowledge. `VectorCRDT` evaluates resolved `Expr` trees against `map[string]*big.Rat` (exact rationals) via a small applicative interpreter (tagged `rtVal` = num/str/bool/func, `[]rtVal` calling convention, partial application, recursion-depth guard). Arithmetic always allocates fresh `big.Rat`s; the **Snapshot/Merge boundary deep-clones** (`cloneRat`) because `big.Rat` is mutable, so no value is aliased across CRDTs. `Query` evals the body to an `rtVal` (a `reduce` sub-node folds `v.state` under the lock) and converts via `rtToAny` (numbers → exact `RatString`); `Merge` is atomic (build-copy-then-swap). |
 | `node` | Lifecycle + message loop; calls `Spec.New` from `BuiltPlan.Collections`. |
 | `gateway` | HTTP; returns 400 on parse/build errors and zero-collection deploys before touching node state; regenerates Swagger on deploy. |
 
@@ -95,7 +99,7 @@ parser  →  builder → prover  →  node / crdt
 main.go               wires 3 nodes + gateways, connects peer inboxes
 
 numtype/
-  numtype.go          leaf pkg (imports nothing): NumType{Domain,Sign}, the six names, Parse/String/Sub/Join/Allows. Zero value = top type `real`; internal `Zero` sign types the literal 0
+  numtype.go          leaf pkg (imports only math/big): NumType{Domain,Sign}, the six names, Parse/String/Sub/Join/Allows(*big.Rat). Zero value = top type `rat`; internal `Zero` sign types the literal 0
   numtype_test.go
 
 builder/
@@ -104,24 +108,24 @@ builder/
 
 prover/
   prover.go           Prove(elem, merge, updates, funcs); sym IR + lower (eval/refFn/evalApp/evalGuards, user-fn inlining + recursion guard); merge-law + per-update inflationary obligation builders
-  smt.go              sym → SMT-LIB (single Real sort, is_int/sign asserts, max/min→ite, ==/ /= → =/distinct); checkGoal/runZ3 via os/exec `z3 -smt2 -in`, unsat=proven; lookPath/z3Binary seams
+  smt.go              sym → SMT-LIB (single Real sort over-approximating ℚ, is_int/sign asserts, fmtRat→(/ p.0 q.0), max/min→ite, ==/ /= → =/distinct); checkGoal/runZ3 via os/exec `z3 -smt2 -in`, unsat=proven; lookPath/z3Binary seams
   prover_test.go      z3-backed accept/reject (max/min join, sum/avg rejected, inflationary, mixed-domain, recursion) + z3-missing seam
 
 crdt/
   crdt.go             CRDT interface: Apply/Query/Merge/Snapshot
-  vector.go           Method (with Result ValType + ResultNum), Function, VectorCRDT, NewVector; tagged rtVal interpreter (eval/evalFn/apply), primOp/arith/cmp primitives, rtToAny, maxEvalDepth guard; bindParams validates via numtype.Allows; toFloat64
+  vector.go           Method (with Result ValType + ResultNum), Function, VectorCRDT (state map[string]*big.Rat), NewVector, cloneRat (deep-clone at Snapshot/Merge); tagged rtVal interpreter (eval/evalFn/apply over *big.Rat), primOp/arith/cmp primitives, rtToAny (num→RatString), maxEvalDepth guard; bindParams validates via numtype.Allows; toRat
   vector_test.go
 
 node/
   node.go             lifecycle + message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
 
 swagger/
-  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; type-switches on *builder.Model; numSchema → integer/number + minimum/maximum from NumType
+  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; type-switches on *builder.Model; numSchema → string (numbers are exact-rational strings on the wire) with the NumType named in the description
   swagger_test.go
 
 gateway/
   gateway.go          HTTP: POST /api/cluster/deploy, POST /api/collections/{collection}/{action},
-                      GET /api/collections/{collection}/{query}?params=... (parsed as float64),
+                      GET /api/collections/{collection}/{query}?params=... (passed as exact-rational strings),
                       GET /api/swagger.json, GET /api/docs (Swagger UI)
 
 parser/
@@ -141,25 +145,26 @@ e2e/
 ## DSL syntax
 
 ```
-type T = vector real0+          # scalar numeric: real|real0+|real0-|int|int0+|int0- ; `vector { x real }` struct form is deferred
-fn lub a::real b::real = max a b # user-defined fn; body is a full applicative expression
-fn grade x::real                 # guarded fn: multi-line, value-typed branches
+type T = vector rat0+           # scalar numeric: rat|rat0+|rat0-|int|int0+|int0- ; `vector { x rat }` struct form is deferred
+fn lub a::rat b::rat = max a b  # user-defined fn; body is a full applicative expression
+fn grade x::rat                  # guarded fn: multi-line, value-typed branches
 | (> x 90) = "A"                #   each cond is a bool; results share one type (numeric/bool/string)
 | otherwise = "F"               #   `otherwise` is mandatory and must be the last case (build-checked)
 merge T = zip lub               # zip: apply a numeric,numeric->numeric fn elementwise per node slot
 query T.Grade = grade (reduce max 0)  # query body is a general expr; reduce folds the slots to a numeric
-update T.Add k::real0+ = local (+ k)  # local: apply a unary fn to ONLY the calling node's slot
+update T.Add k::rat0+ = local (+ k)   # local: apply a unary fn to ONLY the calling node's slot
 collection MyVec = T            # named runtime instance of a type (no args)
 ```
 
 - **Expressions** are prefix application: `f a b`, `+ a (max b c)`. A bare `(op arg)` like `(+ k)` is a **partial application**, not a special "section" form. Application may under-saturate (partial) but never over-saturate (build error).
-  - Partial application binds the **leftmost** argument first, so `(- k)` is `\x -> - k x` = `k - x` (the combinator supplies the slot `x` as the *next* arg). This is the one uniform rule — there is no right-section. For non-commutative ops where you want the slot as the left operand (`x - k`), define a helper with that param order: `fn rsub k::real x::real = - x k` then `local (rsub k)`. (`+ * max min` are commutative, so unaffected.)
+  - Partial application binds the **leftmost** argument first, so `(- k)` is `\x -> - k x` = `k - x` (the combinator supplies the slot `x` as the *next* arg). This is the one uniform rule — there is no right-section. For non-commutative ops where you want the slot as the left operand (`x - k`), define a helper with that param order: `fn rsub k::rat x::rat = - x k` then `local (rsub k)`. (`+ * max min` are commutative, so unaffected.)
 - **`fn`**: top-level, global, at least one numeric param (zero-arg fns rejected); body must be saturated. Return type (numeric/`bool`/`string`) is **inferred**. May reference other fns / itself — recursion is allowed only when a concrete branch anchors the return type (unanchored recursion is a build error); runtime is bounded by `maxEvalDepth`.
 - **Guarded `fn`**: `| cond = result` lines, `cond` a `bool`, all `result`s the same type (numeric branches join to a common numeric supertype). The final case must be `otherwise` (enforced at build time, so matches are total). A guarded body is `ExprGuards`; `reduce` is not allowed inside any `fn` (functions stay pure).
-- **Numeric types & operators**: six types `real, real0+, real0-, int, int0+, int0-` (domain {real,int} × sign {any,≥0,≤0}); see `numtype`. Operators take **any** numeric operand; each computes the tightest sound result (`+`/`-` via `addSign`, `*` via `mulSign`, `max`/`min` by bound analysis — so `real0+ - real0+ → real`). **Assignability** (`numtype.Sub`, not equality) governs args & the combinator boundary, so `int0+` flows where `real0+` is wanted. The literal `0` has an internal `Zero` sign, assignable to any numeric type. Comparisons `> < >= <= == /=` are numeric,numeric->`bool`. Strings are `"..."` (`\" \\ \n \t` escapes). The builder rejects type mismatches (`+ (> x 1) 2`) and results not assignable to the element type.
+- **Numeric types & operators**: six types `rat, rat0+, rat0-, int, int0+, int0-` (domain {rat,int} × sign {any,≥0,≤0}); see `numtype`. `rat` is exact rational (`big.Rat`) at runtime. Operators take **any** numeric operand; each computes the tightest sound result (`+`/`-` via `addSign`, `*` via `mulSign`, `max`/`min` by bound analysis — so `rat0+ - rat0+ → rat`). **Assignability** (`numtype.Sub`, not equality) governs args & the combinator boundary, so `int0+` flows where `rat0+` is wanted. The literal `0` has an internal `Zero` sign, assignable to any numeric type. Comparisons `> < >= <= == /=` are numeric,numeric->`bool`. Strings are `"..."` (`\" \\ \n \t` escapes). The builder rejects type mismatches (`+ (> x 1) 2`) and results not assignable to the element type.
 - **Combinator slots** (`zip`/`reduce`/`local`) take a single **atom** (a name or a parenthesised term), not a bare application — this keeps `reduce + 0` unambiguous (`+` is the fn, `0` the init). The fn is applied to element-typed args and its result must be `Sub` the element type: zip → (E,E)->Sub E; local → (E)->Sub E. `reduce` is also a value atom inside a **query** body (`f (reduce max 0)`); its result type is the lattice **fixpoint** of folding the fn over (acc, E) from the init's type.
 - Primitives: `+ * -` and comparisons are operator tokens; `max`/`min` are ordinary identifiers (so `maxValue` is one name) recognised as primitives by the builder. A `fn` may not shadow a primitive.
 - Params: `name::type` where `type` is one of the six numeric names, names unique. Values are validated at runtime against the param's type (`numtype.Allows`). Update params work; query params parse but are rejected at build (future feature).
+- **Wire form**: numbers cross the HTTP/JSON boundary as **exact-rational strings** (`"5"`, `"1/2"`, input `"0.1"` → `1/10`) — never JSON numbers — so nothing is lost to float at I/O. DSL numeric literals are likewise parsed exact (`parser.Expr.Num` is `*big.Rat`). Swagger types numeric fields as `string`.
 - A collection name = the node's collection key; a `type` defines reusable behavior, instantiated by `collection`.
 
 ## Extension points
@@ -169,7 +174,7 @@ collection MyVec = T            # named runtime instance of a type (no args)
 - **New value type** (non-numeric): add a `parser.ValType` + builder `vkind`, handle it in `checker.typeOf`/`subVtype`/`unify`, add an `rtKind` + constructor in `crdt/vector.go` and a `rtToAny`/`valTypeSchema` case.
 - **New expression form** (e.g. query params, struct vectors): add/realize an `ExprKind`/`ElemKind` in `parser/types.go`, parse it in `dsl.go`, resolve it in `builder.env.resolve` and type-check it in `checker.typeOf`, evaluate it in `crdt/vector.go` (`eval`).
 - **New expression form & the prover:** any new `ExprKind` reachable from a merge/update fn body also needs an `eval` case in `prover/prover.go` (lower it to a `sym`), else the convergence proof errors out. Struct vectors are the planned next step: per-field independent merge is a product lattice (prove each field's scalar fn separately); cross-field/LWW-style merges need a joint obligation — both still reduce to QF SMT.
-- **Network propagation of `deployMsg`:** `BuiltPlan` is data-only; gob/JSON-encode `Model` (it holds `parser.Expr` trees, no closures).
+- **Network propagation of `deployMsg`:** `BuiltPlan` is data-only; gob/JSON-encode `Model` (it holds `parser.Expr` trees, no closures). `Expr.Num` is `*big.Rat`, which has Gob/Text marshalers — propagation is in-process today (channels), so this only matters once it goes over the wire.
 
 ## Testing conventions
 

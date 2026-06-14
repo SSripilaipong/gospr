@@ -5,25 +5,29 @@
 //
 // A numeric type has two independent axes:
 //
-//   - Domain: Int <: Real.
+//   - Domain: Int <: Rat.
 //   - Sign:   Zero <: NonNeg <: Any and Zero <: NonPos <: Any
 //     (NonNeg and NonPos are incomparable).
 //
-// The six user-spellable types pair {Real,Int} with {Any,NonNeg,NonPos}:
-// real, real0+, real0-, int, int0+, int0-. The Zero sign is internal (not
+// The six user-spellable types pair {Rat,Int} with {Any,NonNeg,NonPos}:
+// rat, rat0+, rat0-, int, int0+, int0-. The Zero sign is internal (not
 // user-spellable): it is the type of the literal 0, so that 0 is assignable to
 // both non-negative and non-positive targets.
 //
-// The zero value of NumType is {Real, Any} == the top type `real`, so an unset
+// The Rat domain is exact rational arithmetic (math/big.Rat) at runtime, which
+// is why the convergence proof over the rationals is faithful — there is no
+// float rounding to violate the proved algebraic laws.
+//
+// The zero value of NumType is {Rat, Any} == the top type `rat`, so an unset
 // NumType reads as the most permissive numeric type.
 package numtype
 
-import "math"
+import "math/big"
 
 type Domain int
 
 const (
-	DReal Domain = iota // zero value: the widest domain
+	DRat Domain = iota // zero value: the widest domain
 	DInt
 )
 
@@ -46,12 +50,12 @@ type NumType struct {
 // yields the internal Zero sign.
 func Parse(name string) (NumType, bool) {
 	switch name {
-	case "real":
-		return NumType{DReal, SAny}, true
-	case "real0+":
-		return NumType{DReal, SNonNeg}, true
-	case "real0-":
-		return NumType{DReal, SNonPos}, true
+	case "rat":
+		return NumType{DRat, SAny}, true
+	case "rat0+":
+		return NumType{DRat, SNonNeg}, true
+	case "rat0-":
+		return NumType{DRat, SNonPos}, true
 	case "int":
 		return NumType{DInt, SAny}, true
 	case "int0+":
@@ -64,7 +68,7 @@ func Parse(name string) (NumType, bool) {
 }
 
 func (t NumType) String() string {
-	d := "real"
+	d := "rat"
 	if t.Domain == DInt {
 		d = "int"
 	}
@@ -80,7 +84,7 @@ func (t NumType) String() string {
 	}
 }
 
-func subDomain(a, b Domain) bool { return a == b || (a == DInt && b == DReal) }
+func subDomain(a, b Domain) bool { return a == b || (a == DInt && b == DRat) }
 
 func subSign(a, b Sign) bool {
 	if a == b {
@@ -100,8 +104,8 @@ func subSign(a, b Sign) bool {
 func Sub(a, b NumType) bool { return subDomain(a.Domain, b.Domain) && subSign(a.Sign, b.Sign) }
 
 func joinDomain(a, b Domain) Domain {
-	if a == DReal || b == DReal {
-		return DReal
+	if a == DRat || b == DRat {
+		return DRat
 	}
 	return DInt
 }
@@ -126,17 +130,17 @@ func Join(a, b NumType) NumType {
 
 // Allows reports whether the runtime value v is a member of type t: integral
 // when the domain is Int, and within the sign's range.
-func Allows(t NumType, v float64) bool {
-	if t.Domain == DInt && v != math.Trunc(v) {
+func Allows(t NumType, v *big.Rat) bool {
+	if t.Domain == DInt && !v.IsInt() {
 		return false
 	}
 	switch t.Sign {
 	case SNonNeg:
-		return v >= 0
+		return v.Sign() >= 0
 	case SNonPos:
-		return v <= 0
+		return v.Sign() <= 0
 	case SZero:
-		return v == 0
+		return v.Sign() == 0
 	default: // SAny
 		return true
 	}

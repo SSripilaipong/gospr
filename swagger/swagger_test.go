@@ -2,6 +2,7 @@ package swagger
 
 import (
 	"encoding/json"
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,16 +16,16 @@ import (
 func makeModelPlan() builder.BuiltPlan {
 	plus := parser.Expr{Kind: parser.ExprRef, Name: "+", Arity: 2, Ref: parser.RefPrimitive}
 	max := parser.Expr{Kind: parser.ExprRef, Name: "max", Arity: 2, Ref: parser.RefPrimitive}
-	zero := parser.Expr{Kind: parser.ExprNumLit, Num: 0}
+	zero := parser.Expr{Kind: parser.ExprNumLit, Num: big.NewRat(0, 1)}
 	// (+ 1) and (+ a) as resolved partial applications.
-	one := parser.Expr{Kind: parser.ExprNumLit, Num: 1}
+	one := parser.Expr{Kind: parser.ExprNumLit, Num: big.NewRat(1, 1)}
 	aVar := parser.Expr{Kind: parser.ExprVar, Name: "a"}
 	addOneFn := parser.Expr{Kind: parser.ExprApp, Head: &plus, Args: []*parser.Expr{&one}}
 	addAFn := parser.Expr{Kind: parser.ExprApp, Head: &plus, Args: []*parser.Expr{&aVar}}
 
 	model := &builder.Model{
 		Name:  "MyVec",
-		Elem:  parser.ElemType{Kind: parser.KindReal, Scalar: "real"},
+		Elem:  parser.ElemType{Kind: parser.KindReal, Scalar: "rat"},
 		Merge: parser.Expr{Kind: parser.ExprZip, Fn: &max},
 		Queries: map[string]crdt.Method{
 			"Value": {Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plus, Init: &zero}},
@@ -32,7 +33,7 @@ func makeModelPlan() builder.BuiltPlan {
 		Updates: map[string]crdt.Method{
 			"AddOne": {Body: parser.Expr{Kind: parser.ExprLocal, Fn: &addOneFn}},
 			"Add": {
-				Params: []parser.ParamSpec{{Name: "a", Type: "real"}},
+				Params: []parser.ParamSpec{{Name: "a", Type: "rat"}},
 				Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &addAFn},
 			},
 		},
@@ -56,13 +57,13 @@ func TestGenerate_paramSchemas(t *testing.T) {
 
 	example := mt["example"].(map[string]any)
 	params := example["params"].([]any)
-	assert.Equal(t, []any{float64(1)}, params)
+	assert.Equal(t, []any{"1"}, params) // exact-rational string
 
 	schemaObj := mt["schema"].(map[string]any)
 	propsObj := schemaObj["properties"].(map[string]any)
 	paramsSchema := propsObj["params"].(map[string]any)
 	items := paramsSchema["items"].(map[string]any)
-	assert.Equal(t, "number", items["type"])
+	assert.Equal(t, "string", items["type"]) // numbers cross the boundary as strings
 }
 
 func TestGenerate_zeroParamPost(t *testing.T) {
@@ -97,11 +98,11 @@ func TestGenerate_queryResponseType(t *testing.T) {
 	mt := resp["content"].(map[string]any)["application/json"].(map[string]any)
 	assert.Equal(t, "string", mt["schema"].(map[string]any)["type"])
 
-	// the real-typed Value query reports number
+	// the numeric Value query reports a string (exact-rational wire form)
 	getValue := paths["/api/collections/MyVec/Value"].(map[string]any)["get"].(map[string]any)
 	respValue := getValue["responses"].(map[string]any)["200"].(map[string]any)
 	mtValue := respValue["content"].(map[string]any)["application/json"].(map[string]any)
-	assert.Equal(t, "number", mtValue["schema"].(map[string]any)["type"])
+	assert.Equal(t, "string", mtValue["schema"].(map[string]any)["type"])
 }
 
 func TestGenerate_getZeroParamQuery(t *testing.T) {

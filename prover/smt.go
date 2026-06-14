@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strconv"
+	"math/big"
 	"strings"
 	"time"
 
@@ -47,8 +47,14 @@ func checkGoal(g goal) error {
 
 // buildScript renders a goal to an SMT-LIB script. Every variable is declared
 // as Real; an Int-domain variable additionally gets an integrality constraint,
-// so mixed Int/Real arithmetic never produces an ill-sorted term. This matches
-// the builder's numBin rule (any Real operand widens the result to Real).
+// so mixed Int/Rat arithmetic never produces an ill-sorted term. This matches
+// the builder's numBin rule (any Rat operand widens the result to Rat).
+//
+// The runtime computes in exact rationals (math/big.Rat), and Z3's Real sort
+// over-approximates ℚ (ℚ ⊆ ℝ). Each obligation is a universally-quantified
+// quantifier-free formula proved by refuting its negation, so "no real
+// counterexample" (unsat) implies "no rational counterexample" — proving over
+// Real is sound for the ℚ runtime.
 func buildScript(g goal) string {
 	var b strings.Builder
 	b.WriteString("(set-logic ALL)\n")
@@ -76,7 +82,7 @@ func buildScript(g goal) string {
 func serialize(s sym) string {
 	switch s.kind {
 	case symConst:
-		return fmtReal(s.num)
+		return fmtRat(s.num)
 	case symVar:
 		return s.name
 	case symBin:
@@ -106,17 +112,18 @@ func serialize(s sym) string {
 	}
 }
 
-// fmtReal renders a float as an SMT-LIB Real literal (always with a decimal
-// point; negatives via unary minus, which SMT-LIB requires).
-func fmtReal(f float64) string {
-	if f < 0 {
-		return "(- " + fmtReal(-f) + ")"
+// fmtRat renders an exact rational as an SMT-LIB Real literal. An integer p
+// becomes "p.0"; a fraction p/q becomes "(/ p.0 q.0)" (Z3 reads this as the
+// exact rational). Negatives go through unary minus, which SMT-LIB requires.
+func fmtRat(r *big.Rat) string {
+	if r.Sign() < 0 {
+		return "(- " + fmtRat(new(big.Rat).Neg(r)) + ")"
 	}
-	s := strconv.FormatFloat(f, 'f', -1, 64)
-	if !strings.Contains(s, ".") {
-		s += ".0"
+	num := r.Num().String() + ".0"
+	if r.IsInt() {
+		return num
 	}
-	return s
+	return "(/ " + num + " " + r.Denom().String() + ".0)"
 }
 
 // runZ3 feeds the script to `z3 -smt2 -in` and returns its first result token

@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,7 +14,9 @@ import (
 // ---- unresolved-term builders (parser output shapes) ---------------
 
 func name(n string) parser.Expr { return parser.Expr{Kind: parser.ExprName, Name: n} }
-func num(n float64) parser.Expr { return parser.Expr{Kind: parser.ExprNumLit, Num: n} }
+func num(n float64) parser.Expr {
+	return parser.Expr{Kind: parser.ExprNumLit, Num: new(big.Rat).SetFloat64(n)}
+}
 func app(head parser.Expr, args ...parser.Expr) parser.Expr {
 	h := head
 	ps := make([]*parser.Expr, len(args))
@@ -50,19 +53,19 @@ func gotherwise(result parser.Expr) parser.GuardCase {
 
 // canonicalPlan hard-codes the (unresolved) AST for:
 //
-//	type T = vector real
-//	fn lub a::real b::real = max a b
+//	type T = vector rat
+//	fn lub a::rat b::rat = max a b
 //	merge T = zip lub
 //	query T.Value = reduce + 0
-//	update T.Add k::real0+ = local (+ k)
+//	update T.Add k::rat0+ = local (+ k)
 //
-// The update param is real0+ (not real): a `+ k` update is only inflationary
+// The update param is rat0+ (not rat): a `+ k` update is only inflationary
 // under a max merge when k is non-negative, which the convergence prover checks.
 func canonicalPlan() parser.Plan {
 	return parser.Plan{
-		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal, Scalar: "real"}}},
+		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal, Scalar: "rat"}}},
 		Functions: []parser.FnDef{
-			{Name: "lub", Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
+			{Name: "lub", Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 				Body: app(name("max"), name("a"), name("b"))},
 		},
 		Merges: []parser.MergeDef{
@@ -73,7 +76,7 @@ func canonicalPlan() parser.Plan {
 		},
 		Updates: []parser.UpdateDef{
 			{TypeName: "T", MethodName: "Add",
-				Params: []parser.ParamSpec{{Name: "k", Type: "real0+"}},
+				Params: []parser.ParamSpec{{Name: "k", Type: "rat0+"}},
 				Body:   local(app(name("+"), name("k")))},
 		},
 	}
@@ -119,7 +122,7 @@ func TestBuild_integration(t *testing.T) {
 	require.NoError(t, a.Merge(b.Snapshot())) // zip lub == max per slot
 	got, err := a.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 8.0, got)
+	assert.Equal(t, "8", got)
 }
 
 func TestBuild_collectionReferencesType(t *testing.T) {
@@ -164,7 +167,7 @@ func TestBuild_badParamType(t *testing.T) {
 
 func TestBuild_queryParamsRejected(t *testing.T) {
 	plan := canonicalPlan()
-	plan.Queries[0].Params = []parser.ParamSpec{{Name: "m", Type: "real"}}
+	plan.Queries[0].Params = []parser.ParamSpec{{Name: "m", Type: "rat"}}
 	_, err := Build(plan)
 	require.Error(t, err)
 }
@@ -217,7 +220,7 @@ func TestBuild_sectionUnknownParam(t *testing.T) {
 func TestBuild_duplicateFunction(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Functions = append(plan.Functions, parser.FnDef{Name: "lub",
-		Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
+		Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 		Body:   app(name("min"), name("a"), name("b"))})
 	_, err := Build(plan)
 	require.Error(t, err)
@@ -226,7 +229,7 @@ func TestBuild_duplicateFunction(t *testing.T) {
 func TestBuild_functionShadowsPrimitive(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Functions = append(plan.Functions, parser.FnDef{Name: "max",
-		Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
+		Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 		Body:   name("a")})
 	_, err := Build(plan)
 	require.Error(t, err)
@@ -234,7 +237,7 @@ func TestBuild_functionShadowsPrimitive(t *testing.T) {
 
 func TestBuild_duplicateParam(t *testing.T) {
 	plan := canonicalPlan()
-	plan.Functions[0].Params = []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "a", Type: "real"}}
+	plan.Functions[0].Params = []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "a", Type: "rat"}}
 	_, err := Build(plan)
 	require.Error(t, err)
 }
@@ -272,7 +275,7 @@ func TestBuild_unanchoredRecursionRejected(t *testing.T) {
 	plan := canonicalPlan()
 	// fn loop a b = loop a b  — Option A: return type can't be inferred, rejected.
 	plan.Functions = append(plan.Functions, parser.FnDef{Name: "loop",
-		Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
+		Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 		Body:   app(name("loop"), name("a"), name("b"))})
 	_, err := Build(plan)
 	require.Error(t, err)
@@ -280,13 +283,13 @@ func TestBuild_unanchoredRecursionRejected(t *testing.T) {
 
 func TestBuild_anchoredRecursionBuildsOK(t *testing.T) {
 	plan := canonicalPlan()
-	// fn f x | (> x 0) = f (- x 1) | otherwise = 0  — anchored by the real base case.
+	// fn f x | (> x 0) = f (- x 1) | otherwise = 0  — anchored by the rat base case.
 	body := guards(
 		gcase(app(name(">"), name("x"), num(0)), app(name("f"), app(name("-"), name("x"), num(1)))),
 		gotherwise(num(0)),
 	)
 	plan.Functions = append(plan.Functions, parser.FnDef{Name: "f",
-		Params: []parser.ParamSpec{{Name: "x", Type: "real"}},
+		Params: []parser.ParamSpec{{Name: "x", Type: "rat"}},
 		Body:   body})
 	_, err := Build(plan)
 	require.NoError(t, err)
@@ -305,14 +308,14 @@ func mustParse(t *testing.T, src string) parser.Plan {
 // Integration: build the guarded grade program and assert the inferred query
 // result type is string.
 func TestBuild_guardedProgram(t *testing.T) {
-	src := `type T = vector real
-fn myScore x::real
+	src := `type T = vector rat
+fn myScore x::rat
 | (> x 90) = "You got a A"
 | (>= x 80) = "You got a B"
 | otherwise = "You got a F"
 merge T = zip max
 query T.Grade = myScore (reduce max 0)
-update T.Add k::real0+ = local (+ k)
+update T.Add k::rat0+ = local (+ k)
 collection Scores = T
 `
 	built, err := Build(mustParse(t, src))
@@ -326,30 +329,30 @@ collection Scores = T
 }
 
 func TestBuild_boolReturningFnOK(t *testing.T) {
-	_, err := Build(mustParse(t, "fn adult x::real = >= x 18\n"))
+	_, err := Build(mustParse(t, "fn adult x::rat = >= x 18\n"))
 	require.NoError(t, err)
 }
 
 func TestBuild_guardTypeErrors(t *testing.T) {
 	cases := map[string]string{
-		"guard cond not bool": `fn bad x::real
+		"guard cond not bool": `fn bad x::rat
 | (+ x 1) = "a"
 | otherwise = "b"
 `,
-		"mismatched branch types": `fn bad x::real
+		"mismatched branch types": `fn bad x::rat
 | (> x 1) = "a"
 | otherwise = 0
 `,
-		"missing final otherwise": `fn bad x::real
+		"missing final otherwise": `fn bad x::rat
 | (> x 1) = "a"
 | (> x 2) = "b"
 `,
-		"otherwise not last": `fn bad x::real
+		"otherwise not last": `fn bad x::rat
 | otherwise = "a"
 | (> x 1) = "b"
 `,
-		"bool passed to arithmetic": "fn bad x::real = + (> x 1) 2\n",
-		"reduce in fn body":         "fn bad x::real = reduce + 0\n",
+		"bool passed to arithmetic": "fn bad x::rat = + (> x 1) 2\n",
+		"reduce in fn body":         "fn bad x::rat = reduce + 0\n",
 	}
 	for nameStr, src := range cases {
 		t.Run(nameStr, func(t *testing.T) {
@@ -360,22 +363,22 @@ func TestBuild_guardTypeErrors(t *testing.T) {
 }
 
 func TestBuild_applicationTypeMismatch(t *testing.T) {
-	// g expects a real; passing it a bool (> x 1) is a type error.
-	src := `fn g y::real = y
-fn bad x::real = g (> x 1)
+	// g expects a rat; passing it a bool (> x 1) is a type error.
+	src := `fn g y::rat = y
+fn bad x::rat = g (> x 1)
 `
 	_, err := Build(mustParse(t, src))
 	require.Error(t, err)
 }
 
 func TestBuild_stringFnInLocalRejected(t *testing.T) {
-	// an update's local fn must return real; a string-returning fn is rejected.
-	src := `type T = vector real
-fn label x::real
+	// an update's local fn must return rat; a string-returning fn is rejected.
+	src := `type T = vector rat
+fn label x::rat
 | (> x 0) = "pos"
 | otherwise = "neg"
 merge T = zip max
-update T.Set k::real = local label
+update T.Set k::rat = local label
 collection C = T
 `
 	_, err := Build(mustParse(t, src))
@@ -384,12 +387,12 @@ collection C = T
 
 // ---- numeric subtypes / per-operator typing ------------------------
 
-// Subtraction loses the non-negative sign, so `local (- k)` on a `vector real0+`
-// produces a `real` result that is not assignable back to the `real0+` slot.
+// Subtraction loses the non-negative sign, so `local (- k)` on a `vector rat0+`
+// produces a `rat` result that is not assignable back to the `rat0+` slot.
 func TestBuild_subtractionOnNonNegRejected(t *testing.T) {
-	src := `type T = vector real0+
+	src := `type T = vector rat0+
 merge T = zip max
-update T.Sub k::real0+ = local (- k)
+update T.Sub k::rat0+ = local (- k)
 collection C = T
 `
 	_, err := Build(mustParse(t, src))
@@ -398,22 +401,22 @@ collection C = T
 
 // Addition preserves the non-negative sign, so the same shape with `+` builds.
 func TestBuild_additionOnNonNegOK(t *testing.T) {
-	src := `type T = vector real0+
+	src := `type T = vector rat0+
 merge T = zip max
-update T.Add k::real0+ = local (+ k)
+update T.Add k::rat0+ = local (+ k)
 collection C = T
 `
 	_, err := Build(mustParse(t, src))
 	require.NoError(t, err)
 }
 
-// `reduce + 0` infers the element's numeric type: real0+ over a real0+ vector,
+// `reduce + 0` infers the element's numeric type: rat0+ over a rat0+ vector,
 // int over an int vector (0 + int widens to int via the literal-0 Zero sign).
 func TestBuild_reduceInfersElementType(t *testing.T) {
 	cases := map[string]numtype.NumType{
-		"real0+": {Domain: numtype.DReal, Sign: numtype.SNonNeg},
-		"int":    {Domain: numtype.DInt, Sign: numtype.SAny},
-		"int0+":  {Domain: numtype.DInt, Sign: numtype.SNonNeg},
+		"rat0+": {Domain: numtype.DRat, Sign: numtype.SNonNeg},
+		"int":   {Domain: numtype.DInt, Sign: numtype.SAny},
+		"int0+": {Domain: numtype.DInt, Sign: numtype.SNonNeg},
 	}
 	for elem, want := range cases {
 		t.Run(elem, func(t *testing.T) {
@@ -428,9 +431,9 @@ func TestBuild_reduceInfersElementType(t *testing.T) {
 }
 
 // The literal 0 has the internal Zero sign, so it is assignable to a
-// non-positive target: `local (+ 0)` builds on a `vector real0-`.
+// non-positive target: `local (+ 0)` builds on a `vector rat0-`.
 func TestBuild_literalZeroAssignableToNonPos(t *testing.T) {
-	src := `type T = vector real0-
+	src := `type T = vector rat0-
 merge T = zip min
 update T.Nop = local (+ 0)
 collection C = T
@@ -439,11 +442,11 @@ collection C = T
 	require.NoError(t, err)
 }
 
-// Mixed domains: a `vector real` slot with an int0+ increment param builds and
+// Mixed domains: a `vector rat` slot with an int0+ increment param builds and
 // is proven inflationary under max — the prover declares the slot as Real and
 // the param as an integer (is_int), so the cross-domain `+` is well-sorted.
 func TestBuild_mixedDomainUpdateProven(t *testing.T) {
-	src := `type T = vector real
+	src := `type T = vector rat
 merge T = zip max
 update T.Add k::int0+ = local (+ k)
 collection C = T
@@ -452,9 +455,9 @@ collection C = T
 	require.NoError(t, err)
 }
 
-// int0+ is a subtype of real0+, so a fn expecting real0+ accepts an int0+ arg.
+// int0+ is a subtype of rat0+, so a fn expecting rat0+ accepts an int0+ arg.
 func TestBuild_intSubtypeWhereRealExpected(t *testing.T) {
-	src := `fn f x::real0+ = + x 1
+	src := `fn f x::rat0+ = + x 1
 fn g y::int0+ = f y
 `
 	_, err := Build(mustParse(t, src))
@@ -464,7 +467,7 @@ fn g y::int0+ = f y
 // Anchored recursion where the recursive call is an operand to `+` still builds:
 // the recursive call types as vUnknown mid-inference and defers the numeric check.
 func TestBuild_anchoredRecursionThroughOperator(t *testing.T) {
-	src := `fn f x::real
+	src := `fn f x::rat
 | (> x 0) = + 1 (f (- x 1))
 | otherwise = 0
 `

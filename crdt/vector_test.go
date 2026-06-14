@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,7 +18,11 @@ func prim(name string) parser.Expr {
 func fnRef(name string, arity int) parser.Expr {
 	return parser.Expr{Kind: parser.ExprRef, Name: name, Arity: arity, Ref: parser.RefFunction}
 }
-func lit(n float64) parser.Expr { return parser.Expr{Kind: parser.ExprNumLit, Num: n} }
+
+// bigF builds an exact rational from a float for test fixtures.
+func bigF(n float64) *big.Rat { return new(big.Rat).SetFloat64(n) }
+
+func lit(n float64) parser.Expr { return parser.Expr{Kind: parser.ExprNumLit, Num: bigF(n)} }
 func vr(name string) parser.Expr {
 	return parser.Expr{Kind: parser.ExprVar, Name: name}
 }
@@ -46,7 +51,7 @@ func reducePlus0() Method {
 func localAddK() Method {
 	sec := app(prim("+"), vr("k")) // (+ k) == partial application
 	return Method{
-		Params: []parser.ParamSpec{{Name: "k", Type: "real"}},
+		Params: []parser.ParamSpec{{Name: "k", Type: "rat"}},
 		Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &sec},
 	}
 }
@@ -62,42 +67,88 @@ func TestVector_addAndValue(t *testing.T) {
 	v := newT("nodeA")
 	got, err := v.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 0.0, got)
+	assert.Equal(t, "0", got)
 
-	require.NoError(t, v.Apply("Add", []any{3.0}))
-	require.NoError(t, v.Apply("Add", []any{2.0}))
+	require.NoError(t, v.Apply("Add", []any{"3"}))
+	require.NoError(t, v.Apply("Add", []any{"2"}))
 
 	got, err = v.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 5.0, got)
+	assert.Equal(t, "5", got)
+}
+
+// Exact rationals: ten increments of 0.1 sum to exactly 1, which IEEE floats
+// would miss. This is the soundness payoff of the rat runtime.
+func TestVector_exactRationalArithmetic(t *testing.T) {
+	v := newT("nodeA")
+	for i := 0; i < 10; i++ {
+		require.NoError(t, v.Apply("Add", []any{"0.1"}))
+	}
+	got, err := v.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "1", got)
 }
 
 func TestVector_localOnlyAffectsLocalSlot(t *testing.T) {
 	v := newT("nodeA")
-	v.Apply("Add", []any{4.0})
-	snap := v.Snapshot().(map[string]float64)
+	v.Apply("Add", []any{"4"})
+	snap := v.Snapshot().(map[string]*big.Rat)
 	assert.Len(t, snap, 1)
-	assert.Equal(t, 4.0, snap["nodeA"])
+	assert.Equal(t, big.NewRat(4, 1), snap["nodeA"])
 }
 
 func TestVector_mergeIsElementwiseMax(t *testing.T) {
 	a := newT("nodeA")
 	b := newT("nodeB")
-	a.Apply("Add", []any{3.0}) // a: {nodeA:3}
-	b.Apply("Add", []any{5.0}) // b: {nodeB:5}
+	a.Apply("Add", []any{"3"}) // a: {nodeA:3}
+	b.Apply("Add", []any{"5"}) // b: {nodeB:5}
 
 	require.NoError(t, a.Merge(b.Snapshot()))
 	// union: {nodeA:3, nodeB:5} -> reduce + = 8
 	got, err := a.Query("Value", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 8.0, got)
+	assert.Equal(t, "8", got)
 
 	// merge is max per slot: a re-adds, then a stale lower snapshot must not lower it.
-	a.Apply("Add", []any{10.0}) // nodeA: 13
-	stale := map[string]float64{"nodeA": 1.0}
+	a.Apply("Add", []any{"10"}) // nodeA: 13
+	stale := map[string]*big.Rat{"nodeA": big.NewRat(1, 1)}
 	a.Merge(stale)
-	snap := a.Snapshot().(map[string]float64)
-	assert.Equal(t, 13.0, snap["nodeA"])
+	snap := a.Snapshot().(map[string]*big.Rat)
+	assert.Equal(t, big.NewRat(13, 1), snap["nodeA"])
+}
+
+// Snapshot must hand out deep copies: mutating a returned *big.Rat must not
+// change the CRDT's own state (big.Rat is mutable).
+func TestVector_snapshotIsDeepCopied(t *testing.T) {
+	v := newT("nodeA")
+	v.Apply("Add", []any{"4"})
+	snap := v.Snapshot().(map[string]*big.Rat)
+	snap["nodeA"].Add(snap["nodeA"], big.NewRat(100, 1)) // mutate the handed-out value
+
+	again := v.Snapshot().(map[string]*big.Rat)
+	assert.Equal(t, big.NewRat(4, 1), again["nodeA"], "CRDT state must be unaffected by snapshot mutation")
+}
+
+// Merge must not alias the remote snapshot into local state: mutating a remote
+// value after a merge must not change the local CRDT (for both the merged-slot
+// and the adopt-remote paths).
+func TestVector_mergeDoesNotAliasRemote(t *testing.T) {
+	a := newT("nodeA")
+	a.Apply("Add", []any{"3"}) // a: {nodeA:3}
+
+	remote := map[string]*big.Rat{
+		"nodeA": big.NewRat(5, 1), // overlapping slot -> max(3,5)=5
+		"nodeB": big.NewRat(7, 1), // absent locally -> adopted
+	}
+	require.NoError(t, a.Merge(remote))
+
+	// Mutate the remote values after the merge.
+	remote["nodeA"].Add(remote["nodeA"], big.NewRat(100, 1))
+	remote["nodeB"].Add(remote["nodeB"], big.NewRat(100, 1))
+
+	snap := a.Snapshot().(map[string]*big.Rat)
+	assert.Equal(t, big.NewRat(5, 1), snap["nodeA"], "merged slot must not alias remote")
+	assert.Equal(t, big.NewRat(7, 1), snap["nodeB"], "adopted slot must not alias remote")
 }
 
 func TestVector_unknownActionAndQuery(t *testing.T) {
@@ -113,18 +164,18 @@ func TestVector_paramCountMismatch(t *testing.T) {
 }
 
 // A value outside a param's declared numeric type is rejected at apply time:
-// a negative increment on a real0+ counter, and a non-integer on an int slot.
+// a negative increment on a rat0+ counter, and a non-integer on an int slot.
 func TestVector_runtimeParamValidation(t *testing.T) {
 	nonNeg := func() Method {
 		sec := app(prim("+"), vr("k"))
 		return Method{
-			Params: []parser.ParamSpec{{Name: "k", Type: "real0+"}},
+			Params: []parser.ParamSpec{{Name: "k", Type: "rat0+"}},
 			Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &sec},
 		}
 	}
 	v := NewVector("nodeA", zipMax(), nil, map[string]Method{"Add": nonNeg()}, nil)
-	require.NoError(t, v.Apply("Add", []any{5.0}))
-	require.Error(t, v.Apply("Add", []any{-1.0}), "negative value must be rejected for real0+")
+	require.NoError(t, v.Apply("Add", []any{"5"}))
+	require.Error(t, v.Apply("Add", []any{"-1"}), "negative value must be rejected for rat0+")
 
 	intOnly := func() Method {
 		sec := app(prim("+"), vr("k"))
@@ -134,22 +185,22 @@ func TestVector_runtimeParamValidation(t *testing.T) {
 		}
 	}
 	w := NewVector("nodeA", zipMax(), nil, map[string]Method{"Add": intOnly()}, nil)
-	require.NoError(t, w.Apply("Add", []any{3.0}))
-	require.Error(t, w.Apply("Add", []any{2.5}), "non-integer must be rejected for int")
+	require.NoError(t, w.Apply("Add", []any{"3"}))
+	require.Error(t, w.Apply("Add", []any{"2.5"}), "non-integer must be rejected for int")
 }
 
 // ---- evaluator unit tests ------------------------------------------
 
 func TestEval_application(t *testing.T) {
 	// fn add a b = + a b
-	add := Function{Name: "add", Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
+	add := Function{Name: "add", Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 		Body: app(prim("+"), vr("a"), vr("b"))}
 	v := NewVector("n", zipMax(), nil, nil, map[string]Function{"add": add})
 
 	got, err := v.eval(app(fnRef("add", 2), lit(2), lit(3)), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, kNum, got.kind)
-	assert.Equal(t, 5.0, got.num)
+	assert.Equal(t, big.NewRat(5, 1), got.num)
 }
 
 func TestEval_partialApplication(t *testing.T) {
@@ -159,9 +210,9 @@ func TestEval_partialApplication(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, kFunc, got.kind)
 	assert.Equal(t, 1, got.arity)
-	r, err := got.call([]rtVal{numVal(4)})
+	r, err := got.call([]rtVal{numVal(bigF(4))})
 	require.NoError(t, err)
-	assert.Equal(t, 5.0, r.num)
+	assert.Equal(t, big.NewRat(5, 1), r.num)
 }
 
 func TestEval_primitiveRef(t *testing.T) {
@@ -169,9 +220,9 @@ func TestEval_primitiveRef(t *testing.T) {
 	got, err := v.eval(prim("max"), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, kFunc, got.kind)
-	r, err := got.call([]rtVal{numVal(3), numVal(7)})
+	r, err := got.call([]rtVal{numVal(bigF(3)), numVal(bigF(7))})
 	require.NoError(t, err)
-	assert.Equal(t, 7.0, r.num)
+	assert.Equal(t, big.NewRat(7, 1), r.num)
 }
 
 // ---- bool / string / guards / reduce-in-expression -----------------
@@ -216,7 +267,7 @@ func TestEval_guardsSelectFirstTrueElseOtherwise(t *testing.T) {
 		gcase(app(prim(">="), vr("x"), lit(80)), str("B")),
 		gotherwise(str("F")),
 	)
-	grade := Function{Name: "grade", Params: []parser.ParamSpec{{Name: "x", Type: "real"}}, Body: body}
+	grade := Function{Name: "grade", Params: []parser.ParamSpec{{Name: "x", Type: "rat"}}, Body: body}
 	v := NewVector("n", zipMax(), nil, nil, map[string]Function{"grade": grade})
 
 	call := func(x float64) string {
@@ -237,26 +288,26 @@ func TestEval_reduceInExpression(t *testing.T) {
 	reduceBody := parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}
 	body := app(prim("+"), lit(1), reduceBody)
 	v := NewVector("n", zipMax(), map[string]Method{"Q": {Body: body, Result: parser.TypeReal}}, nil, nil)
-	v.state["a"] = 2
-	v.state["b"] = 3
+	v.state["a"] = big.NewRat(2, 1)
+	v.state["b"] = big.NewRat(3, 1)
 	got, err := v.Query("Q", nil)
 	require.NoError(t, err)
-	assert.Equal(t, 6.0, got) // 1 + (2 + 3)
+	assert.Equal(t, "6", got) // 1 + (2 + 3)
 }
 
 // A non-terminating recursive merge fn must error (depth guard), not hang,
 // and must leave state untouched (merge atomicity).
 func TestVector_recursionGuardAndMergeAtomicity(t *testing.T) {
-	loop := Function{Name: "loop", Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
+	loop := Function{Name: "loop", Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 		Body: app(fnRef("loop", 2), vr("a"), vr("b"))}
 	zipLoop := func() parser.Expr {
 		fn := fnRef("loop", 2)
 		return parser.Expr{Kind: parser.ExprZip, Fn: &fn}
 	}
 	v := NewVector("nodeA", zipLoop(), nil, nil, map[string]Function{"loop": loop})
-	v.state["nodeA"] = 1.0
+	v.state["nodeA"] = big.NewRat(1, 1)
 
-	err := v.Merge(map[string]float64{"nodeA": 2.0}) // overlapping slot triggers loop
+	err := v.Merge(map[string]*big.Rat{"nodeA": big.NewRat(2, 1)}) // overlapping slot triggers loop
 	require.Error(t, err)
-	assert.Equal(t, 1.0, v.state["nodeA"], "state must be unchanged after a failing merge")
+	assert.Equal(t, big.NewRat(1, 1), v.state["nodeA"], "state must be unchanged after a failing merge")
 }

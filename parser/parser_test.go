@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,15 +11,15 @@ import (
 // Mandated integration test: parse the canonical snippet (now including a
 // user-defined function used in merge) into the AST.
 func TestParse_integration(t *testing.T) {
-	src := `type T = vector real
+	src := `type T = vector rat
 
-fn lub a::real b::real = max a b
+fn lub a::rat b::rat = max a b
 
 merge T = zip lub
 
 query T.Value = reduce + 0
 
-update T.Add k::real = local (+ k)
+update T.Add k::rat = local (+ k)
 `
 	plan, err := Parse(src)
 	require.NoError(t, err)
@@ -35,7 +36,7 @@ update T.Add k::real = local (+ k)
 	assert.Equal(t, "lub", fn.Name)
 	require.Len(t, fn.Params, 2)
 	assert.Equal(t, "a", fn.Params[0].Name)
-	assert.Equal(t, "real", fn.Params[0].Type)
+	assert.Equal(t, "rat", fn.Params[0].Type)
 	assert.Equal(t, "b", fn.Params[1].Name)
 	// body is `max a b` == App(Name max, [Name a, Name b]) (unresolved)
 	require.Equal(t, ExprApp, fn.Body.Kind)
@@ -68,7 +69,7 @@ update T.Add k::real = local (+ k)
 	assert.Equal(t, "+", qd.Body.Fn.Name)
 	require.NotNil(t, qd.Body.Init)
 	assert.Equal(t, ExprNumLit, qd.Body.Init.Kind)
-	assert.Equal(t, float64(0), qd.Body.Init.Num)
+	assert.Equal(t, big.NewRat(0, 1), qd.Body.Init.Num)
 
 	// --- update: local (+ k) == local applied to a partial application ---
 	require.Len(t, plan.Updates, 1)
@@ -93,14 +94,14 @@ update T.Add k::real = local (+ k)
 // Integration: a full program with a multi-line guarded function (comparisons
 // + string results + otherwise) and a query that wraps reduce.
 func TestParse_guardedFunctionProgram(t *testing.T) {
-	src := `type T = vector real
-fn myScore x::real
+	src := `type T = vector rat
+fn myScore x::rat
 | (> x 90) = "You got a A"
 | (>= x 80) = "You got a B"
 | otherwise = "You got a F"
 merge T = zip max
 query T.Grade = myScore (reduce max 0)
-update T.Add k::real = local (+ k)
+update T.Add k::rat = local (+ k)
 collection Scores = T
 `
 	plan, err := Parse(src)
@@ -137,21 +138,21 @@ collection Scores = T
 	require.Len(t, qb.Args, 1)
 	require.Equal(t, ExprReduce, qb.Args[0].Kind)
 	assert.Equal(t, "max", qb.Args[0].Fn.Name)
-	assert.Equal(t, float64(0), qb.Args[0].Init.Num)
+	assert.Equal(t, big.NewRat(0, 1), qb.Args[0].Init.Num)
 
 	require.Len(t, plan.Collections, 1)
 	assert.Equal(t, "Scores", plan.Collections[0].Name)
 }
 
 func TestParse_singleLineFnStillWorks(t *testing.T) {
-	plan, err := Parse("fn lub a::real b::real = max a b\n")
+	plan, err := Parse("fn lub a::rat b::rat = max a b\n")
 	require.NoError(t, err)
 	require.Len(t, plan.Functions, 1)
 	assert.Equal(t, ExprApp, plan.Functions[0].Body.Kind)
 }
 
 func TestParse_stringLiteralEscapes(t *testing.T) {
-	plan, err := Parse("fn f x::real = \"a\\\"b\\\\c\"\n")
+	plan, err := Parse("fn f x::rat = \"a\\\"b\\\\c\"\n")
 	require.NoError(t, err)
 	body := plan.Functions[0].Body
 	require.Equal(t, ExprStrLit, body.Kind)
@@ -159,13 +160,13 @@ func TestParse_stringLiteralEscapes(t *testing.T) {
 }
 
 func TestParse_unterminatedStringIsError(t *testing.T) {
-	_, err := Parse("fn f x::real = \"oops\n")
+	_, err := Parse("fn f x::rat = \"oops\n")
 	require.Error(t, err)
 }
 
 func TestParse_comparisonOperators(t *testing.T) {
 	for _, op := range []string{">", "<", ">=", "<=", "==", "/="} {
-		plan, err := Parse("fn f x::real = " + op + " x 1\n")
+		plan, err := Parse("fn f x::rat = " + op + " x 1\n")
 		require.NoError(t, err, "op %q", op)
 		body := plan.Functions[0].Body
 		require.Equal(t, ExprApp, body.Kind, "op %q", op)
@@ -186,8 +187,8 @@ func TestParse_queryWrapsReduceAtom(t *testing.T) {
 // `fn` header — is a parse error, never silently skipped.
 func TestParse_strayBarIsError(t *testing.T) {
 	cases := []string{
-		"fn f x::real\n| otherwise = \"a\"\n| broken\n", // malformed guard after otherwise
-		"type T = vector real\n| broken\n",              // `|` with no fn header
+		"fn f x::rat\n| otherwise = \"a\"\n| broken\n", // malformed guard after otherwise
+		"type T = vector rat\n| broken\n",              // `|` with no fn header
 	}
 	for _, src := range cases {
 		_, err := Parse(src)
@@ -196,9 +197,9 @@ func TestParse_strayBarIsError(t *testing.T) {
 }
 
 // All six numeric type names parse, both as a vector element and as a param type.
-// `real0+` must win over the `real` prefix (longest match).
+// `rat0+` must win over the `rat` prefix (longest match).
 func TestParse_numericTypeNames(t *testing.T) {
-	for _, name := range []string{"real", "real0+", "real0-", "int", "int0+", "int0-"} {
+	for _, name := range []string{"rat", "rat0+", "rat0-", "int", "int0+", "int0-"} {
 		plan, err := Parse("type T = vector " + name + "\n")
 		require.NoError(t, err, "elem %q", name)
 		require.Len(t, plan.Types, 1, "elem %q", name)
@@ -228,13 +229,13 @@ func TestParse_sectionNumberLiteral(t *testing.T) {
 	assert.Equal(t, "+", sec.Head.Name)
 	require.Len(t, sec.Args, 1)
 	assert.Equal(t, ExprNumLit, sec.Args[0].Kind)
-	assert.Equal(t, float64(1), sec.Args[0].Num)
+	assert.Equal(t, big.NewRat(1, 1), sec.Args[0].Num)
 }
 
 func TestParse_decimalLiteral(t *testing.T) {
 	plan, err := Parse("query T.V = reduce + 2.5\n")
 	require.NoError(t, err)
-	assert.Equal(t, 2.5, plan.Queries[0].Body.Init.Num)
+	assert.Equal(t, big.NewRat(5, 2), plan.Queries[0].Body.Init.Num)
 }
 
 func TestParse_operators(t *testing.T) {
@@ -254,7 +255,7 @@ func TestParse_operators(t *testing.T) {
 
 // fn body with nested parenthesised application: + a (max b c)
 func TestParse_nestedApplication(t *testing.T) {
-	plan, err := Parse("fn f a::real b::real c::real = + a (max b c)\n")
+	plan, err := Parse("fn f a::rat b::rat c::rat = + a (max b c)\n")
 	require.NoError(t, err)
 	require.Len(t, plan.Functions, 1)
 	body := plan.Functions[0].Body
@@ -274,7 +275,7 @@ func TestParse_nestedApplication(t *testing.T) {
 // An identifier with a primitive prefix must parse as one name, not as the
 // operator token max/min followed by a remainder.
 func TestParse_primitivePrefixedIdentifier(t *testing.T) {
-	plan, err := Parse("fn f maximum::real = maximum\n")
+	plan, err := Parse("fn f maximum::rat = maximum\n")
 	require.NoError(t, err)
 	fn := plan.Functions[0]
 	require.Len(t, fn.Params, 1)
@@ -292,11 +293,11 @@ func TestParse_reduceFnIsAtomNotApplication(t *testing.T) {
 	require.Equal(t, ExprReduce, body.Kind)
 	assert.Equal(t, ExprName, body.Fn.Kind) // not an ExprApp
 	assert.Equal(t, "+", body.Fn.Name)
-	assert.Equal(t, float64(0), body.Init.Num)
+	assert.Equal(t, big.NewRat(0, 1), body.Init.Num)
 }
 
 func TestParse_skipBlankAndUnknownLines(t *testing.T) {
-	plan, err := Parse("\n# a comment\ntype T = vector real\n\n")
+	plan, err := Parse("\n# a comment\ntype T = vector rat\n\n")
 	require.NoError(t, err)
 	assert.Len(t, plan.Types, 1)
 }
