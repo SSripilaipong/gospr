@@ -112,6 +112,32 @@ func TestVector_paramCountMismatch(t *testing.T) {
 	require.Error(t, v.Apply("Add", nil))
 }
 
+// A value outside a param's declared numeric type is rejected at apply time:
+// a negative increment on a real0+ counter, and a non-integer on an int slot.
+func TestVector_runtimeParamValidation(t *testing.T) {
+	nonNeg := func() Method {
+		sec := app(prim("+"), vr("k"))
+		return Method{
+			Params: []parser.ParamSpec{{Name: "k", Type: "real0+"}},
+			Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &sec},
+		}
+	}
+	v := NewVector("nodeA", zipMax(), nil, map[string]Method{"Add": nonNeg()}, nil)
+	require.NoError(t, v.Apply("Add", []any{5.0}))
+	require.Error(t, v.Apply("Add", []any{-1.0}), "negative value must be rejected for real0+")
+
+	intOnly := func() Method {
+		sec := app(prim("+"), vr("k"))
+		return Method{
+			Params: []parser.ParamSpec{{Name: "k", Type: "int"}},
+			Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &sec},
+		}
+	}
+	w := NewVector("nodeA", zipMax(), nil, map[string]Method{"Add": intOnly()}, nil)
+	require.NoError(t, w.Apply("Add", []any{3.0}))
+	require.Error(t, w.Apply("Add", []any{2.5}), "non-integer must be rejected for int")
+}
+
 // ---- evaluator unit tests ------------------------------------------
 
 func TestEval_application(t *testing.T) {

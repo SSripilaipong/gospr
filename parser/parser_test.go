@@ -195,6 +195,22 @@ func TestParse_strayBarIsError(t *testing.T) {
 	}
 }
 
+// All six numeric type names parse, both as a vector element and as a param type.
+// `real0+` must win over the `real` prefix (longest match).
+func TestParse_numericTypeNames(t *testing.T) {
+	for _, name := range []string{"real", "real0+", "real0-", "int", "int0+", "int0-"} {
+		plan, err := Parse("type T = vector " + name + "\n")
+		require.NoError(t, err, "elem %q", name)
+		require.Len(t, plan.Types, 1, "elem %q", name)
+		assert.Equal(t, name, plan.Types[0].Elem.Scalar, "elem %q", name)
+
+		plan, err = Parse("fn f k::" + name + " = k\n")
+		require.NoError(t, err, "param %q", name)
+		require.Len(t, plan.Functions, 1, "param %q", name)
+		assert.Equal(t, name, plan.Functions[0].Params[0].Type, "param %q", name)
+	}
+}
+
 func TestParse_collection(t *testing.T) {
 	plan, err := Parse("collection MyVec = T\n")
 	require.NoError(t, err)

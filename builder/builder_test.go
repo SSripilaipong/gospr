@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"gospr/numtype"
 	"gospr/parser"
 )
 
@@ -56,7 +57,7 @@ func gotherwise(result parser.Expr) parser.GuardCase {
 //	update T.Add k::real = local (+ k)
 func canonicalPlan() parser.Plan {
 	return parser.Plan{
-		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal}}},
+		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal, Scalar: "real"}}},
 		Functions: []parser.FnDef{
 			{Name: "lub", Params: []parser.ParamSpec{{Name: "a", Type: "real"}, {Name: "b", Type: "real"}},
 				Body: app(name("max"), name("a"), name("b"))},
@@ -153,7 +154,7 @@ func TestBuild_unknownIdentifier(t *testing.T) {
 
 func TestBuild_badParamType(t *testing.T) {
 	plan := canonicalPlan()
-	plan.Updates[0].Params = []parser.ParamSpec{{Name: "k", Type: "int"}}
+	plan.Updates[0].Params = []parser.ParamSpec{{Name: "k", Type: "bool"}}
 	_, err := Build(plan)
 	require.Error(t, err)
 }
@@ -376,4 +377,81 @@ collection C = T
 `
 	_, err := Build(mustParse(t, src))
 	require.Error(t, err)
+}
+
+// ---- numeric subtypes / per-operator typing ------------------------
+
+// Subtraction loses the non-negative sign, so `local (- k)` on a `vector real0+`
+// produces a `real` result that is not assignable back to the `real0+` slot.
+func TestBuild_subtractionOnNonNegRejected(t *testing.T) {
+	src := `type T = vector real0+
+merge T = zip max
+update T.Sub k::real0+ = local (- k)
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+}
+
+// Addition preserves the non-negative sign, so the same shape with `+` builds.
+func TestBuild_additionOnNonNegOK(t *testing.T) {
+	src := `type T = vector real0+
+merge T = zip max
+update T.Add k::real0+ = local (+ k)
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+}
+
+// `reduce + 0` infers the element's numeric type: real0+ over a real0+ vector,
+// int over an int vector (0 + int widens to int via the literal-0 Zero sign).
+func TestBuild_reduceInfersElementType(t *testing.T) {
+	cases := map[string]numtype.NumType{
+		"real0+": {Domain: numtype.DReal, Sign: numtype.SNonNeg},
+		"int":    {Domain: numtype.DInt, Sign: numtype.SAny},
+		"int0+":  {Domain: numtype.DInt, Sign: numtype.SNonNeg},
+	}
+	for elem, want := range cases {
+		t.Run(elem, func(t *testing.T) {
+			src := "type T = vector " + elem + "\nmerge T = zip max\nquery T.Value = reduce + 0\ncollection C = T\n"
+			built, err := Build(mustParse(t, src))
+			require.NoError(t, err)
+			q := built.Models["T"].Queries["Value"]
+			assert.Equal(t, parser.TypeReal, q.Result)
+			assert.Equal(t, want, q.ResultNum)
+		})
+	}
+}
+
+// The literal 0 has the internal Zero sign, so it is assignable to a
+// non-positive target: `local (+ 0)` builds on a `vector real0-`.
+func TestBuild_literalZeroAssignableToNonPos(t *testing.T) {
+	src := `type T = vector real0-
+merge T = zip min
+update T.Nop = local (+ 0)
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+}
+
+// int0+ is a subtype of real0+, so a fn expecting real0+ accepts an int0+ arg.
+func TestBuild_intSubtypeWhereRealExpected(t *testing.T) {
+	src := `fn f x::real0+ = + x 1
+fn g y::int0+ = f y
+`
+	_, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+}
+
+// Anchored recursion where the recursive call is an operand to `+` still builds:
+// the recursive call types as vUnknown mid-inference and defers the numeric check.
+func TestBuild_anchoredRecursionThroughOperator(t *testing.T) {
+	src := `fn f x::real
+| (> x 0) = + 1 (f (- x 1))
+| otherwise = 0
+`
+	_, err := Build(mustParse(t, src))
+	require.NoError(t, err)
 }

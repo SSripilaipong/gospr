@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"sync"
 
+	"gospr/numtype"
 	"gospr/parser"
 )
 
@@ -20,6 +21,9 @@ type Method struct {
 	Params []parser.ParamSpec
 	Body   parser.Expr
 	Result parser.ValType
+	// ResultNum is the numeric subtype of a query result (meaningful only when
+	// Result == TypeReal); it drives the Swagger min/max/integer constraints.
+	ResultNum numtype.NumType
 }
 
 // Function is a resolved user-defined function: its params plus a resolved
@@ -423,13 +427,23 @@ func cmp(f func(a, b float64) bool) func(a, b rtVal) (rtVal, error) {
 	}
 }
 
-// bindParams binds method params (real-only) to runtime values.
+// bindParams binds method params to runtime values, validating each value
+// against its declared numeric type (sign + integrality). An out-of-domain value
+// — e.g. a negative increment on a `real0+` counter — is rejected here, which the
+// gateway surfaces as a 4xx.
 func bindParams(specs []parser.ParamSpec, vals []any) (map[string]rtVal, error) {
 	m := make(map[string]rtVal, len(specs))
 	for i, p := range specs {
 		f, err := toFloat64(vals[i])
 		if err != nil {
 			return nil, fmt.Errorf("param %s: %w", p.Name, err)
+		}
+		nt, ok := numtype.Parse(p.Type)
+		if !ok {
+			return nil, fmt.Errorf("param %s: unknown type %q", p.Name, p.Type)
+		}
+		if !numtype.Allows(nt, f) {
+			return nil, fmt.Errorf("param %s: value %v is not a valid %s", p.Name, f, p.Type)
 		}
 		m[p.Name] = numVal(f)
 	}

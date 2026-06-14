@@ -35,17 +35,25 @@ go vet ./...
 A toy distributed CRDT engine driven by a small functional DSL. A type is a
 **vector** (distributed-systems vector clock: `nodeID -> value`). Merge, query,
 and update behaviors are written as Haskell-style functional expressions. MVP
-stores only `real` slots, but expressions are typed over three value types:
-`real`, `bool` (from comparison operators), and `string` (from string literals).
+Slots hold numbers typed by a small **numeric subtype lattice** (six types:
+`real, real0+, real0-, int, int0+, int0-` — domain {real,int} × sign {any,≥0,≤0};
+see the `numtype` package). Value types are `numeric` (carrying a `NumType`),
+`bool` (from comparisons), and `string` (from string literals). Built-in
+operators accept *any* numeric operand and each computes the *tightest sound*
+result type (`int + int0+ → int`, `real0+ - real0+ → real`); a `vector real0+`
+counter thus rejects `local (- k)` at build time and a negative `Add` at runtime.
 Users define functions (`fn add a::real b::real = + a b`, or multi-line **guarded**
 `fn grade x::real | (> x 90) = "A" | otherwise = "F"`) over a small applicative
 core (variables, literals, function references, application). `reduce`/`zip`/`local`
 remain combinator keywords carrying a function-valued term; `reduce` may also
 appear as a value sub-expression inside a **query** body (e.g. `myScore (reduce max 0)`),
-so a query can return a `bool`/`string`. Function params stay `real`-only; return
-types are **inferred**. Recursion is allowed only when a concrete branch anchors
-its return type (unanchored recursion is a build error). Query params and struct
-vectors (`vector { x real }`) are designed-for but not implemented.
+so a query can return a `bool`/`string`. Function params are **concrete** numeric
+types (numeric-generic params are out of scope); return types are **inferred**.
+Recursion is allowed only when a concrete branch anchors its return type
+(unanchored recursion is a build error). This makes non-negative increments
+*expressible and checkable* — it is **not** a full CRDT-correctness proof (merge
+monotonicity remains future work). Query params and struct vectors
+(`vector { x real }`) are designed-for but not implemented.
 
 ## Architecture
 
@@ -64,7 +72,7 @@ parser  →  builder  →  node / crdt
 | Layer | Owns |
 |---|---|
 | `parser` | Syntax: text → `Plan` (flat AST slices, incl. `FnDef`s). Bodies are an applicative `Expr` sum type (`NumLit`/`StrLit`/`Name`/`App` + `Guards` + `Reduce`/`Zip`/`Local` combinators). A guarded `fn` body is `ExprGuards{Cases}`; `otherwise` is a `GuardCase.Otherwise` marker, not an expression. Leaves are emitted as **unresolved** `Name`s — the parser knows no scope. |
-| `builder` | Semantics: folds flat `TypeDef`+`FnDef`+`MergeDef`+`QueryDef`+`UpdateDef` into validated `*Model`s + a global `Functions` table, **resolves** every `Name` → `Var`/`Ref`, and **type-checks** every term (a small `checker`: `typeOf` over `real`/`bool`/`string`, with memoized DFS return-type inference). Rejects duplicate/primitive-shadowing/zero-param fns, duplicate params, unknown identifiers, arity/type mismatches, guards without a final `otherwise` (or an `otherwise` not last), `reduce` outside a query, unanchored recursion, non-`real` params, query params, missing merge. `Model` implements `CollectionSpec.New`; queries carry an inferred `Result` `ValType`. |
+| `builder` | Semantics: folds flat `TypeDef`+`FnDef`+`MergeDef`+`QueryDef`+`UpdateDef` into validated `*Model`s + a global `Functions` table, **resolves** every `Name` → `Var`/`Ref`, and **type-checks** every term (a small `checker`: `typeOf` over numeric (carrying `numtype.NumType`)/`bool`/`string`, **assignability via `numtype.Sub`** instead of equality, per-operator result rules, combinator boundary checks `Sub(result, elemType)`, memoized DFS return-type inference). Rejects duplicate/primitive-shadowing/zero-param fns, duplicate params, unknown identifiers, arity/type mismatches, results not assignable to the element type, guards without a final `otherwise` (or an `otherwise` not last), `reduce` outside a query, unanchored recursion, unknown param types, query params, missing merge. `Model` implements `CollectionSpec.New`; queries carry an inferred `Result` `ValType` + `ResultNum` `NumType`. |
 | `crdt` | Runtime only — no string parsing, no `Plan` knowledge. `VectorCRDT` evaluates resolved `Expr` trees against `map[string]float64` via a small applicative interpreter (tagged `rtVal` = num/str/bool/func, `[]rtVal` calling convention, partial application, recursion-depth guard). `Query` evals the body to an `rtVal` (a `reduce` sub-node folds `v.state` under the lock) and converts via `rtToAny`; `Merge` is atomic (build-copy-then-swap). |
 | `node` | Lifecycle + message loop; calls `Spec.New` from `BuiltPlan.Collections`. |
 | `gateway` | HTTP; returns 400 on parse/build errors and zero-collection deploys before touching node state; regenerates Swagger on deploy. |
@@ -74,20 +82,24 @@ parser  →  builder  →  node / crdt
 ```
 main.go               wires 3 nodes + gateways, connects peer inboxes
 
+numtype/
+  numtype.go          leaf pkg (imports nothing): NumType{Domain,Sign}, the six names, Parse/String/Sub/Join/Allows. Zero value = top type `real`; internal `Zero` sign types the literal 0
+  numtype_test.go
+
 builder/
-  builder.go          Build(Plan) → BuiltPlan{Models, Functions, Collections}; Model + env.resolve (Name→Var/Ref) + arityOf; checker (vtype/sig, primitiveSig, typeOf/typeOfGuards, inferReturn, unify) + validators
-  builder_test.go     hard-coded-AST integration test + error/duplicate/fn/arity/type cases
+  builder.go          Build(Plan) → BuiltPlan{Models, Functions, Collections}; Model (+ElemNum) + env.resolve (Name→Var/Ref) + arityOf; checker (vtype{kind,num}/sig, primitiveArity + per-op rules addSign/mulSign/negate/max/min + numBin, applyArgs/resultOf, subVtype, typeOf/typeOfGuards/typeOfReduce fixpoint, inferReturn, unify via Join) + validators
+  builder_test.go     hard-coded-AST integration test + error/duplicate/fn/arity/type + numeric-subtype cases
 
 crdt/
   crdt.go             CRDT interface: Apply/Query/Merge/Snapshot
-  vector.go           Method (with Result ValType), Function, VectorCRDT, NewVector; tagged rtVal interpreter (eval/evalFn/apply), primOp/arith/cmp primitives, rtToAny, maxEvalDepth guard; toFloat64
+  vector.go           Method (with Result ValType + ResultNum), Function, VectorCRDT, NewVector; tagged rtVal interpreter (eval/evalFn/apply), primOp/arith/cmp primitives, rtToAny, maxEvalDepth guard; bindParams validates via numtype.Allows; toFloat64
   vector_test.go
 
 node/
   node.go             lifecycle + message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
 
 swagger/
-  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; type-switches on *builder.Model; `real`→number schema
+  swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; type-switches on *builder.Model; numSchema → integer/number + minimum/maximum from NumType
   swagger_test.go
 
 gateway/
@@ -96,12 +108,12 @@ gateway/
                       GET /api/swagger.json, GET /api/docs (Swagger UI)
 
 parser/
-  types.go            AST: ElemType, Expr sum type (ExprKind incl. StrLit/Guards), GuardCase, ValType, RefKind, TypeDef/FnDef/MergeDef/QueryDef/UpdateDef/CollectionSpec, Plan
+  types.go            AST: ElemType (Scalar = numeric type name), Expr sum type (ExprKind incl. StrLit/Guards), GuardCase, ValType, RefKind, TypeDef/FnDef/MergeDef/QueryDef/UpdateDef/CollectionSpec, Plan
   parser.go           public Parse entry point
   stream.go           value-typed Stream — backtracking is free
   result.go           ParseResult[A], Parser[A], Of2–Of5 tuples
   combinators.go      all combinators
-  dsl.go              DSL grammar (line parsers incl. guarded fnLineP/guardLineP + numberP/stringLitP/symOpP/paramP/reduceFormP + exprP/atomP/nameP/applicationP)
+  dsl.go              DSL grammar (line parsers incl. guarded fnLineP/guardLineP + numberP/stringLitP/symOpP/numTypeNameP/paramP/reduceFormP + exprP/atomP/nameP/applicationP)
   parser_test.go      canonical-snippet integration test + cases
 
 e2e/
@@ -112,32 +124,32 @@ e2e/
 ## DSL syntax
 
 ```
-type T = vector real            # only `vector real`; `vector { x real }` struct form is deferred (not parsed)
+type T = vector real0+          # scalar numeric: real|real0+|real0-|int|int0+|int0- ; `vector { x real }` struct form is deferred
 fn lub a::real b::real = max a b # user-defined fn; body is a full applicative expression
 fn grade x::real                 # guarded fn: multi-line, value-typed branches
-| (> x 90) = "A"                #   each cond is a bool; results share one type (real/bool/string)
+| (> x 90) = "A"                #   each cond is a bool; results share one type (numeric/bool/string)
 | otherwise = "F"               #   `otherwise` is mandatory and must be the last case (build-checked)
-merge T = zip lub               # zip: apply a real->real->real fn elementwise per node slot
-query T.Grade = grade (reduce max 0)  # query body is a general expr; reduce folds the slots to a real
-update T.Add k::real = local (+ k)    # local: apply a unary fn (real->real) to ONLY the calling node's slot
+merge T = zip lub               # zip: apply a numeric,numeric->numeric fn elementwise per node slot
+query T.Grade = grade (reduce max 0)  # query body is a general expr; reduce folds the slots to a numeric
+update T.Add k::real0+ = local (+ k)  # local: apply a unary fn to ONLY the calling node's slot
 collection MyVec = T            # named runtime instance of a type (no args)
 ```
 
 - **Expressions** are prefix application: `f a b`, `+ a (max b c)`. A bare `(op arg)` like `(+ k)` is a **partial application**, not a special "section" form. Application may under-saturate (partial) but never over-saturate (build error).
   - Partial application binds the **leftmost** argument first, so `(- k)` is `\x -> - k x` = `k - x` (the combinator supplies the slot `x` as the *next* arg). This is the one uniform rule — there is no right-section. For non-commutative ops where you want the slot as the left operand (`x - k`), define a helper with that param order: `fn rsub k::real x::real = - x k` then `local (rsub k)`. (`+ * max min` are commutative, so unaffected.)
-- **`fn`**: top-level, global, at least one `real` param (zero-arg fns rejected); body must be saturated. Return type (`real`/`bool`/`string`) is **inferred**. May reference other fns / itself — recursion is allowed only when a concrete branch anchors the return type (unanchored recursion is a build error); runtime is bounded by `maxEvalDepth`.
-- **Guarded `fn`**: `| cond = result` lines, `cond` a `bool`, all `result`s the same type. The final case must be `otherwise` (enforced at build time, so matches are total). A guarded body is `ExprGuards`; `reduce` is not allowed inside any `fn` (functions stay pure).
-- **Value types**: `real`, `bool`, `string`. String literals are `"..."` (with `\" \\ \n \t` escapes). Comparisons `> < >= <= == /=` are `real,real->bool`; arithmetic `+ * - max min` are `real,real->real`. The builder rejects type mismatches (e.g. `+ (> x 1) 2`).
-- **Combinator slots** (`zip`/`reduce`/`local`) take a single **atom** (a name or a parenthesised term), not a bare application — this keeps `reduce + 0` unambiguous (`+` is the fn, `0` the init). Their function's arity/type is checked: zip → real,real->real; local → real->real. `reduce` is also a value atom inside a **query** body (`f (reduce max 0)`); a query returns its body's inferred type (real/bool/string).
+- **`fn`**: top-level, global, at least one numeric param (zero-arg fns rejected); body must be saturated. Return type (numeric/`bool`/`string`) is **inferred**. May reference other fns / itself — recursion is allowed only when a concrete branch anchors the return type (unanchored recursion is a build error); runtime is bounded by `maxEvalDepth`.
+- **Guarded `fn`**: `| cond = result` lines, `cond` a `bool`, all `result`s the same type (numeric branches join to a common numeric supertype). The final case must be `otherwise` (enforced at build time, so matches are total). A guarded body is `ExprGuards`; `reduce` is not allowed inside any `fn` (functions stay pure).
+- **Numeric types & operators**: six types `real, real0+, real0-, int, int0+, int0-` (domain {real,int} × sign {any,≥0,≤0}); see `numtype`. Operators take **any** numeric operand; each computes the tightest sound result (`+`/`-` via `addSign`, `*` via `mulSign`, `max`/`min` by bound analysis — so `real0+ - real0+ → real`). **Assignability** (`numtype.Sub`, not equality) governs args & the combinator boundary, so `int0+` flows where `real0+` is wanted. The literal `0` has an internal `Zero` sign, assignable to any numeric type. Comparisons `> < >= <= == /=` are numeric,numeric->`bool`. Strings are `"..."` (`\" \\ \n \t` escapes). The builder rejects type mismatches (`+ (> x 1) 2`) and results not assignable to the element type.
+- **Combinator slots** (`zip`/`reduce`/`local`) take a single **atom** (a name or a parenthesised term), not a bare application — this keeps `reduce + 0` unambiguous (`+` is the fn, `0` the init). The fn is applied to element-typed args and its result must be `Sub` the element type: zip → (E,E)->Sub E; local → (E)->Sub E. `reduce` is also a value atom inside a **query** body (`f (reduce max 0)`); its result type is the lattice **fixpoint** of folding the fn over (acc, E) from the init's type.
 - Primitives: `+ * -` and comparisons are operator tokens; `max`/`min` are ordinary identifiers (so `maxValue` is one name) recognised as primitives by the builder. A `fn` may not shadow a primitive.
-- Params: `name::type`, only `type == real`, names unique. Update params work; query params parse but are rejected at build (future feature).
+- Params: `name::type` where `type` is one of the six numeric names, names unique. Values are validated at runtime against the param's type (`numtype.Allows`). Update params work; query params parse but are rejected at build (future feature).
 - A collection name = the node's collection key; a `type` defines reusable behavior, instantiated by `collection`.
 
 ## Extension points
 
-- **New operator:** add its signature to `primitiveSig` in `builder/builder.go` (params + result `vtype`), add a case in `primOp` in `crdt/vector.go` (`arith` → real result, `cmp` → bool), and (for a punctuation operator) a `Try(StringP(...))` alternative in `symOpP` (`parser/dsl.go`, multi-char before single-char); word-shaped operators need no parser change (they parse as identifiers).
-- **New param type:** relax the `real`-only check in `builder.validateParams`, handle it in `crdt.bindParams`/`toFloat64`, add cases in `swagger.paramToSchema`/`paramExample`.
-- **New value type:** add a `parser.ValType` + builder `vtype`, handle it in `checker.typeOf`, add an `rtKind` + constructor in `crdt/vector.go` and a `rtToAny`/`valTypeSchema` case.
+- **New operator:** add its arity to `primitiveArity` in `builder/builder.go` and a result rule (a `numBin` case for arithmetic, or `cmpOps` membership for a bool result), add a case in `primOp` in `crdt/vector.go` (`arith` / `cmp`), and (for a punctuation operator) a `Try(StringP(...))` alternative in `symOpP` (`parser/dsl.go`, multi-char before single-char); word-shaped operators need no parser change (they parse as identifiers).
+- **New numeric type:** add the name + `NumType` to `numtype.Parse`/`String` and adjust `Sub`/`Join`/`Allows`; add it to `numTypeNameP` in `parser/dsl.go` (longest-match order). The builder/crdt/swagger consume `numtype` generically, so usually need no change.
+- **New value type** (non-numeric): add a `parser.ValType` + builder `vkind`, handle it in `checker.typeOf`/`subVtype`/`unify`, add an `rtKind` + constructor in `crdt/vector.go` and a `rtToAny`/`valTypeSchema` case.
 - **New expression form** (e.g. query params, struct vectors): add/realize an `ExprKind`/`ElemKind` in `parser/types.go`, parse it in `dsl.go`, resolve it in `builder.env.resolve` and type-check it in `checker.typeOf`, evaluate it in `crdt/vector.go` (`eval`).
 - **Network propagation of `deployMsg`:** `BuiltPlan` is data-only; gob/JSON-encode `Model` (it holds `parser.Expr` trees, no closures).
 

@@ -111,11 +111,23 @@ func symOpP() Parser[string] {
 			Or(lit(">"), lit("<")))))))))
 }
 
-// paramP parses `name::type`, e.g. `k::real`.
+// numTypeNameP parses one of the six numeric type names. Longer names are tried
+// before their prefixes (`real0+` before `real`, `int0+` before `int`) so the
+// longest match wins; each alternative is Try-wrapped to backtrack cleanly. The
+// names contain `+`/`-`/`0`, which IdentP does not accept, so this dedicated
+// parser is required for type positions.
+func numTypeNameP() Parser[string] {
+	lit := func(str string) Parser[string] { return Try(StringP(str)) }
+	return Or(lit("real0+"), Or(lit("real0-"), Or(lit("real"),
+		Or(lit("int0+"), Or(lit("int0-"), lit("int"))))))
+}
+
+// paramP parses `name::type`, e.g. `k::real0+`. The type is one of the six
+// numeric type names; an unknown name is a parse error.
 func paramP() Parser[ParamSpec] {
 	dcolon := Sequence2(RuneP(':'), RuneP(':'))
 	return Map(
-		Sequence3(IdentP(), dcolon, IdentP()),
+		Sequence3(IdentP(), dcolon, numTypeNameP()),
 		func(t Of3[string, Of2[rune, rune], string]) ParamSpec {
 			return ParamSpec{Name: t.V1, Type: t.V3}
 		},
@@ -204,11 +216,12 @@ func exprP() Parser[Expr] {
 	}
 }
 
-// elemTypeP parses the vector element type. Only `vector real` for now.
+// elemTypeP parses the vector element type, e.g. `vector real0+`. The element is
+// a scalar numeric type (one of the six names); the struct form is deferred.
 func elemTypeP() Parser[ElemType] {
 	return Map(
-		Sequence3(StringP("vector"), Spaces1P(), StringP("real")),
-		func(_ Of3[string, struct{}, string]) ElemType { return ElemType{Kind: KindReal} },
+		Sequence3(StringP("vector"), Spaces1P(), numTypeNameP()),
+		func(t Of3[string, struct{}, string]) ElemType { return ElemType{Kind: KindReal, Scalar: t.V3} },
 	)
 }
 

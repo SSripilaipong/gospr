@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"gospr/builder"
+	"gospr/numtype"
 	"gospr/parser"
 	"strings"
 )
@@ -55,6 +56,7 @@ type schema struct {
 	Properties    map[string]schema `json:"properties,omitempty"`
 	Items         *schema           `json:"items,omitempty"`
 	MinimumNumber *float64          `json:"minimum,omitempty"`
+	MaximumNumber *float64          `json:"maximum,omitempty"`
 }
 
 type response struct {
@@ -72,7 +74,7 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 					Content: map[string]mediaType{
 						"text/plain": {
 							Schema:  schema{Type: "string"},
-							Example: "type T = vector real\nmerge T = zip max\nquery T.Value = reduce + 0\nupdate T.Add k::real = local (+ k)\ncollection MyVec = T",
+							Example: "type T = vector real0+\nmerge T = zip max\nquery T.Value = reduce + 0\nupdate T.Add k::real0+ = local (+ k)\ncollection MyVec = T",
 						},
 					},
 				},
@@ -87,7 +89,7 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	for _, bc := range plan.Collections {
 		if m, ok := bc.Spec.(*builder.Model); ok {
 			for queryName, qs := range m.Queries {
-				addGetPath(paths, bc.Name, queryName, qs.Params, qs.Result)
+				addGetPath(paths, bc.Name, queryName, qs.Params, qs.Result, qs.ResultNum)
 			}
 			for actionName, us := range m.Updates {
 				addPostPath(paths, bc.Name, actionName, us.Params)
@@ -103,14 +105,14 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	return json.MarshalIndent(spec, "", "  ")
 }
 
-func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType) {
+func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType, resultNum numtype.NumType) {
 	key := "/api/collections/" + collection + "/" + queryName
 	op := &operation{
 		Summary: queryName + " on " + collection,
 		Responses: map[string]response{
 			"200": {
 				Description: "Query result",
-				Content:     map[string]mediaType{"application/json": {Schema: valTypeSchema(result)}},
+				Content:     map[string]mediaType{"application/json": {Schema: valTypeSchema(result, resultNum)}},
 			},
 			"400": {Description: "Error"},
 		},
@@ -179,32 +181,56 @@ func addPostPath(paths map[string]pathItem, collection, actionName string, param
 	}
 }
 
-// valTypeSchema maps a query's result value type to an OpenAPI schema.
-func valTypeSchema(t parser.ValType) schema {
+// valTypeSchema maps a query's result value type to an OpenAPI schema. For a
+// numeric result the carried NumType drives the integer/number type and any
+// min/max bound.
+func valTypeSchema(t parser.ValType, nt numtype.NumType) schema {
 	switch t {
 	case parser.TypeBool:
 		return schema{Type: "boolean"}
 	case parser.TypeString:
 		return schema{Type: "string"}
 	default:
-		return schema{Type: "number"}
+		return numSchema(nt)
 	}
+}
+
+// numSchema renders a numeric type as a JSON schema: integer vs number by
+// domain, and a minimum/maximum of 0 for the non-negative/non-positive signs.
+func numSchema(nt numtype.NumType) schema {
+	s := schema{Type: "number"}
+	if nt.Domain == numtype.DInt {
+		s.Type = "integer"
+	}
+	zero := 0.0
+	switch nt.Sign {
+	case numtype.SNonNeg:
+		s.MinimumNumber = &zero
+	case numtype.SNonPos:
+		s.MaximumNumber = &zero
+	}
+	return s
 }
 
 func paramToSchema(p parser.ParamSpec) schema {
-	switch p.Type {
-	case "real":
-		return schema{Type: "number"}
-	default:
+	nt, ok := numtype.Parse(p.Type)
+	if !ok {
 		return schema{}
 	}
+	return numSchema(nt)
 }
 
 func paramExample(p parser.ParamSpec) any {
-	switch p.Type {
-	case "real":
-		return 1.0
-	default:
+	nt, ok := numtype.Parse(p.Type)
+	if !ok {
 		return nil
 	}
+	v := 1.0
+	if nt.Sign == numtype.SNonPos {
+		v = -1.0
+	}
+	if nt.Domain == numtype.DInt {
+		return int(v)
+	}
+	return v
 }

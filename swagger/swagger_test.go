@@ -24,7 +24,7 @@ func makeModelPlan() builder.BuiltPlan {
 
 	model := &builder.Model{
 		Name:  "MyVec",
-		Elem:  parser.ElemType{Kind: parser.KindReal},
+		Elem:  parser.ElemType{Kind: parser.KindReal, Scalar: "real"},
 		Merge: parser.Expr{Kind: parser.ExprZip, Fn: &max},
 		Queries: map[string]crdt.Method{
 			"Value": {Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plus, Init: &zero}},

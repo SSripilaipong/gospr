@@ -10,15 +10,15 @@ import (
 	"gospr/parser"
 )
 
-const src = `type T = vector real
+const src = `type T = vector real0+
 
-fn lub a::real b::real = max a b
+fn lub a::real0+ b::real0+ = max a b
 
 merge T = zip lub
 
 query T.Value = reduce + 0
 
-update T.Add k::real = local (+ k)
+update T.Add k::real0+ = local (+ k)
 `
 
 // End-to-end: code string -> parse -> build -> model instance -> behaviors.
@@ -78,7 +78,7 @@ func TestE2E_vectorModel(t *testing.T) {
 // maps the reduced vector to a grade. Exercises guards, comparisons, string
 // results, otherwise, and reduce-in-a-query-expression together.
 func TestE2E_guardedGradeQuery(t *testing.T) {
-	src := `type Scores = vector real
+	src := `type Scores = vector real0+
 fn myScore x::real
 | (> x 90) = "You got a A"
 | (> x 80) = "You got a B"
@@ -86,7 +86,7 @@ fn myScore x::real
 | otherwise = "You got a F"
 merge Scores = zip max
 query Scores.Grade = myScore (reduce max 0)
-update Scores.Add k::real = local (+ k)
+update Scores.Add k::real0+ = local (+ k)
 collection Scores = Scores
 `
 	plan, err := parser.Parse(src)

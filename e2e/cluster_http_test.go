@@ -20,10 +20,10 @@ import (
 // slot (`local (+ k)`), slots merge per-node-id by max (`zip max`), and the
 // query sums every slot (`reduce + 0`). A `collection` line is required so the
 // cluster has something to instantiate and so HTTP can address it by name.
-const counterDSL = `type T = vector real
+const counterDSL = `type T = vector real0+
 merge T = zip max
 query T.Value = reduce + 0
-update T.Add k::real = local (+ k)
+update T.Add k::real0+ = local (+ k)
 collection Counter = T
 `
 

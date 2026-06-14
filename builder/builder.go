@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"gospr/crdt"
+	"gospr/numtype"
 	"gospr/parser"
 )
 
@@ -18,6 +19,7 @@ type CollectionSpec interface {
 type Model struct {
 	Name    string
 	Elem    parser.ElemType
+	ElemNum numtype.NumType        // the element's numeric type (parsed from Elem.Scalar)
 	Merge   parser.Expr            // a Zip expr (Fn resolved)
 	Queries map[string]crdt.Method // Reduce methods (bodies resolved)
 	Updates map[string]crdt.Method // Local methods (bodies resolved)
@@ -42,25 +44,44 @@ type BuiltPlan struct {
 	Collections []BuiltCollection
 }
 
-// vtype is the builder's internal value type. vUnknown is a sentinel used only
-// during return-type inference for an as-yet-undetermined (recursive) function;
-// it unifies with any concrete type and must not survive to a built artifact.
-type vtype int
+// vkind tags the builder's internal value type. vkUnknown is a sentinel used
+// only during return-type inference for an as-yet-undetermined (recursive)
+// function; it unifies with any concrete type and must not survive to a built
+// artifact.
+type vkind int
 
 const (
-	vUnknown vtype = iota
-	vReal
-	vBool
-	vString
+	vkUnknown vkind = iota
+	vkNum
+	vkBool
+	vkString
 )
 
+// vtype is the builder's internal value type. For vkNum the carried NumType says
+// which numeric subtype; for the others NumType is unused.
+type vtype struct {
+	kind vkind
+	num  numtype.NumType
+}
+
+var (
+	vUnknown = vtype{kind: vkUnknown}
+	vBool    = vtype{kind: vkBool}
+	vString  = vtype{kind: vkString}
+	// numTop is the widest numeric type (`real`); a primitive accepts any
+	// numeric operand, expressed as "operand must be <: numTop".
+	numTop = vNum(numtype.NumType{Domain: numtype.DReal, Sign: numtype.SAny})
+)
+
+func vNum(nt numtype.NumType) vtype { return vtype{kind: vkNum, num: nt} }
+
 func (t vtype) String() string {
-	switch t {
-	case vReal:
-		return "real"
-	case vBool:
+	switch t.kind {
+	case vkNum:
+		return t.num.String()
+	case vkBool:
 		return "bool"
-	case vString:
+	case vkString:
 		return "string"
 	default:
 		return "unknown"
@@ -68,37 +89,153 @@ func (t vtype) String() string {
 }
 
 func toValType(t vtype) parser.ValType {
-	switch t {
-	case vBool:
+	switch t.kind {
+	case vkBool:
 		return parser.TypeBool
-	case vString:
+	case vkString:
 		return parser.TypeString
 	default:
 		return parser.TypeReal
 	}
 }
 
+// toResultNum returns the numeric type of a value result (meaningful only when
+// toValType(t) == TypeReal); for non-numeric results it returns the top type.
+func toResultNum(t vtype) numtype.NumType {
+	if t.kind == vkNum {
+		return t.num
+	}
+	return numtype.NumType{}
+}
+
+// subVtype reports whether a is assignable where b is wanted. vkUnknown (a
+// recursive call mid-inference) defers — it is treated as assignable to/from
+// anything, so anchored recursion keeps type-checking.
+func subVtype(a, b vtype) bool {
+	if a.kind == vkUnknown || b.kind == vkUnknown {
+		return true
+	}
+	if a.kind == vkNum && b.kind == vkNum {
+		return numtype.Sub(a.num, b.num)
+	}
+	return a.kind == b.kind
+}
+
 // sig is a (possibly partially applied) function signature: the param types it
-// still expects, plus the type it yields once saturated. A value has no params.
+// still expects plus the type it yields once saturated. For a primitive the
+// result depends on its operands, so op names the operator and bound records the
+// operand types already supplied; result is then computed when saturated. For a
+// user function / value, op == "" and result is fixed.
 type sig struct {
 	params []vtype
 	result vtype
+	op     string  // primitive operator driving the result rule; "" otherwise
+	bound  []vtype // operand types already supplied (for partial primitive apps)
 }
 
-// primitiveSig is the table of built-in operators. Arithmetic is real,real->real;
-// the comparisons are real,real->bool. Arity is len(params).
-var primitiveSig = map[string]sig{
-	"+":   {[]vtype{vReal, vReal}, vReal},
-	"*":   {[]vtype{vReal, vReal}, vReal},
-	"-":   {[]vtype{vReal, vReal}, vReal},
-	"max": {[]vtype{vReal, vReal}, vReal},
-	"min": {[]vtype{vReal, vReal}, vReal},
-	">":   {[]vtype{vReal, vReal}, vBool},
-	"<":   {[]vtype{vReal, vReal}, vBool},
-	">=":  {[]vtype{vReal, vReal}, vBool},
-	"<=":  {[]vtype{vReal, vReal}, vBool},
-	"==":  {[]vtype{vReal, vReal}, vBool},
-	"/=":  {[]vtype{vReal, vReal}, vBool},
+// primitiveArity is the table of built-in operators and their arities. All
+// current primitives are binary. Result types come from the per-operator rules
+// (resultOf), not from this table.
+var primitiveArity = map[string]int{
+	"+": 2, "*": 2, "-": 2, "max": 2, "min": 2,
+	">": 2, "<": 2, ">=": 2, "<=": 2, "==": 2, "/=": 2,
+}
+
+// cmpOps are the comparison primitives: any-numeric operands, bool result.
+var cmpOps = map[string]bool{">": true, "<": true, ">=": true, "<=": true, "==": true, "/=": true}
+
+// ---- per-operator result rules -------------------------------------
+
+// negateSign flips a sign (used by subtraction: a - b == a + (-b)).
+func negateSign(s numtype.Sign) numtype.Sign {
+	switch s {
+	case numtype.SNonNeg:
+		return numtype.SNonPos
+	case numtype.SNonPos:
+		return numtype.SNonNeg
+	default: // Zero, Any
+		return s
+	}
+}
+
+func addSign(a, b numtype.Sign) numtype.Sign {
+	switch {
+	case a == numtype.SZero:
+		return b
+	case b == numtype.SZero:
+		return a
+	case a == numtype.SNonNeg && b == numtype.SNonNeg:
+		return numtype.SNonNeg
+	case a == numtype.SNonPos && b == numtype.SNonPos:
+		return numtype.SNonPos
+	default:
+		return numtype.SAny
+	}
+}
+
+func mulSign(a, b numtype.Sign) numtype.Sign {
+	switch {
+	case a == numtype.SZero || b == numtype.SZero:
+		return numtype.SZero
+	case a == b: // NonNeg*NonNeg or NonPos*NonPos
+		return numtype.SNonNeg
+	case a == numtype.SAny || b == numtype.SAny:
+		return numtype.SAny
+	default: // opposite definite signs
+		return numtype.SNonPos
+	}
+}
+
+func maxSign(a, b numtype.Sign) numtype.Sign {
+	switch {
+	case a == numtype.SZero && b == numtype.SZero:
+		return numtype.SZero
+	case a == numtype.SNonNeg || b == numtype.SNonNeg || a == numtype.SZero || b == numtype.SZero:
+		// max with a >=0 operand (or 0) is itself >= 0.
+		return numtype.SNonNeg
+	case a == numtype.SNonPos && b == numtype.SNonPos:
+		return numtype.SNonPos
+	default:
+		return numtype.SAny
+	}
+}
+
+func minSign(a, b numtype.Sign) numtype.Sign {
+	switch {
+	case a == numtype.SZero && b == numtype.SZero:
+		return numtype.SZero
+	case a == numtype.SNonPos || b == numtype.SNonPos || a == numtype.SZero || b == numtype.SZero:
+		// min with a <=0 operand (or 0) is itself <= 0.
+		return numtype.SNonPos
+	case a == numtype.SNonNeg && b == numtype.SNonNeg:
+		return numtype.SNonNeg
+	default:
+		return numtype.SAny
+	}
+}
+
+// numBin computes the result numeric type of a binary arithmetic operator over
+// two numeric operands. Domain widens to Real if either operand is Real; the
+// sign follows the operator's sound rule.
+func numBin(op string, a, b numtype.NumType) numtype.NumType {
+	d := numtype.DInt
+	if a.Domain == numtype.DReal || b.Domain == numtype.DReal {
+		d = numtype.DReal
+	}
+	var s numtype.Sign
+	switch op {
+	case "+":
+		s = addSign(a.Sign, b.Sign)
+	case "-":
+		s = addSign(a.Sign, negateSign(b.Sign))
+	case "*":
+		s = mulSign(a.Sign, b.Sign)
+	case "max":
+		s = maxSign(a.Sign, b.Sign)
+	case "min":
+		s = minSign(a.Sign, b.Sign)
+	}
+	return numtype.NumType{Domain: d, Sign: s}
 }
 
 func Build(plan parser.Plan) (BuiltPlan, error) {
@@ -108,11 +245,16 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 			return BuiltPlan{}, fmt.Errorf("type %s declared twice", td.Name)
 		}
 		if td.Elem.Kind != parser.KindReal {
-			return BuiltPlan{}, fmt.Errorf("type %s: only `vector real` is supported", td.Name)
+			return BuiltPlan{}, fmt.Errorf("type %s: only a scalar `vector <numeric>` is supported", td.Name)
+		}
+		elemNum, ok := numtype.Parse(td.Elem.Scalar)
+		if !ok {
+			return BuiltPlan{}, fmt.Errorf("type %s: unknown element type %q", td.Name, td.Elem.Scalar)
 		}
 		models[td.Name] = &Model{
 			Name:    td.Name,
 			Elem:    td.Elem,
+			ElemNum: elemNum,
 			Queries: map[string]crdt.Method{},
 			Updates: map[string]crdt.Method{},
 		}
@@ -125,7 +267,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if _, dup := fnArity[fd.Name]; dup {
 			return BuiltPlan{}, fmt.Errorf("function %s declared twice", fd.Name)
 		}
-		if _, clash := primitiveSig[fd.Name]; clash {
+		if _, clash := primitiveArity[fd.Name]; clash {
 			return BuiltPlan{}, fmt.Errorf("function %s shadows a built-in primitive", fd.Name)
 		}
 		if len(fd.Params) == 0 {
@@ -178,7 +320,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("merge %s: %w", md.TypeName, err)
 		}
-		if err := chk.checkCombinatorFn(merge, nil); err != nil {
+		if err := chk.checkCombinatorFn(merge, nil, m.ElemNum); err != nil {
 			return BuiltPlan{}, fmt.Errorf("merge %s: %w", md.TypeName, err)
 		}
 		m.Merge = merge
@@ -203,11 +345,11 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		result, err := chk.checkValue(body)
+		result, err := chk.checkValue(body, m.ElemNum)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		m.Queries[qd.MethodName] = crdt.Method{Params: qd.Params, Body: body, Result: toValType(result)}
+		m.Queries[qd.MethodName] = crdt.Method{Params: qd.Params, Body: body, Result: toValType(result), ResultNum: toResultNum(result)}
 	}
 
 	for _, ud := range plan.Updates {
@@ -225,7 +367,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
-		if err := chk.checkCombinatorFn(body, realScope(ud.Params)); err != nil {
+		if err := chk.checkCombinatorFn(body, paramScope(ud.Params), m.ElemNum); err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
 		m.Updates[ud.MethodName] = crdt.Method{Params: ud.Params, Body: body, Result: parser.TypeReal}
@@ -283,8 +425,8 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		if scope[expr.Name] {
 			return parser.Expr{Kind: parser.ExprVar, Name: expr.Name}, nil
 		}
-		if s, ok := primitiveSig[expr.Name]; ok {
-			return parser.Expr{Kind: parser.ExprRef, Name: expr.Name, Arity: len(s.params), Ref: parser.RefPrimitive}, nil
+		if a, ok := primitiveArity[expr.Name]; ok {
+			return parser.Expr{Kind: parser.ExprRef, Name: expr.Name, Arity: a, Ref: parser.RefPrimitive}, nil
 		}
 		if a, ok := e.fnArity[expr.Name]; ok {
 			return parser.Expr{Kind: parser.ExprRef, Name: expr.Name, Arity: a, Ref: parser.RefFunction}, nil
@@ -433,6 +575,12 @@ type checker struct {
 	fnBody     map[string]parser.Expr
 	result     map[string]vtype
 	inProgress map[string]bool
+
+	// elem/hasElem give the current query's vector element type to the reduce
+	// case of typeOf. They are set only for the duration of a checkValue call;
+	// reduce is forbidden outside queries (so this is unset everywhere else).
+	elem    numtype.NumType
+	hasElem bool
 }
 
 func newChecker(_ env) *checker {
@@ -445,13 +593,15 @@ func newChecker(_ env) *checker {
 	}
 }
 
-// register records a resolved function body and its (real-only) param scope.
+// register records a resolved function body and its param scope. Each param is
+// bound to its declared numeric type.
 func (c *checker) register(name string, params []parser.ParamSpec, body parser.Expr) {
 	pts := make([]vtype, len(params))
 	scope := make(map[string]vtype, len(params))
 	for i, p := range params {
-		pts[i] = vReal
-		scope[p.Name] = vReal
+		nt, _ := numtype.Parse(p.Type) // validated by validateParams
+		pts[i] = vNum(nt)
+		scope[p.Name] = vNum(nt)
 	}
 	c.fnParams[name] = pts
 	c.fnScope[name] = scope
@@ -476,7 +626,7 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 	if len(s.params) != 0 {
 		return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(s.params))
 	}
-	if s.result == vUnknown {
+	if s.result.kind == vkUnknown {
 		return vUnknown, fmt.Errorf("cannot infer return type (unanchored recursion)")
 	}
 	c.result[name] = s.result
@@ -484,8 +634,11 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 }
 
 // checkValue type-checks a term that must yield a value (not a function) and
-// returns its type. Used for query bodies.
-func (c *checker) checkValue(e parser.Expr) (vtype, error) {
+// returns its type. Used for query bodies; elem is the vector element type, made
+// available to any `reduce` sub-expression in the body.
+func (c *checker) checkValue(e parser.Expr, elem numtype.NumType) (vtype, error) {
+	c.elem, c.hasElem = elem, true
+	defer func() { c.hasElem = false }()
 	s, err := c.typeOf(e, nil)
 	if err != nil {
 		return vUnknown, err
@@ -493,16 +646,19 @@ func (c *checker) checkValue(e parser.Expr) (vtype, error) {
 	if len(s.params) != 0 {
 		return vUnknown, fmt.Errorf("expected a value, got a function missing %d argument(s)", len(s.params))
 	}
-	if s.result == vUnknown {
+	if s.result.kind == vkUnknown {
 		return vUnknown, fmt.Errorf("cannot determine result type")
 	}
 	return s.result, nil
 }
 
 // checkCombinatorFn type-checks the function carried by a resolved zip/local
-// node: it must operate on reals and return a real. scope carries the method's
-// params (a local update fn may reference them, e.g. `local (+ k)`).
-func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype) error {
+// node against the element type E: applying the function to E-typed slot(s) must
+// yield a result assignable to E (Sub(result, E)). This is where non-negativity
+// is enforced — e.g. `local (- k)` on a `vector real0+` loses the sign and is
+// rejected. scope carries the method's params (a local update fn may reference
+// them, e.g. `local (+ k)`).
+func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, elem numtype.NumType) error {
 	if comb.Fn == nil {
 		return fmt.Errorf("combinator has no function")
 	}
@@ -510,13 +666,22 @@ func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype) er
 	if err != nil {
 		return err
 	}
-	for _, p := range s.params {
-		if p != vReal {
-			return fmt.Errorf("combinator function must operate on reals")
-		}
+	if len(s.params) == 0 {
+		return fmt.Errorf("combinator function takes no arguments")
 	}
-	if s.result != vReal && s.result != vUnknown {
-		return fmt.Errorf("combinator function must return real, returns %s", s.result)
+	args := make([]vtype, len(s.params))
+	for i := range args {
+		args[i] = vNum(elem)
+	}
+	sat, err := c.applyArgs(s, args)
+	if err != nil {
+		return err
+	}
+	if sat.result.kind == vkUnknown {
+		return nil // unanchored recursion: result type can't be verified, allowed
+	}
+	if !subVtype(sat.result, vNum(elem)) {
+		return fmt.Errorf("combinator result %s is not assignable to element type %s", sat.result, elem)
 	}
 	return nil
 }
@@ -525,22 +690,26 @@ func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype) er
 func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 	switch e.Kind {
 	case parser.ExprNumLit:
-		return sig{nil, vReal}, nil
+		return sig{result: literalType(e.Num)}, nil
 	case parser.ExprStrLit:
-		return sig{nil, vString}, nil
+		return sig{result: vString}, nil
 	case parser.ExprVar:
 		t, ok := scope[e.Name]
 		if !ok {
 			return sig{}, fmt.Errorf("unbound variable %q", e.Name)
 		}
-		return sig{nil, t}, nil
+		return sig{result: t}, nil
 	case parser.ExprRef:
 		if e.Ref == parser.RefPrimitive {
-			ps, ok := primitiveSig[e.Name]
+			ar, ok := primitiveArity[e.Name]
 			if !ok {
 				return sig{}, fmt.Errorf("unknown primitive %q", e.Name)
 			}
-			return sig{append([]vtype(nil), ps.params...), ps.result}, nil
+			params := make([]vtype, ar)
+			for i := range params {
+				params[i] = numTop // any numeric operand
+			}
+			return sig{params: params, op: e.Name}, nil
 		}
 		params, ok := c.fnParams[e.Name]
 		if !ok {
@@ -550,7 +719,7 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 		if err != nil {
 			return sig{}, err
 		}
-		return sig{append([]vtype(nil), params...), res}, nil
+		return sig{params: append([]vtype(nil), params...), result: res}, nil
 	case parser.ExprApp:
 		if e.Head == nil {
 			return sig{}, fmt.Errorf("application has no head")
@@ -559,9 +728,7 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 		if err != nil {
 			return sig{}, err
 		}
-		if len(e.Args) > len(hs.params) {
-			return sig{}, fmt.Errorf("too many arguments: expected %d, got %d", len(hs.params), len(e.Args))
-		}
+		args := make([]vtype, len(e.Args))
 		for i, a := range e.Args {
 			as, err := c.typeOf(*a, scope)
 			if err != nil {
@@ -570,28 +737,120 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 			if len(as.params) != 0 {
 				return sig{}, fmt.Errorf("cannot pass a function as an argument")
 			}
-			if want := hs.params[i]; as.result != vUnknown && as.result != want {
-				return sig{}, fmt.Errorf("argument %d: expected %s, got %s", i+1, want, as.result)
-			}
+			args[i] = as.result
 		}
-		return sig{hs.params[len(e.Args):], hs.result}, nil
+		return c.applyArgs(hs, args)
 	case parser.ExprGuards:
 		return c.typeOfGuards(e, scope)
 	case parser.ExprReduce:
-		if e.Fn == nil {
-			return sig{}, fmt.Errorf("reduce has no function")
-		}
-		fs, err := c.typeOf(*e.Fn, scope)
-		if err != nil {
-			return sig{}, err
-		}
-		if len(fs.params) != 2 || fs.params[0] != vReal || fs.params[1] != vReal || (fs.result != vReal && fs.result != vUnknown) {
-			return sig{}, fmt.Errorf("reduce needs a real,real->real function")
-		}
-		return sig{nil, vReal}, nil
+		return c.typeOfReduce(e, scope)
 	default:
 		return sig{}, fmt.Errorf("cannot type-check expression of kind %d", e.Kind)
 	}
+}
+
+// literalType types a numeric literal. All literals are non-negative; the
+// literal 0 gets the internal Zero sign so it is assignable to any numeric type
+// (non-negative AND non-positive targets). Integer-valued literals are int;
+// others are real.
+func literalType(n float64) vtype {
+	switch {
+	case n == 0:
+		return vNum(numtype.NumType{Domain: numtype.DInt, Sign: numtype.SZero})
+	case n == float64(int64(n)):
+		return vNum(numtype.NumType{Domain: numtype.DInt, Sign: numtype.SNonNeg})
+	default:
+		return vNum(numtype.NumType{Domain: numtype.DReal, Sign: numtype.SNonNeg})
+	}
+}
+
+// applyArgs applies args to a (possibly partial) signature. Each arg must be
+// assignable to the corresponding param (subVtype, with vUnknown deferring).
+// When the result saturates, the result type is computed via resultOf; otherwise
+// a new partial sig carrying the remaining params (and accumulated bound
+// operands) is returned.
+func (c *checker) applyArgs(s sig, args []vtype) (sig, error) {
+	if len(args) > len(s.params) {
+		return sig{}, fmt.Errorf("too many arguments: expected %d, got %d", len(s.params), len(args))
+	}
+	for i, a := range args {
+		if !subVtype(a, s.params[i]) {
+			return sig{}, fmt.Errorf("argument %d: expected %s, got %s", i+1, s.params[i], a)
+		}
+	}
+	bound := append(append([]vtype(nil), s.bound...), args...)
+	remaining := s.params[len(args):]
+	if len(remaining) == 0 {
+		return sig{result: resultOf(s.op, s.result, bound)}, nil
+	}
+	return sig{params: remaining, result: s.result, op: s.op, bound: bound}, nil
+}
+
+// resultOf computes a saturated application's result type. For a non-primitive
+// (op == "") it is the fixed fallback (the function's inferred return / value).
+// For a primitive, an unknown operand defers to vUnknown; comparisons yield
+// bool; arithmetic applies the per-operator numeric rule.
+func resultOf(op string, fallback vtype, operands []vtype) vtype {
+	if op == "" {
+		return fallback
+	}
+	for _, o := range operands {
+		if o.kind == vkUnknown {
+			return vUnknown
+		}
+	}
+	if cmpOps[op] {
+		return vBool
+	}
+	return vNum(numBin(op, operands[0].num, operands[1].num))
+}
+
+// typeOfReduce types a `reduce <binary fn> <init>` over the current query's
+// element type. The result type is the least fixpoint of folding the function
+// over (accumulator, element), starting from the init literal's type — bounded
+// because the lattice has finite height.
+func (c *checker) typeOfReduce(e parser.Expr, scope map[string]vtype) (sig, error) {
+	if e.Fn == nil || e.Init == nil {
+		return sig{}, fmt.Errorf("malformed reduce")
+	}
+	if !c.hasElem {
+		return sig{}, fmt.Errorf("reduce may only appear in a query body")
+	}
+	fs, err := c.typeOf(*e.Fn, scope)
+	if err != nil {
+		return sig{}, err
+	}
+	if len(fs.params) != 2 {
+		return sig{}, fmt.Errorf("reduce needs a binary function")
+	}
+	initS, err := c.typeOf(*e.Init, scope)
+	if err != nil {
+		return sig{}, err
+	}
+	if initS.result.kind != vkNum {
+		return sig{}, fmt.Errorf("reduce init must be numeric")
+	}
+	elemV := vNum(c.elem)
+	acc := initS.result.num
+	// Iterate to a fixpoint; the lattice height bounds the iteration count.
+	for i := 0; i < 16; i++ {
+		sat, err := c.applyArgs(fs, []vtype{vNum(acc), elemV})
+		if err != nil {
+			return sig{}, err
+		}
+		if sat.result.kind == vkUnknown {
+			break // recursive reduce fn mid-inference: settle on the accumulator so far
+		}
+		if sat.result.kind != vkNum {
+			return sig{}, fmt.Errorf("reduce function must produce a numeric value")
+		}
+		next := numtype.Join(acc, sat.result.num)
+		if next == acc {
+			break
+		}
+		acc = next
+	}
+	return sig{result: vNum(acc)}, nil
 }
 
 func (c *checker) typeOfGuards(e parser.Expr, scope map[string]vtype) (sig, error) {
@@ -619,7 +878,7 @@ func (c *checker) typeOfGuards(e parser.Expr, scope map[string]vtype) (sig, erro
 			if len(cs.params) != 0 {
 				return sig{}, fmt.Errorf("guard condition must be a value, not a function")
 			}
-			if cs.result != vBool && cs.result != vUnknown {
+			if cs.result.kind != vkBool && cs.result.kind != vkUnknown {
 				return sig{}, fmt.Errorf("guard condition must be bool, got %s", cs.result)
 			}
 		}
@@ -639,16 +898,21 @@ func (c *checker) typeOfGuards(e parser.Expr, scope map[string]vtype) (sig, erro
 		}
 		result = unified
 	}
-	return sig{nil, result}, nil
+	return sig{result: result}, nil
 }
 
+// unify widens two guard-result types to a common type: vUnknown defers, two
+// numeric types join to their least upper bound, and otherwise the kinds must
+// match.
 func unify(a, b vtype) (vtype, error) {
 	switch {
-	case a == vUnknown:
+	case a.kind == vkUnknown:
 		return b, nil
-	case b == vUnknown:
+	case b.kind == vkUnknown:
 		return a, nil
-	case a != b:
+	case a.kind == vkNum && b.kind == vkNum:
+		return vNum(numtype.Join(a.num, b.num)), nil
+	case a.kind != b.kind:
 		return vUnknown, fmt.Errorf("%s vs %s", a, b)
 	default:
 		return a, nil
@@ -660,8 +924,8 @@ func unify(a, b vtype) (vtype, error) {
 func validateParams(ps []parser.ParamSpec) error {
 	seen := make(map[string]bool, len(ps))
 	for _, p := range ps {
-		if p.Type != "real" {
-			return fmt.Errorf("param %s: unknown type %q (only real)", p.Name, p.Type)
+		if _, ok := numtype.Parse(p.Type); !ok {
+			return fmt.Errorf("param %s: unknown type %q", p.Name, p.Type)
 		}
 		if seen[p.Name] {
 			return fmt.Errorf("duplicate param %s", p.Name)
@@ -679,11 +943,13 @@ func paramSet(ps []parser.ParamSpec) map[string]bool {
 	return s
 }
 
-// realScope builds a type-checking scope binding each (real-only) param to vReal.
-func realScope(ps []parser.ParamSpec) map[string]vtype {
+// paramScope builds a type-checking scope binding each param to its declared
+// numeric type.
+func paramScope(ps []parser.ParamSpec) map[string]vtype {
 	s := make(map[string]vtype, len(ps))
 	for _, p := range ps {
-		s[p.Name] = vReal
+		nt, _ := numtype.Parse(p.Type) // validated by validateParams
+		s[p.Name] = vNum(nt)
 	}
 	return s
 }

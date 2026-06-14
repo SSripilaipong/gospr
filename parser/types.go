@@ -14,10 +14,14 @@ const (
 	KindStruct          // reserved, NOT parsed yet
 )
 
-// ElemType describes what each vector slot holds. For `vector real`,
-// Kind == KindReal and Fields is nil. Struct support later fills Fields.
+// ElemType describes what each vector slot holds. For a scalar vector,
+// Kind == KindReal, Scalar holds the parsed numeric type name (one of the six:
+// real, real0+, real0-, int, int0+, int0-), and Fields is nil. Struct support
+// later fills Fields. Scalar is a syntactic name only — the builder maps it to a
+// numtype.NumType; the parser stays semantics-free.
 type ElemType struct {
 	Kind   ElemKind
+	Scalar string      // numeric type name for KindReal; "" for KindStruct
 	Fields []FieldSpec // nil for KindReal; reserved for KindStruct
 }
 
