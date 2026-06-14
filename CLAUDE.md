@@ -26,9 +26,14 @@ Maintain it by these rules:
 ```bash
 go build ./...
 go run .                          # start all three nodes (ports 8081/8082/8083)
-go test -timeout 10s ./...        # always use -timeout; combinators can loop infinitely
+go test -timeout 60s ./...        # always use -timeout; combinators can loop infinitely
 go vet ./...
 ```
+
+**Prerequisite:** `z3` must be on `PATH` (`z3 --version`). The builder proves
+CRDT convergence via the SMT solver on every deploy, so a build that defines a
+type fails without it — including `go test` for `builder`/`e2e`/`prover`. Install
+from <https://github.com/Z3Prover/z3> or `pip install z3-solver`.
 
 ## Purpose & scope
 
@@ -50,29 +55,36 @@ appear as a value sub-expression inside a **query** body (e.g. `myScore (reduce 
 so a query can return a `bool`/`string`. Function params are **concrete** numeric
 types (numeric-generic params are out of scope); return types are **inferred**.
 Recursion is allowed only when a concrete branch anchors its return type
-(unanchored recursion is a build error). This makes non-negative increments
-*expressible and checkable* — it is **not** a full CRDT-correctness proof (merge
-monotonicity remains future work). Query params and struct vectors
-(`vector { x real }`) are designed-for but not implemented.
+(unanchored recursion is a build error). On top of type-checking, the builder
+**proves convergence** (CvRDT / strong eventual consistency) for every type via
+the `prover` package: the merge fn must be a join-semilattice (commutative,
+associative, idempotent) and every update must be inflationary in merge's
+induced order (`merge(x, h(x)) = h(x)`). Both decompose to scalar SMT obligations
+discharged by Z3; an unprovable merge/update pair is rejected at build time. This
+is **not** a merge-monotonicity-only heuristic — it is the full SEC obligation
+pair, modulo idealized real/int arithmetic (the proof reasons over ℝ/ℤ, not
+IEEE floats). Query params and struct vectors (`vector { x real }`) are
+designed-for but not implemented.
 
 ## Architecture
 
 Three nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls.
 
-- `POST /api/cluster/deploy` → DSL parsed → builder validates and builds per-type `Model`s → node initializes and propagates `deployMsg` to peers
+- `POST /api/cluster/deploy` → DSL parsed → builder validates, type-checks, **and proves convergence** (via `prover`/Z3) → builds per-type `Model`s → node initializes and propagates `deployMsg` to peers
 - Every ~2s each node gossips a snapshot to one random peer; the peer merges each collection via that type's user-defined `merge` expr (e.g. `zip max` → elementwise max over the union of node slots)
 - Node lifecycle: `Uninitialized → Initialized` (one-way, idempotent). Because it is one-way, the gateway rejects a deploy that yields zero collections.
 
 ## Layer responsibilities
 
 ```
-parser  →  builder  →  node / crdt
+parser  →  builder → prover  →  node / crdt
 ```
 
 | Layer | Owns |
 |---|---|
 | `parser` | Syntax: text → `Plan` (flat AST slices, incl. `FnDef`s). Bodies are an applicative `Expr` sum type (`NumLit`/`StrLit`/`Name`/`App` + `Guards` + `Reduce`/`Zip`/`Local` combinators). A guarded `fn` body is `ExprGuards{Cases}`; `otherwise` is a `GuardCase.Otherwise` marker, not an expression. Leaves are emitted as **unresolved** `Name`s — the parser knows no scope. |
 | `builder` | Semantics: folds flat `TypeDef`+`FnDef`+`MergeDef`+`QueryDef`+`UpdateDef` into validated `*Model`s + a global `Functions` table, **resolves** every `Name` → `Var`/`Ref`, and **type-checks** every term (a small `checker`: `typeOf` over numeric (carrying `numtype.NumType`)/`bool`/`string`, **assignability via `numtype.Sub`** instead of equality, per-operator result rules, combinator boundary checks `Sub(result, elemType)`, memoized DFS return-type inference). Rejects duplicate/primitive-shadowing/zero-param fns, duplicate params, unknown identifiers, arity/type mismatches, results not assignable to the element type, guards without a final `otherwise` (or an `otherwise` not last), `reduce` outside a query, unanchored recursion, unknown param types, query params, missing merge. `Model` implements `CollectionSpec.New`; queries carry an inferred `Result` `ValType` + `ResultNum` `NumType`. |
+| `prover` | Proves CvRDT convergence for each `*Model` at the end of `Build` (imports `parser`/`numtype`/`crdt`, never `builder`). Lowers the merge fn and each update fn to a symbolic IR (`sym`, mirroring crdt's eval/apply with user-fn inlining + recursion rejection), builds scalar obligations — merge comm/assoc/idempotence + per-update `merge(x,h(x))=h(x)` — and discharges each by **negation** through Z3 (`z3 -smt2 -in`). Every var is declared `Real` with `is_int`/sign constraints from its own `NumType` (slot from the element type, update params from their declared types), so mixed Int/Real arithmetic stays well-sorted. No pure-Go fast path → `z3` is mandatory. |
 | `crdt` | Runtime only — no string parsing, no `Plan` knowledge. `VectorCRDT` evaluates resolved `Expr` trees against `map[string]float64` via a small applicative interpreter (tagged `rtVal` = num/str/bool/func, `[]rtVal` calling convention, partial application, recursion-depth guard). `Query` evals the body to an `rtVal` (a `reduce` sub-node folds `v.state` under the lock) and converts via `rtToAny`; `Merge` is atomic (build-copy-then-swap). |
 | `node` | Lifecycle + message loop; calls `Spec.New` from `BuiltPlan.Collections`. |
 | `gateway` | HTTP; returns 400 on parse/build errors and zero-collection deploys before touching node state; regenerates Swagger on deploy. |
@@ -87,8 +99,13 @@ numtype/
   numtype_test.go
 
 builder/
-  builder.go          Build(Plan) → BuiltPlan{Models, Functions, Collections}; Model (+ElemNum) + env.resolve (Name→Var/Ref) + arityOf; checker (vtype{kind,num}/sig, primitiveArity + per-op rules addSign/mulSign/negate/max/min + numBin, applyArgs/resultOf, subVtype, typeOf/typeOfGuards/typeOfReduce fixpoint, inferReturn, unify via Join) + validators
-  builder_test.go     hard-coded-AST integration test + error/duplicate/fn/arity/type + numeric-subtype cases
+  builder.go          Build(Plan) → BuiltPlan{Models, Functions, Collections}; Model (+ElemNum) + env.resolve (Name→Var/Ref) + arityOf; checker (vtype{kind,num}/sig, primitiveArity + per-op rules addSign/mulSign/negate/max/min + numBin, applyArgs/resultOf, subVtype, typeOf/typeOfGuards/typeOfReduce fixpoint, inferReturn, unify via Join) + validators; final per-model `prover.Prove` convergence gate
+  builder_test.go     hard-coded-AST integration test + error/duplicate/fn/arity/type + numeric-subtype + convergence-rejection cases
+
+prover/
+  prover.go           Prove(elem, merge, updates, funcs); sym IR + lower (eval/refFn/evalApp/evalGuards, user-fn inlining + recursion guard); merge-law + per-update inflationary obligation builders
+  smt.go              sym → SMT-LIB (single Real sort, is_int/sign asserts, max/min→ite, ==/ /= → =/distinct); checkGoal/runZ3 via os/exec `z3 -smt2 -in`, unsat=proven; lookPath/z3Binary seams
+  prover_test.go      z3-backed accept/reject (max/min join, sum/avg rejected, inflationary, mixed-domain, recursion) + z3-missing seam
 
 crdt/
   crdt.go             CRDT interface: Apply/Query/Merge/Snapshot
@@ -147,10 +164,11 @@ collection MyVec = T            # named runtime instance of a type (no args)
 
 ## Extension points
 
-- **New operator:** add its arity to `primitiveArity` in `builder/builder.go` and a result rule (a `numBin` case for arithmetic, or `cmpOps` membership for a bool result), add a case in `primOp` in `crdt/vector.go` (`arith` / `cmp`), and (for a punctuation operator) a `Try(StringP(...))` alternative in `symOpP` (`parser/dsl.go`, multi-char before single-char); word-shaped operators need no parser change (they parse as identifiers).
+- **New operator:** add its arity to `primitiveArity` in `builder/builder.go` and a result rule (a `numBin` case for arithmetic, or `cmpOps` membership for a bool result), add a case in `primOp` in `crdt/vector.go` (`arith` / `cmp`), add a `serialize` case in `prover/smt.go` so the convergence proof can reason about it (and `cmpOps` membership in `prover/prover.go` for a bool op), and (for a punctuation operator) a `Try(StringP(...))` alternative in `symOpP` (`parser/dsl.go`, multi-char before single-char); word-shaped operators need no parser change (they parse as identifiers).
 - **New numeric type:** add the name + `NumType` to `numtype.Parse`/`String` and adjust `Sub`/`Join`/`Allows`; add it to `numTypeNameP` in `parser/dsl.go` (longest-match order). The builder/crdt/swagger consume `numtype` generically, so usually need no change.
 - **New value type** (non-numeric): add a `parser.ValType` + builder `vkind`, handle it in `checker.typeOf`/`subVtype`/`unify`, add an `rtKind` + constructor in `crdt/vector.go` and a `rtToAny`/`valTypeSchema` case.
 - **New expression form** (e.g. query params, struct vectors): add/realize an `ExprKind`/`ElemKind` in `parser/types.go`, parse it in `dsl.go`, resolve it in `builder.env.resolve` and type-check it in `checker.typeOf`, evaluate it in `crdt/vector.go` (`eval`).
+- **New expression form & the prover:** any new `ExprKind` reachable from a merge/update fn body also needs an `eval` case in `prover/prover.go` (lower it to a `sym`), else the convergence proof errors out. Struct vectors are the planned next step: per-field independent merge is a product lattice (prove each field's scalar fn separately); cross-field/LWW-style merges need a joint obligation — both still reduce to QF SMT.
 - **Network propagation of `deployMsg`:** `BuiltPlan` is data-only; gob/JSON-encode `Model` (it holds `parser.Expr` trees, no closures).
 
 ## Testing conventions

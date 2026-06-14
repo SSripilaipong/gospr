@@ -6,6 +6,7 @@ import (
 	"gospr/crdt"
 	"gospr/numtype"
 	"gospr/parser"
+	"gospr/prover"
 )
 
 // CollectionSpec produces a runtime CRDT instance for a node.
@@ -377,6 +378,15 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 	for name := range models {
 		if !mergeSeen[name] {
 			return BuiltPlan{}, fmt.Errorf("type %s has no merge defined", name)
+		}
+	}
+
+	// Prove convergence: the merge must be a join-semilattice and every update
+	// inflationary in its induced order. Unprovable types are rejected (the
+	// gateway surfaces this as a 400). Requires z3 on PATH.
+	for _, m := range models {
+		if err := prover.Prove(m.ElemNum, m.Merge, m.Updates, funcs); err != nil {
+			return BuiltPlan{}, fmt.Errorf("convergence proof failed for type %s: %w", m.Name, err)
 		}
 	}
 

@@ -54,7 +54,10 @@ func gotherwise(result parser.Expr) parser.GuardCase {
 //	fn lub a::real b::real = max a b
 //	merge T = zip lub
 //	query T.Value = reduce + 0
-//	update T.Add k::real = local (+ k)
+//	update T.Add k::real0+ = local (+ k)
+//
+// The update param is real0+ (not real): a `+ k` update is only inflationary
+// under a max merge when k is non-negative, which the convergence prover checks.
 func canonicalPlan() parser.Plan {
 	return parser.Plan{
 		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal, Scalar: "real"}}},
@@ -70,7 +73,7 @@ func canonicalPlan() parser.Plan {
 		},
 		Updates: []parser.UpdateDef{
 			{TypeName: "T", MethodName: "Add",
-				Params: []parser.ParamSpec{{Name: "k", Type: "real"}},
+				Params: []parser.ParamSpec{{Name: "k", Type: "real0+"}},
 				Body:   local(app(name("+"), name("k")))},
 		},
 	}
@@ -309,7 +312,7 @@ fn myScore x::real
 | otherwise = "You got a F"
 merge T = zip max
 query T.Grade = myScore (reduce max 0)
-update T.Add k::real = local (+ k)
+update T.Add k::real0+ = local (+ k)
 collection Scores = T
 `
 	built, err := Build(mustParse(t, src))
@@ -430,6 +433,19 @@ func TestBuild_literalZeroAssignableToNonPos(t *testing.T) {
 	src := `type T = vector real0-
 merge T = zip min
 update T.Nop = local (+ 0)
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+}
+
+// Mixed domains: a `vector real` slot with an int0+ increment param builds and
+// is proven inflationary under max — the prover declares the slot as Real and
+// the param as an integer (is_int), so the cross-domain `+` is well-sorted.
+func TestBuild_mixedDomainUpdateProven(t *testing.T) {
+	src := `type T = vector real
+merge T = zip max
+update T.Add k::int0+ = local (+ k)
 collection C = T
 `
 	_, err := Build(mustParse(t, src))
