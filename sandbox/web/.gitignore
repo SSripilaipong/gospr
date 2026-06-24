@@ -1,0 +1,4 @@
+# Built output (dist/) is intentionally NOT ignored: it is embedded by the Go
+# server via //go:embed, so `go build` works without a Node toolchain.
+node_modules/
+*.tsbuildinfo

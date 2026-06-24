@@ -27,9 +27,12 @@ Maintain it by these rules:
 go build ./...
 go run . server local                       # one node, gateway on :9050
 go run . server local --nodes=3 --port=9050 # 3 nodes, gateways on :9050/:9051/:9052
+go run . sandbox run --nodes=5 --port=9060  # observable web UI: watch gossip, partition links, deploy/query/invoke
 go run . check file.gos                      # validate a .gos file (parse+typecheck+prove), no server
 go test -timeout 60s ./...        # always use -timeout; combinators can loop infinitely
 go vet ./...
+
+cd sandbox/web && npm install && npm run build  # rebuild the sandbox SPA; dist/ is //go:embed-ed and committed so `go build` needs no Node
 ```
 
 **Prerequisite:** `z3` must be on `PATH` (`z3 --version`). The builder proves
@@ -74,7 +77,7 @@ designed-for but not implemented.
 
 ## Architecture
 
-Nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls. The CLI (`gospr server local`) spins up N nodes (default 1, `--nodes` to scale), wiring each as the others' peer; one node is a degenerate cluster (no peers, gossip no-ops).
+Nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls. The send side is the `node.Peer` interface (`Send(msg any)`); production wraps each inbox in `node.ChanPeer` (a blocking channel send). This is the single interception seam: the `sandbox` package supplies its own `Peer` to observe/delay/drop messages **without touching production node code** (the sandbox is designed to be liftable into its own repo). The CLI (`gospr server local`) spins up N nodes (default 1, `--nodes` to scale), wiring each as the others' peer; one node is a degenerate cluster (no peers, gossip no-ops).
 
 - `POST /api/cluster/deploy` → DSL parsed → builder validates, type-checks, **and proves convergence** (via `prover`/Z3) → builds per-type `Model`s → node initializes and propagates `deployMsg` to peers
 - Every ~2s each node gossips a snapshot to one random peer; the peer merges each collection via that type's user-defined `merge` expr (e.g. `zip max` → elementwise max over the union of node slots)
@@ -92,13 +95,14 @@ parser  →  builder → prover  →  node / crdt
 | `builder` | Semantics: folds flat `TypeDef`+`FnDef`+`MergeDef`+`QueryDef`+`UpdateDef` into validated `*Model`s + a global `Functions` table, **resolves** every `Name` → `Var`/`Ref`, and **type-checks** every term (a small `checker`: `typeOf` over numeric (carrying `numtype.NumType`)/`bool`/`string`, **assignability via `numtype.Sub`** instead of equality, per-operator result rules, combinator boundary checks `Sub(result, elemType)`, memoized DFS return-type inference). Rejects duplicate/primitive-shadowing/zero-param fns, duplicate params, unknown identifiers, arity/type mismatches, results not assignable to the element type, guards without a final `otherwise` (or an `otherwise` not last), `reduce` outside a query, unanchored recursion, unknown param types, query params, missing merge. `Model` implements `CollectionSpec.New`; queries carry an inferred `Result` `ValType` + `ResultNum` `NumType`. |
 | `prover` | Proves CvRDT convergence for each `*Model` at the end of `Build` (imports `parser`/`numtype`/`crdt`, never `builder`). Lowers the merge fn and each update fn to a symbolic IR (`sym`, mirroring crdt's eval/apply with user-fn inlining + recursion rejection), builds scalar obligations — merge comm/assoc/idempotence + per-update `merge(x,h(x))=h(x)` — and discharges each by **negation** through Z3 (`z3 -smt2 -in`). Every var is declared `Real` with `is_int`/sign constraints from its own `NumType` (slot from the element type, update params from their declared types), so mixed Int/Rat arithmetic stays well-sorted. `Real` over-approximates the ℚ runtime soundly (unsat over ℝ ⇒ no rational counterexample); rational literals serialize as `(/ p.0 q.0)`. No pure-Go fast path → `z3` is mandatory. |
 | `crdt` | Runtime only — no string parsing, no `Plan` knowledge. `VectorCRDT` evaluates resolved `Expr` trees against `map[string]*big.Rat` (exact rationals) via a small applicative interpreter (tagged `rtVal` = num/str/bool/func, `[]rtVal` calling convention, partial application, recursion-depth guard). Arithmetic always allocates fresh `big.Rat`s; the **Snapshot/Merge boundary deep-clones** (`cloneRat`) because `big.Rat` is mutable, so no value is aliased across CRDTs. `Query` evals the body to an `rtVal` (a `reduce` sub-node folds `v.state` under the lock) and converts via `rtToAny` (numbers → exact `RatString`); `Merge` is atomic (build-copy-then-swap). |
-| `node` | Lifecycle + message loop; calls `Spec.New` from `BuiltPlan.Collections`. |
+| `node` | Lifecycle + message loop; calls `Spec.New` from `BuiltPlan.Collections`. Sends go through the `Peer` interface (`Send`), the one interception seam — prod uses `ChanPeer`; graceful `Stop()` lets a cluster be torn down without leaking goroutines. |
 | `gateway` | HTTP; returns 400 on parse/build errors and zero-collection deploys before touching node state; regenerates Swagger on deploy. |
+| `sandbox` | Observable web playground (`gospr sandbox run`): a swappable `Cluster` of nodes wired with intercepting `Peer`s that drop (partition) / delay / observe (SSE) messages, an HTTP+SPA server, and atomic Reset. Imports only `parser`/`builder`/`node`/`crdt` — built to lift into its own repo. |
 
 ## File map
 
 ```
-main.go               CLI entry (urfave/cli/v3): `server local` (--nodes/--port, wires N nodes+gateways+peers) and `check <file.gos>` (parse→Build, no server)
+main.go               CLI entry (urfave/cli/v3): `server local` (--nodes/--port, wires N nodes+gateways+peers), `sandbox run` (--nodes/--port → sandbox.Run), and `check <file.gos>` (parse→Build, no server)
 
 numtype/
   numtype.go          leaf pkg (imports only math/big): NumType{Domain,Sign}, the six names, Parse/String/Sub/Join/Allows(*big.Rat). Zero value = top type `rat`; internal `Zero` sign types the literal 0
@@ -119,7 +123,18 @@ crdt/
   vector_test.go
 
 node/
-  node.go             lifecycle + message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan)
+  node.go             lifecycle + message loop; Initialize(BuiltPlan), PropagatePlan(BuiltPlan); Peer interface + ChanPeer (interception seam), MessageKind, Initialized(), graceful Stop() (quit chan + select in both loops; prod calls it never, sandbox calls it on Reset)
+  node_test.go        Stop() halts gossip + is idempotent; MessageKind
+
+sandbox/             observe/interact playground; imports only parser/builder/node/crdt — designed to lift into its own repo. `gospr sandbox run`
+  sandbox.go          Server (stable Network+Hub, swappable *Cluster behind RWMutex), Run; locking contract: withCluster=RLock for reads/Apply, withClusterW=Lock for deploy (pin check+set), Parse/Build (z3) run OUTSIDE the lock; reset() = Lock→swap+net.Reconnect()→Unlock→old.stop(). GOTCHA: Reconnect MUST be inside the same write lock as the swap, else a deploy can land in the gap and propagate through stale partitions then pin (lock order is always s.mu→net, so no deadlock)
+  cluster.go          Cluster (swappable topology): newCluster wires a full mesh of interceptingPeer + short gossip interval; stop() closes done + Stops every node; pinned deployed *BuiltPlan
+  network.go          Network: per-pair partition (order-independent "a|b" key) + global delay, both RWMutex-guarded; survives Reset (delay kept, links reconnected)
+  hub.go              SSE Event fan-out; Emit is non-blocking (buffered per-sub chan + select/default drop) so a stuck client never stalls the gossip/deploy send path
+  peer.go             interceptingPeer (node.Peer): drops on partition, else emits inflight + delivers after delay in a goroutine guarded by the cluster's done chan (timer+select so Reset aborts in-flight sends promptly)
+  server.go           HTTP+SPA: GET state/events(SSE), POST deploy(pin-the-plan, 409 on 2nd, zero-collection guard)/reset/links/speed, POST/GET nodes/{id}/collections/{collection}/{action|query} (string-only params); //go:embed web/dist
+  *_test.go           network/peer(done-abort)/cluster(reset + reset-reconnect-atomic-with-deploy race) unit tests
+  web/                Vite+TS+Web Components SPA (no framework). src/components/{sandbox-app(poll /state + /events),node-graph(SVG circle, flight dots),node-panel(one input per declared param),network-controls(speed/links/Reset)}; dist/ committed + embedded
 
 swagger/
   swagger.go          Generate(BuiltPlan) → OpenAPI 3.0 JSON; type-switches on *builder.Model; numSchema → string (numbers are exact-rational strings on the wire) with the NumType named in the description

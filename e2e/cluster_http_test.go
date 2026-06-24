@@ -71,7 +71,7 @@ func startCluster(t *testing.T, gossip time.Duration) []string {
 	for i, n := range nodes {
 		for j, peer := range nodes {
 			if i != j {
-				n.AddPeer(peer.Inbox())
+				n.AddPeer(node.NewChanPeer(peer.Inbox()))
 			}
 		}
 	}

@@ -26,13 +26,42 @@ type deployMsg struct {
 	built builder.BuiltPlan
 }
 
+// Peer is the send-side of a node link. The default implementation (ChanPeer)
+// delivers straight to a peer's inbox channel; alternative implementations can
+// intercept, delay, or drop messages (e.g. the sandbox) without the node code
+// knowing the difference. This is the single interception point for both gossip
+// and deploy propagation.
+type Peer interface{ Send(msg any) }
+
+// ChanPeer is the production Peer: a blocking send to the target inbox.
+type ChanPeer struct{ inbox chan any }
+
+func NewChanPeer(inbox chan any) ChanPeer { return ChanPeer{inbox} }
+
+func (p ChanPeer) Send(msg any) { p.inbox <- msg }
+
+// MessageKind classifies an inter-node message without exposing the unexported
+// message types, so non-node packages can label traffic.
+func MessageKind(msg any) string {
+	switch msg.(type) {
+	case gossipMsg:
+		return "gossip"
+	case deployMsg:
+		return "deploy"
+	default:
+		return "unknown"
+	}
+}
+
 type Node struct {
 	id             string
 	state          State
 	inbox          chan any
-	peers          []chan any
+	peers          []Peer
 	collections    map[string]crdt.CRDT
 	gossipInterval time.Duration
+	quit           chan struct{}
+	stopOnce       sync.Once
 	mu             sync.RWMutex
 }
 
@@ -51,6 +80,7 @@ func New(id string, opts ...Option) *Node {
 		inbox:          make(chan any, 64),
 		collections:    make(map[string]crdt.CRDT),
 		gossipInterval: 2 * time.Second,
+		quit:           make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(n)
@@ -62,13 +92,27 @@ func (n *Node) ID() string { return n.id }
 
 func (n *Node) Inbox() chan any { return n.inbox }
 
-func (n *Node) AddPeer(inbox chan any) {
-	n.peers = append(n.peers, inbox)
+func (n *Node) AddPeer(p Peer) {
+	n.peers = append(n.peers, p)
 }
 
 func (n *Node) Start() {
 	go n.runMessageLoop()
 	go n.runGossip()
+}
+
+// Stop gracefully halts the gossip and message-loop goroutines. It is idempotent
+// and prod-neutral: `server local` never calls it (behavior identical to before);
+// the sandbox calls it on Reset to tear a cluster down without leaking goroutines.
+func (n *Node) Stop() {
+	n.stopOnce.Do(func() { close(n.quit) })
+}
+
+// Initialized reports whether a plan has been deployed to this node.
+func (n *Node) Initialized() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.state == Initialized
 }
 
 func (n *Node) Initialize(plan builder.BuiltPlan) error {
@@ -88,7 +132,7 @@ func (n *Node) Initialize(plan builder.BuiltPlan) error {
 func (n *Node) PropagatePlan(plan builder.BuiltPlan) {
 	msg := deployMsg{built: plan}
 	for _, peer := range n.peers {
-		peer <- msg
+		peer.Send(msg)
 	}
 }
 
@@ -139,7 +183,12 @@ func (n *Node) MergeSnapshot(snap map[string]any) {
 func (n *Node) runGossip() {
 	ticker := time.NewTicker(n.gossipInterval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-n.quit:
+			return
+		case <-ticker.C:
+		}
 		n.mu.RLock()
 		ready := n.state == Initialized
 		n.mu.RUnlock()
@@ -148,12 +197,18 @@ func (n *Node) runGossip() {
 		}
 		snap := n.Snapshot()
 		peer := n.peers[rand.Intn(len(n.peers))]
-		peer <- gossipMsg{senderID: n.id, snapshot: snap}
+		peer.Send(gossipMsg{senderID: n.id, snapshot: snap})
 	}
 }
 
 func (n *Node) runMessageLoop() {
-	for msg := range n.inbox {
+	for {
+		var msg any
+		select {
+		case <-n.quit:
+			return
+		case msg = <-n.inbox:
+		}
 		switch m := msg.(type) {
 		case gossipMsg:
 			n.mu.RLock()

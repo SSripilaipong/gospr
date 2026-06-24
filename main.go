@@ -11,6 +11,7 @@ import (
 	"gospr/gateway"
 	"gospr/node"
 	"gospr/parser"
+	"gospr/sandbox"
 
 	"github.com/urfave/cli/v3"
 )
@@ -21,6 +22,7 @@ func main() {
 		Usage: "a toy distributed CRDT engine driven by a small functional DSL",
 		Commands: []*cli.Command{
 			serverCmd(),
+			sandboxCmd(),
 			checkCmd(),
 		},
 	}
@@ -56,6 +58,44 @@ func serverCmd() *cli.Command {
 	}
 }
 
+func sandboxCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "sandbox",
+		Usage: "run an observable, interactive cluster with a web UI",
+		Commands: []*cli.Command{
+			{
+				Name:  "run",
+				Usage: "run a goroutine cluster with a web app to watch gossip, partition links, and deploy/query/invoke",
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "nodes",
+						Value: 5,
+						Usage: "number of nodes to run",
+					},
+					&cli.IntFlag{
+						Name:  "port",
+						Value: 9060,
+						Usage: "HTTP port for the web UI + API",
+					},
+				},
+				Action: runSandbox,
+			},
+		},
+	}
+}
+
+func runSandbox(ctx context.Context, cmd *cli.Command) error {
+	nodes := cmd.Int("nodes")
+	port := cmd.Int("port")
+	if nodes < 1 {
+		return cli.Exit("--nodes must be >= 1", 1)
+	}
+	if port < 1 || port > 65535 {
+		return cli.Exit("--port out of range", 1)
+	}
+	return sandbox.Run(ctx, nodes, port)
+}
+
 func checkCmd() *cli.Command {
 	return &cli.Command{
 		Name:      "check",
@@ -86,7 +126,7 @@ func runLocal(ctx context.Context, cmd *cli.Command) error {
 	for i, n := range ns {
 		for j, peer := range ns {
 			if i != j {
-				n.AddPeer(peer.Inbox())
+				n.AddPeer(node.NewChanPeer(peer.Inbox()))
 			}
 		}
 	}
