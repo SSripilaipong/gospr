@@ -150,6 +150,10 @@ label {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 8px;
+  /* Cap the focal graph so it doesn't balloon on wide screens; centered in the
+     wider left column. Below the cap it stays responsive (width:100%). */
+  max-width: 600px;
+  margin-inline: auto;
 }
 svg.graph {
   width: 100%;
@@ -159,6 +163,9 @@ svg.graph {
 .link {
   stroke: var(--border);
   stroke-width: 2;
+  /* Clicks pass through to the wide .link-hit underneath. */
+  pointer-events: none;
+  transition: stroke-width 0.1s ease, stroke 0.1s ease;
 }
 .link.up {
   stroke: #3a4757;
@@ -167,6 +174,22 @@ svg.graph {
   stroke: var(--warn);
   stroke-dasharray: 6 6;
   opacity: 0.6;
+}
+/* Wide transparent, keyboard-operable hit target for partitioning a link. */
+.link-hit {
+  stroke: transparent;
+  stroke-width: 16;
+  cursor: pointer;
+}
+.link-hit:hover + .link,
+.link-hit:focus-visible + .link {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+.link-hit:focus-visible {
+  outline: none;
+  stroke: var(--accent);
+  stroke-opacity: 0.35;
 }
 .node-circle {
   fill: var(--surface-2);
@@ -201,11 +224,18 @@ svg.graph {
   text-anchor: middle;
   pointer-events: none;
 }
-.flight-dot {
-  fill: var(--accent);
+/* A node briefly brightens when its slot state changes (replaces the old gossip
+   flight dots). brightness() doesn't conflict with the stroke color classes. */
+@keyframes node-blink {
+  0% {
+    filter: brightness(2.4);
+  }
+  100% {
+    filter: brightness(1);
+  }
 }
-.flight-dot.deploy {
-  fill: var(--good);
+.node-circle.blink {
+  animation: node-blink 0.7s ease-out;
 }
 
 /* ---- params grid ---- */
@@ -285,27 +315,6 @@ svg.graph {
   color: var(--text-muted);
 }
 
-.slider-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.slider-row input[type="range"] {
-  flex: 1;
-}
-
-.link-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 0;
-}
-.link-toggle .pair {
-  font-family: var(--mono);
-  font-size: 0.85rem;
-}
-
 ul.reset {
   list-style: none;
   margin: 0;
@@ -324,7 +333,7 @@ pre.result {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .flight-dot {
-    display: none;
+  .node-circle.blink {
+    animation: none;
   }
 }

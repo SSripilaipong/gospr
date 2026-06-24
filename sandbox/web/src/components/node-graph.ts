@@ -1,4 +1,4 @@
-import type { FlightEvent, SandboxState } from "../api";
+import type { SandboxState } from "../api";
 import { linkKey } from "../util";
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -14,7 +14,12 @@ export class NodeGraph extends HTMLElement {
   private state: SandboxState | null = null;
   private selected: string | null = null;
   private svg!: SVGSVGElement;
+  // base holds links + nodes, rebuilt on each render.
+  private base!: SVGGElement;
   private pos = new Map<string, { x: number; y: number }>();
+  private lastSig = "";
+  // Last-seen slot signature per node, to blink a node when its state changes.
+  private prevSlots = new Map<string, string>();
 
   connectedCallback() {
     const wrap = document.createElement("div");
@@ -22,16 +27,33 @@ export class NodeGraph extends HTMLElement {
     this.svg = document.createElementNS(SVG, "svg") as SVGSVGElement;
     this.svg.setAttribute("class", "graph");
     this.svg.setAttribute("viewBox", `0 0 ${SIZE} ${SIZE}`);
-    this.svg.setAttribute("role", "img");
+    // role="group" (not "img") so the per-link button controls inside are exposed
+    // to screen readers — role="img" would present the SVG as one opaque image.
+    this.svg.setAttribute("role", "group");
     this.svg.setAttribute("aria-label", "cluster graph");
-    wrap.appendChild(this.svg);
+    this.base = document.createElementNS(SVG, "g") as SVGGElement;
+    this.svg.appendChild(this.base);
     this.appendChild(wrap);
+    wrap.appendChild(this.svg);
     this.render();
   }
 
   setData(state: SandboxState, selected: string | null) {
     this.state = state;
     this.selected = selected;
+    // The graph reflects gossip (slot values), so collections ARE part of the sig;
+    // skip only truly identical polls to avoid redundant rebuilds.
+    const sig = JSON.stringify({
+      nodes: state.nodes.map((n) => ({
+        id: n.id,
+        initialized: n.initialized,
+        collections: n.collections,
+      })),
+      selected,
+      links: state.links,
+    });
+    if (sig === this.lastSig) return;
+    this.lastSig = sig;
     this.computePositions();
     this.render();
   }
@@ -53,7 +75,7 @@ export class NodeGraph extends HTMLElement {
   private render() {
     if (!this.state) return;
     const s = this.state;
-    this.svg.replaceChildren();
+    this.base.replaceChildren();
 
     // Links first (under nodes).
     const ids = s.nodes.map((n) => n.id);
@@ -64,22 +86,47 @@ export class NodeGraph extends HTMLElement {
         const connected = s.links[linkKey(a, b)] ?? true;
         const pa = this.pos.get(a)!;
         const pb = this.pos.get(b)!;
+
+        // Wide transparent, keyboard-operable hit target (this replaces the old
+        // per-pair buttons, so it must be reachable + activatable by keyboard).
+        // Appended BEFORE the visible line so the `.link-hit + .link` hover/focus
+        // CSS works and the visible (pointer-events:none) line paints on top.
+        const toggle = () =>
+          this.dispatchEvent(
+            new CustomEvent("toggle-link", {
+              detail: { a, b, connected: !connected },
+              bubbles: true,
+            }),
+          );
+        const hit = document.createElementNS(SVG, "line");
+        hit.setAttribute("x1", String(pa.x));
+        hit.setAttribute("y1", String(pa.y));
+        hit.setAttribute("x2", String(pb.x));
+        hit.setAttribute("y2", String(pb.y));
+        hit.setAttribute("class", "link-hit");
+        hit.setAttribute("tabindex", "0");
+        hit.setAttribute("role", "button");
+        hit.setAttribute(
+          "aria-label",
+          `link ${a} ↔ ${b}, ${connected ? "connected" : "disconnected"} — activate to ${connected ? "disconnect" : "reconnect"}`,
+        );
+        hit.addEventListener("click", toggle);
+        hit.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            toggle();
+          }
+        });
+        this.base.appendChild(hit);
+
+        // Visible styling line — non-interactive so clicks land on the hit-line.
         const line = document.createElementNS(SVG, "line");
         line.setAttribute("x1", String(pa.x));
         line.setAttribute("y1", String(pa.y));
         line.setAttribute("x2", String(pb.x));
         line.setAttribute("y2", String(pb.y));
         line.setAttribute("class", `link ${connected ? "up" : "down"}`);
-        line.style.cursor = "pointer";
-        line.addEventListener("click", () =>
-          this.dispatchEvent(
-            new CustomEvent("toggle-link", {
-              detail: { a, b, connected: !connected },
-              bubbles: true,
-            }),
-          ),
-        );
-        this.svg.appendChild(line);
+        this.base.appendChild(line);
 
         if (!connected) {
           const mx = (pa.x + pb.x) / 2;
@@ -90,7 +137,7 @@ export class NodeGraph extends HTMLElement {
           t.setAttribute("class", "node-status");
           t.setAttribute("fill", "var(--warn)");
           t.textContent = "✕ disconnected";
-          this.svg.appendChild(t);
+          this.base.appendChild(t);
         }
       }
     }
@@ -100,6 +147,13 @@ export class NodeGraph extends HTMLElement {
       const p = this.pos.get(node.id)!;
       const g = document.createElementNS(SVG, "g");
 
+      // Blink the node when its slot state actually changed since the last poll
+      // (but not when clearing to empty on Reset, and not on first sighting).
+      const slotSig = JSON.stringify(node.collections);
+      const prev = this.prevSlots.get(node.id);
+      const changed = prev !== undefined && prev !== slotSig && slotSig !== "{}";
+      this.prevSlots.set(node.id, slotSig);
+
       const c = document.createElementNS(SVG, "circle");
       c.setAttribute("cx", String(p.x));
       c.setAttribute("cy", String(p.y));
@@ -107,6 +161,7 @@ export class NodeGraph extends HTMLElement {
       let cls = "node-circle";
       if (node.initialized) cls += " init";
       if (node.id === this.selected) cls += " selected";
+      if (changed) cls += " blink";
       c.setAttribute("class", cls);
       c.addEventListener("click", () =>
         this.dispatchEvent(
@@ -141,60 +196,10 @@ export class NodeGraph extends HTMLElement {
         g.appendChild(t);
       });
 
-      this.svg.appendChild(g);
+      this.base.appendChild(g);
     }
   }
 
-  // flight animates a traveling dot for an inflight event; dropped flashes the
-  // link. Honors reduced-motion via CSS (the dot is hidden, state poll still shows
-  // the effect).
-  flight(ev: FlightEvent) {
-    if (!ev.from || !ev.to) return;
-    const pa = this.pos.get(ev.from);
-    const pb = this.pos.get(ev.to);
-    if (!pa || !pb) return;
-
-    if (ev.status === "dropped") {
-      this.flashLink(ev.from, ev.to);
-      return;
-    }
-    if (ev.status !== "inflight") return;
-
-    const dot = document.createElementNS(SVG, "circle");
-    dot.setAttribute("r", "6");
-    dot.setAttribute("class", `flight-dot ${ev.kind}`);
-    dot.setAttribute("cx", String(pa.x));
-    dot.setAttribute("cy", String(pa.y));
-    this.svg.appendChild(dot);
-
-    const dur = 600;
-    const start = performance.now();
-    const step = (now: number) => {
-      const t = Math.min((now - start) / dur, 1);
-      dot.setAttribute("cx", String(pa.x + (pb.x - pa.x) * t));
-      dot.setAttribute("cy", String(pa.y + (pb.y - pa.y) * t));
-      if (t < 1) {
-        requestAnimationFrame(step);
-      } else {
-        dot.remove();
-      }
-    };
-    requestAnimationFrame(step);
-  }
-
-  private flashLink(a: string, b: string) {
-    const pa = this.pos.get(a)!;
-    const pb = this.pos.get(b)!;
-    const flash = document.createElementNS(SVG, "line");
-    flash.setAttribute("x1", String(pa.x));
-    flash.setAttribute("y1", String(pa.y));
-    flash.setAttribute("x2", String(pb.x));
-    flash.setAttribute("y2", String(pb.y));
-    flash.setAttribute("stroke", "var(--bad)");
-    flash.setAttribute("stroke-width", "3");
-    this.svg.appendChild(flash);
-    setTimeout(() => flash.remove(), 400);
-  }
 }
 
 function slotLines(node: { collections: Record<string, Record<string, string>> }): string[] {
@@ -204,8 +209,8 @@ function slotLines(node: { collections: Record<string, Record<string, string>> }
     if (entries.length === 0) {
       out.push(`${coll}: ∅`);
     } else {
-      const summary = entries.map(([k, v]) => `${k}=${v}`).join(" ");
-      out.push(`${coll}: ${summary}`);
+      const summary = entries.map(([, v]) => v).join(" ");
+      out.push(`${coll}: [${summary}]`);
     }
     if (out.length >= 3) break;
   }

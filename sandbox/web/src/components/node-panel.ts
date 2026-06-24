@@ -20,10 +20,24 @@ collection Counter = T`;
 export class NodePanel extends HTMLElement {
   private state: SandboxState | null = null;
   private selected: string | null = null;
+  private lastSig = "";
+  // In-progress deploy code, preserved across the re-renders that do happen (e.g.
+  // changing the target node) so typing is never lost. Cleared after a deploy.
+  private draft: string | null = null;
 
   setData(state: SandboxState, selected: string | null) {
     this.state = state;
     this.selected = selected;
+    // Re-render only when something this panel actually shows changes — NOT on
+    // gossip/slot churn (the panel displays no slot values), so typing survives.
+    const sig = JSON.stringify({
+      hasPlan: this.hasPlan(),
+      selected,
+      ids: state.nodes.map((n) => n.id),
+      schema: state.schema,
+    });
+    if (sig === this.lastSig) return;
+    this.lastSig = sig;
     this.render();
   }
 
@@ -77,8 +91,11 @@ export class NodePanel extends HTMLElement {
     const codeWrap = el("div");
     codeWrap.appendChild(labelEl("DSL code"));
     const ta = document.createElement("textarea");
-    ta.value = SAMPLE;
+    ta.value = this.draft ?? SAMPLE;
     ta.spellcheck = false;
+    ta.addEventListener("input", () => {
+      this.draft = ta.value;
+    });
     codeWrap.appendChild(ta);
     card.appendChild(codeWrap);
 
@@ -87,6 +104,7 @@ export class NodePanel extends HTMLElement {
       btn.disabled = true;
       try {
         await deploy(select.value, ta.value);
+        this.draft = null;
         toast(`Deployed to ${select.value}`);
         this.refresh();
       } catch (e) {

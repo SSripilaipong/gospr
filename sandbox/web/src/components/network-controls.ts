@@ -1,14 +1,22 @@
-import { reset, setLink, setSpeed, type SandboxState } from "../api";
+import { reset, setSpeed, type SandboxState } from "../api";
 import { toast } from "../toast";
-import { linkKey } from "../util";
 
-// <network-controls> owns the gossip-speed slider, per-pair link toggles, and the
-// Reset button (rebuilds the cluster so new code can be deployed).
+// <network-controls> owns the message-delay field and the Reset button (rebuilds
+// the cluster so new code can be deployed). Partitioning links is done by clicking
+// them directly in the graph.
 export class NetworkControls extends HTMLElement {
   private state: SandboxState | null = null;
+  private lastSig = "";
 
   setData(state: SandboxState) {
     this.state = state;
+    // Skip re-render on gossip/slot churn so the delay field keeps focus while typing.
+    const sig = JSON.stringify({
+      ids: state.nodes.map((n) => n.id),
+      delayMs: state.delayMs,
+    });
+    if (sig === this.lastSig) return;
+    this.lastSig = sig;
     this.render();
   }
 
@@ -24,67 +32,34 @@ export class NetworkControls extends HTMLElement {
     const card = el("div", "card stack");
     card.appendChild(el("h2", "", "Network"));
 
-    // Speed slider.
+    // Message delay (typed value, in ms).
     const speedWrap = el("div");
-    speedWrap.appendChild(labelEl(`Message delay: ${s.delayMs} ms`));
-    const row = el("div", "slider-row");
-    const slider = document.createElement("input");
-    slider.type = "range";
-    slider.min = "0";
-    slider.max = "3000";
-    slider.step = "100";
-    slider.value = String(s.delayMs);
-    slider.addEventListener("input", () => {
-      speedWrap.firstElementChild!.textContent = `Message delay: ${slider.value} ms`;
-    });
-    slider.addEventListener("change", async () => {
+    speedWrap.appendChild(labelEl("Message delay (ms)"));
+    const row = el("div", "row");
+    const field = document.createElement("input");
+    field.type = "number";
+    field.min = "0";
+    field.step = "100";
+    field.inputMode = "numeric";
+    field.value = String(s.delayMs);
+    field.style.flex = "0 0 130px";
+    const commit = async () => {
+      const v = Math.max(0, Number(field.value) || 0);
+      field.value = String(v);
       try {
-        await setSpeed(Number(slider.value));
+        await setSpeed(v);
       } catch (e) {
         toast(String((e as Error).message), "error");
       }
-    });
-    row.appendChild(slider);
+    };
+    field.addEventListener("change", commit);
+    row.appendChild(field);
+    row.appendChild(el("span", "hint", "ms"));
     speedWrap.appendChild(row);
+    speedWrap.appendChild(
+      el("p", "hint", "Click a link in the graph to partition / reconnect it."),
+    );
     card.appendChild(speedWrap);
-
-    // Link toggles.
-    const ids = s.nodes.map((n) => n.id);
-    const linksWrap = el("div");
-    linksWrap.appendChild(el("h3", "", "Links"));
-    if (ids.length < 2) {
-      linksWrap.appendChild(el("p", "hint", "Need at least 2 nodes for links."));
-    }
-    for (let i = 0; i < ids.length; i++) {
-      for (let j = i + 1; j < ids.length; j++) {
-        const a = ids[i];
-        const b = ids[j];
-        const connected = s.links[linkKey(a, b)] ?? true;
-        const lt = el("div", "link-toggle");
-        const pair = el("span", "pair", `${a} ↔ ${b}`);
-        const badge = el(
-          "span",
-          `badge ${connected ? "init" : "empty-b"}`,
-          connected ? "● connected" : "✕ disconnected",
-        );
-        const btn = el("button", "", connected ? "Disconnect" : "Connect") as HTMLButtonElement;
-        btn.addEventListener("click", async () => {
-          try {
-            await setLink(a, b, !connected);
-            this.refresh();
-          } catch (e) {
-            toast(String((e as Error).message), "error");
-          }
-        });
-        const left = el("div", "row");
-        left.appendChild(pair);
-        left.appendChild(badge);
-        lt.appendChild(left);
-        lt.appendChild(btn);
-        linksWrap.appendChild(lt);
-      }
-    }
-    card.appendChild(linksWrap);
 
     // Reset.
     const resetWrap = el("div");

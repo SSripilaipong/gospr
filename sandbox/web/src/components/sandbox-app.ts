@@ -66,12 +66,12 @@ export class SandboxApp extends HTMLElement {
   }
 
   private onEvent(ev: FlightEvent) {
+    // Messages are no longer animated; we only react to Reset (state changes are
+    // shown by the node blink driven from the /state poll).
     if (ev.kind === "reset") {
       this.selected = null;
       void this.poll();
-      return;
     }
-    this.graph.flight(ev);
   }
 
   private async poll() {
