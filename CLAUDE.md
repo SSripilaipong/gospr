@@ -25,7 +25,9 @@ Maintain it by these rules:
 
 ```bash
 go build ./...
-go run .                          # start all three nodes (ports 8081/8082/8083)
+go run . server local                       # one node, gateway on :9050
+go run . server local --nodes=3 --port=9050 # 3 nodes, gateways on :9050/:9051/:9052
+go run . check file.gos                      # validate a .gos file (parse+typecheck+prove), no server
 go test -timeout 60s ./...        # always use -timeout; combinators can loop infinitely
 go vet ./...
 ```
@@ -72,7 +74,7 @@ designed-for but not implemented.
 
 ## Architecture
 
-Three nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls.
+Nodes run as goroutine groups and communicate only via `chan any` — no shared memory, no direct cross-node calls. The CLI (`gospr server local`) spins up N nodes (default 1, `--nodes` to scale), wiring each as the others' peer; one node is a degenerate cluster (no peers, gossip no-ops).
 
 - `POST /api/cluster/deploy` → DSL parsed → builder validates, type-checks, **and proves convergence** (via `prover`/Z3) → builds per-type `Model`s → node initializes and propagates `deployMsg` to peers
 - Every ~2s each node gossips a snapshot to one random peer; the peer merges each collection via that type's user-defined `merge` expr (e.g. `zip max` → elementwise max over the union of node slots)
@@ -96,7 +98,7 @@ parser  →  builder → prover  →  node / crdt
 ## File map
 
 ```
-main.go               wires 3 nodes + gateways, connects peer inboxes
+main.go               CLI entry (urfave/cli/v3): `server local` (--nodes/--port, wires N nodes+gateways+peers) and `check <file.gos>` (parse→Build, no server)
 
 numtype/
   numtype.go          leaf pkg (imports only math/big): NumType{Domain,Sign}, the six names, Parse/String/Sub/Join/Allows(*big.Rat). Zero value = top type `rat`; internal `Zero` sign types the literal 0
