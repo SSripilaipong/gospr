@@ -16,8 +16,11 @@ type Network struct {
 	delay        time.Duration
 }
 
+// defaultDelay is the artificial per-message delay a fresh Network starts with.
+const defaultDelay = 1000 * time.Millisecond
+
 func NewNetwork() *Network {
-	return &Network{disconnected: map[string]bool{}}
+	return &Network{disconnected: map[string]bool{}, delay: defaultDelay}
 }
 
 // linkKey builds the order-independent key for a node pair.

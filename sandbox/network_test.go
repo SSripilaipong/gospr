@@ -30,7 +30,7 @@ func TestNetworkReconnect(t *testing.T) {
 
 func TestNetworkDelay(t *testing.T) {
 	net := NewNetwork()
-	assert.Equal(t, time.Duration(0), net.Delay())
+	assert.Equal(t, defaultDelay, net.Delay())
 	net.SetDelay(250 * time.Millisecond)
 	assert.Equal(t, 250*time.Millisecond, net.Delay())
 }
