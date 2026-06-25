@@ -43,13 +43,23 @@ export async function getState(): Promise<SandboxState> {
   return res.json();
 }
 
-export async function deploy(target: string, code: string): Promise<void> {
+export interface DeployResult {
+  ok: boolean;
+  status: number;
+  message: string;
+}
+
+// deployRaw returns the HTTP status instead of throwing, so the modal can branch:
+// 200 = deployed, 400 = code rejected (keep current cluster), 409 = code is valid
+// but a plan is already pinned (caller resets, then redeploys).
+export async function deployRaw(target: string, code: string): Promise<DeployResult> {
   const res = await fetch("/api/sandbox/deploy", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ target, code }),
   });
-  await ok(res);
+  const message = res.ok ? "" : (await res.text()) || `${res.status} ${res.statusText}`;
+  return { ok: res.ok, status: res.status, message };
 }
 
 export async function reset(): Promise<void> {
@@ -85,6 +95,26 @@ export async function query(
   );
   await ok(res);
   return res.json();
+}
+
+// queryAll polls one (param-less) query across many nodes for the live per-node
+// label. It is resilient: a node that hasn't installed the collection yet (deploy
+// delay / partition) 400s on Query — those rejections are dropped via allSettled,
+// so one unavailable node never breaks the poll cycle. Returns nodeId -> result for
+// the nodes that answered.
+export async function queryAll(
+  nodes: string[],
+  collection: string,
+  q: string,
+): Promise<Record<string, unknown>> {
+  const settled = await Promise.allSettled(
+    nodes.map(async (node) => [node, await query(node, collection, q, [])] as const),
+  );
+  const out: Record<string, unknown> = {};
+  for (const r of settled) {
+    if (r.status === "fulfilled") out[r.value[0]] = r.value[1];
+  }
+  return out;
 }
 
 export async function setLink(a: string, b: string, connected: boolean): Promise<void> {

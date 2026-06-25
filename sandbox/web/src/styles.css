@@ -12,7 +12,8 @@
   --bad: #f85149;
   --warn: #d29922;
 
-  --radius: 10px;
+  --radius: 12px;
+  --radius-sm: 8px;
   --gap: 16px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -32,24 +33,42 @@ body {
 
 h1,
 h2,
-h3 {
+h3,
+h4 {
   margin: 0 0 0.5rem;
   font-weight: 650;
 }
+/* Dashboard heading caps: page title <=28px, card titles <=24px. */
+h1 {
+  font-size: 1.4rem;
+}
+h2 {
+  font-size: 1.05rem;
+}
+h3 {
+  font-size: 0.95rem;
+}
+
+/* ---- buttons ---- */
 
 button {
   font: inherit;
   cursor: pointer;
   min-height: 44px;
-  padding: 0 14px;
-  border-radius: 8px;
+  padding: 0 16px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface-2);
   color: var(--text);
-  transition: background 0.12s ease, border-color 0.12s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
 }
 button:hover {
   background: var(--border);
+}
+button:active {
+  transform: translateY(1px);
 }
 button:focus-visible {
   outline: 2px solid var(--accent);
@@ -67,25 +86,57 @@ button.primary:hover {
 button.danger {
   border-color: var(--bad);
   color: var(--bad);
+  background: transparent;
 }
 button.danger:hover {
   background: rgba(248, 81, 73, 0.15);
 }
+button.ghost {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+button.ghost:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+button.icon-btn {
+  min-height: 36px;
+  width: 36px;
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  font-size: 1rem;
+}
+button.icon-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+  transform: none;
 }
+
+/* ---- inputs ---- */
 
 input,
 textarea,
 select {
   font: inherit;
   color: var(--text);
+  /* Lift fill + border above the parent surface so the field reads as a control. */
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   width: 100%;
+}
+input:hover,
+textarea:hover,
+select:hover {
+  border-color: #44546a;
 }
 input:focus-visible,
 textarea:focus-visible,
@@ -105,31 +156,88 @@ label {
   margin-bottom: 4px;
 }
 
-/* ---- layout ---- */
+/* Restyled native select (strip OS arrow, custom chevron, dark option list). */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  color-scheme: dark;
+  padding-right: 2.5rem;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239bafc4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
 
-.app {
+/* ---- app shell ---- */
+
+.shell {
   display: grid;
-  grid-template-columns: 1fr 360px;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    "topbar topbar"
+    "canvas inspector";
   gap: var(--gap);
   padding: var(--gap);
   min-height: 100vh;
-  align-items: start;
 }
-.app header {
-  grid-column: 1 / -1;
+.shell[inert] {
+  /* Background is non-interactive while the modal is open. */
+  pointer-events: none;
+}
+
+.topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  flex-wrap: wrap;
+  padding-bottom: var(--gap);
+  border-bottom: 1px solid var(--border);
+}
+.topbar .brand {
   display: flex;
   align-items: baseline;
   gap: 12px;
+  flex-wrap: wrap;
 }
-.app header .sub {
+.topbar .brand h1 {
+  margin: 0;
+}
+.topbar .sub {
   color: var(--text-muted);
   font-size: 0.9rem;
 }
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.collection-select {
+  width: auto;
+  min-width: 150px;
+}
+
+.canvas {
+  grid-area: canvas;
+  min-width: 0;
+}
+.inspector {
+  grid-area: inspector;
+}
+
 @media (max-width: 880px) {
-  .app {
+  .shell {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "topbar"
+      "canvas"
+      "inspector";
   }
 }
+
+/* ---- cards ---- */
 
 .card {
   background: var(--surface);
@@ -142,6 +250,11 @@ label {
   flex-direction: column;
   gap: var(--gap);
 }
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
 
 /* ---- graph (focal point) ---- */
 
@@ -150,9 +263,8 @@ label {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 8px;
-  /* Cap the focal graph so it doesn't balloon on wide screens; centered in the
-     wider left column. Below the cap it stays responsive (width:100%). */
-  max-width: 600px;
+  /* Larger than before (more room for value/query chips), still capped + centered. */
+  max-width: 760px;
   margin-inline: auto;
 }
 svg.graph {
@@ -163,8 +275,7 @@ svg.graph {
 .link {
   stroke: var(--border);
   stroke-width: 2;
-  /* Clicks pass through to the wide .link-hit underneath. */
-  pointer-events: none;
+  pointer-events: none; /* clicks pass to the wide .link-hit underneath */
   transition: stroke-width 0.1s ease, stroke 0.1s ease;
 }
 .link.up {
@@ -175,7 +286,6 @@ svg.graph {
   stroke-dasharray: 6 6;
   opacity: 0.6;
 }
-/* Wide transparent, keyboard-operable hit target for partitioning a link. */
 .link-hit {
   stroke: transparent;
   stroke-width: 16;
@@ -191,19 +301,26 @@ svg.graph {
   stroke: var(--accent);
   stroke-opacity: 0.35;
 }
+.link-label {
+  fill: var(--warn);
+  font-size: 11px;
+  text-anchor: middle;
+  pointer-events: none;
+}
 .node-circle {
   fill: var(--surface-2);
   stroke: var(--border);
   stroke-width: 2;
   cursor: pointer;
-}
-.node-circle.selected {
-  stroke: var(--accent);
-  stroke-width: 3;
+  transition: stroke 0.12s ease;
 }
 .node-circle.init {
   fill: #16321f;
   stroke: var(--good);
+}
+.node-circle.selected {
+  stroke: var(--accent);
+  stroke-width: 3;
 }
 .node-label {
   fill: var(--text);
@@ -213,19 +330,42 @@ svg.graph {
   pointer-events: none;
 }
 .node-status {
-  font-size: 11px;
+  font-size: 10px;
   text-anchor: middle;
   pointer-events: none;
 }
-.node-slot {
+.node-status.good {
+  fill: var(--good);
+}
+.node-status.muted {
   fill: var(--text-muted);
-  font-size: 11px;
+}
+
+/* Node value / query chips below the circle. */
+.chip-text {
   font-family: var(--mono);
+  font-size: 12px;
   text-anchor: middle;
   pointer-events: none;
 }
-/* A node briefly brightens when its slot state changes (replaces the old gossip
-   flight dots). brightness() doesn't conflict with the stroke color classes. */
+.chip-bg.chip-value {
+  fill: var(--surface-2);
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.chip-text.chip-value {
+  fill: var(--text);
+}
+.chip-bg.chip-query {
+  fill: rgba(78, 161, 255, 0.16);
+  stroke: var(--accent);
+  stroke-width: 1;
+}
+.chip-text.chip-query {
+  fill: var(--accent);
+}
+
+/* A node briefly brightens when its slot state changes. */
 @keyframes node-blink {
   0% {
     filter: brightness(2.4);
@@ -238,7 +378,7 @@ svg.graph {
   animation: node-blink 0.7s ease-out;
 }
 
-/* ---- params grid ---- */
+/* ---- inspector internals ---- */
 
 .params {
   display: grid;
@@ -247,9 +387,8 @@ svg.graph {
 }
 .method-block {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 12px;
-  margin-bottom: 10px;
 }
 .method-block h4 {
   margin: 0 0 8px;
@@ -259,12 +398,100 @@ svg.graph {
 .hint {
   color: var(--text-muted);
   font-size: 0.8rem;
+  margin: 0;
+}
+.empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 20px 12px;
+  margin: 0;
 }
 
-.row {
+/* ---- deploy modal ---- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
   display: flex;
-  gap: 8px;
   align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 100;
+}
+.modal-backdrop[hidden] {
+  display: none;
+}
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  width: min(720px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: modal-in 0.14s ease-out;
+}
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.modal-head h2 {
+  margin: 0;
+}
+.modal .field {
+  display: flex;
+  flex-direction: column;
+}
+.modal .field select {
+  width: auto;
+  min-width: 160px;
+}
+.code-editor {
+  min-height: 320px;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  tab-size: 2;
+}
+.warn-banner {
+  background: rgba(210, 153, 34, 0.12);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  margin: 0;
+}
+.modal-err {
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid var(--bad);
+  color: var(--bad);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  margin: 0;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 /* ---- toast ---- */
@@ -279,7 +506,7 @@ svg.graph {
   border: 1px solid var(--border);
   background: var(--surface-2);
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
-  z-index: 50;
+  z-index: 200;
 }
 .toast.error {
   border-color: var(--bad);
@@ -292,48 +519,14 @@ svg.graph {
   margin-bottom: 2px;
 }
 
-.empty {
-  color: var(--text-muted);
-  text-align: center;
-  padding: 24px;
-}
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.8rem;
-  padding: 2px 8px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-}
-.badge.init {
-  color: var(--good);
-  border-color: var(--good);
-}
-.badge.empty-b {
-  color: var(--text-muted);
-}
-
-ul.reset {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-pre.result {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
-  font-family: var(--mono);
-  font-size: 0.85rem;
-  overflow-x: auto;
-  margin: 8px 0 0;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .node-circle.blink {
     animation: none;
+  }
+  .modal {
+    animation: none;
+  }
+  button:active {
+    transform: none;
   }
 }

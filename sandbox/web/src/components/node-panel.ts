@@ -1,40 +1,40 @@
-import {
-  deploy,
-  invoke,
-  query,
-  type ParamSchema,
-  type SandboxState,
-} from "../api";
+import { invoke, setSpeed, type ParamSchema, type SandboxState } from "../api";
 import { toast } from "../toast";
 
-const SAMPLE = `type T = vector rat0+
-merge T = zip max
-query T.Value = reduce + 0
-update T.Add k::rat0+ = local (+ k)
-collection Counter = T`;
-
-// <node-panel> is the quiet secondary surface for interacting with the selected
-// node: deploy code (before any plan), or invoke updates / run queries (after).
-// Params render as one labeled input per declared param — bare exact-rational
-// values, no quotes or commas.
+// <node-panel> is the right inspector rail. It has three regions:
+//   1. Live label — a cluster-wide picker choosing which (param-less) query is shown
+//      live on every node in the graph. Dispatches "set-live-query" {name|null}.
+//   2. Selected node — invoke blocks (updates) for the selected node + collection.
+//   3. Network — message-delay field + a hint that links are partitioned by clicking.
+// Deploy lives in <deploy-modal>, not here, so the rail stays quiet between deploys.
+//
+// Like the other components it signature-guards render: it re-renders only when a
+// field it displays changes, so the 750ms poll never wipes an in-progress input.
 export class NodePanel extends HTMLElement {
   private state: SandboxState | null = null;
   private selected: string | null = null;
+  private collection: string | null = null;
+  private liveQuery: string | null = null;
   private lastSig = "";
-  // In-progress deploy code, preserved across the re-renders that do happen (e.g.
-  // changing the target node) so typing is never lost. Cleared after a deploy.
-  private draft: string | null = null;
 
-  setData(state: SandboxState, selected: string | null) {
+  setData(
+    state: SandboxState,
+    selected: string | null,
+    collection: string | null,
+    liveQuery: string | null,
+  ) {
     this.state = state;
     this.selected = selected;
-    // Re-render only when something this panel actually shows changes — NOT on
-    // gossip/slot churn (the panel displays no slot values), so typing survives.
+    this.collection = collection;
+    this.liveQuery = liveQuery;
     const sig = JSON.stringify({
       hasPlan: this.hasPlan(),
       selected,
+      collection,
+      liveQuery,
       ids: state.nodes.map((n) => n.id),
-      schema: state.schema,
+      schema: collection ? state.schema[collection] : null,
+      delayMs: state.delayMs,
     });
     if (sig === this.lastSig) return;
     this.lastSig = sig;
@@ -54,89 +54,81 @@ export class NodePanel extends HTMLElement {
     this.replaceChildren();
 
     if (!this.hasPlan()) {
-      this.renderDeploy();
-      return;
-    }
-    if (!this.selected) {
       const card = el("div", "card");
-      card.appendChild(el("h2", "", "Interact"));
-      const p = el("p", "empty", "Select a node in the graph to invoke methods or run queries.");
-      card.appendChild(p);
+      card.appendChild(el("h2", "", "Inspector"));
+      card.appendChild(
+        el("p", "empty", "Deploy a type to begin. Use the Deploy button in the top bar."),
+      );
       this.appendChild(card);
+      this.appendChild(this.networkCard());
       return;
     }
-    this.renderInteract();
+
+    this.appendChild(this.liveLabelCard());
+    this.appendChild(this.selectedNodeCard());
+    this.appendChild(this.networkCard());
   }
 
-  private renderDeploy() {
+  private liveLabelCard(): HTMLElement {
     const card = el("div", "card stack");
-    card.appendChild(el("h2", "", "Deploy"));
+    card.appendChild(el("h2", "", "Live label"));
     card.appendChild(
-      el("p", "empty", "No plan deployed yet. Deploy a type to begin — it propagates from the target node to its peers."),
+      el("p", "hint", "Show a query's result live on every node in the graph."),
     );
 
-    const targetWrap = el("div");
-    targetWrap.appendChild(labelEl("Target node"));
-    const select = document.createElement("select");
-    for (const n of this.state!.nodes) {
-      const opt = document.createElement("option");
-      opt.value = n.id;
-      opt.textContent = n.id;
-      if (n.id === this.selected) opt.selected = true;
-      select.appendChild(opt);
+    const cs = this.collection ? this.state!.schema[this.collection] : undefined;
+    const queries = cs ? Object.keys(cs.queries) : [];
+    if (queries.length === 0) {
+      card.appendChild(el("p", "empty", "This collection has no queries."));
+      return card;
     }
-    targetWrap.appendChild(select);
-    card.appendChild(targetWrap);
 
-    const codeWrap = el("div");
-    codeWrap.appendChild(labelEl("DSL code"));
-    const ta = document.createElement("textarea");
-    ta.value = this.draft ?? SAMPLE;
-    ta.spellcheck = false;
-    ta.addEventListener("input", () => {
-      this.draft = ta.value;
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "Live label query");
+    const off = document.createElement("option");
+    off.value = "";
+    off.textContent = "Off";
+    select.appendChild(off);
+    for (const q of queries) {
+      const o = document.createElement("option");
+      o.value = q;
+      o.textContent = q;
+      if (q === this.liveQuery) o.selected = true;
+      select.appendChild(o);
+    }
+    select.addEventListener("change", () => {
+      this.dispatchEvent(
+        new CustomEvent("set-live-query", {
+          detail: { name: select.value || null },
+          bubbles: true,
+        }),
+      );
     });
-    codeWrap.appendChild(ta);
-    card.appendChild(codeWrap);
-
-    const btn = el("button", "primary", "Deploy") as HTMLButtonElement;
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      try {
-        await deploy(select.value, ta.value);
-        this.draft = null;
-        toast(`Deployed to ${select.value}`);
-        this.refresh();
-      } catch (e) {
-        toast(String((e as Error).message), "error");
-      } finally {
-        btn.disabled = false;
-      }
-    });
-    card.appendChild(btn);
-    this.appendChild(card);
+    card.appendChild(select);
+    return card;
   }
 
-  private renderInteract() {
-    const node = this.selected!;
-    const schema = this.state!.schema;
-
+  private selectedNodeCard(): HTMLElement {
     const card = el("div", "card stack");
+    if (!this.selected) {
+      card.appendChild(el("h2", "", "Inspect node"));
+      card.appendChild(el("p", "empty", "Select a node in the graph to invoke updates."));
+      return card;
+    }
+
+    const node = this.selected;
     card.appendChild(el("h2", "", `Node ${node}`));
 
-    for (const [collection, cs] of Object.entries(schema)) {
-      const section = el("div");
-      section.appendChild(el("h3", "", collection));
-
-      for (const [action, params] of Object.entries(cs.updates)) {
-        section.appendChild(this.methodBlock(node, collection, action, params, "update"));
-      }
-      for (const [q, params] of Object.entries(cs.queries)) {
-        section.appendChild(this.methodBlock(node, collection, q, params, "query"));
-      }
-      card.appendChild(section);
+    const cs = this.collection ? this.state!.schema[this.collection] : undefined;
+    const updates = cs ? Object.entries(cs.updates) : [];
+    if (updates.length === 0) {
+      card.appendChild(el("p", "empty", "This collection has no updates."));
+      return card;
     }
-    this.appendChild(card);
+    for (const [action, params] of updates) {
+      card.appendChild(this.methodBlock(node, this.collection!, action, params));
+    }
+    return card;
   }
 
   private methodBlock(
@@ -144,11 +136,9 @@ export class NodePanel extends HTMLElement {
     collection: string,
     name: string,
     params: ParamSchema[],
-    kind: "update" | "query",
   ): HTMLElement {
     const block = el("div", "method-block");
-    const heading = el("h4", "", `${kind === "update" ? "▸" : "?"} ${name}`);
-    block.appendChild(heading);
+    block.appendChild(el("h4", "", name));
 
     const inputs: HTMLInputElement[] = [];
     if (params.length > 0) {
@@ -157,7 +147,7 @@ export class NodePanel extends HTMLElement {
         const w = el("div");
         w.appendChild(labelEl(`${p.name} (${p.type})`));
         const input = document.createElement("input");
-        input.placeholder = `value, e.g. 5 or 1/2 (${p.type})`;
+        input.placeholder = `e.g. 5 or 1/2`;
         w.appendChild(input);
         inputs.push(input);
         grid.appendChild(w);
@@ -165,38 +155,55 @@ export class NodePanel extends HTMLElement {
       block.appendChild(grid);
     }
 
-    const result = el("pre", "result");
-    result.style.display = "none";
-
-    const btn = el(
-      "button",
-      kind === "update" ? "primary" : "",
-      kind === "update" ? "Invoke" : "Run query",
-    ) as HTMLButtonElement;
+    const btn = el("button", "primary", "Invoke") as HTMLButtonElement;
     btn.addEventListener("click", async () => {
       const values = inputs.map((i) => i.value.trim());
       btn.disabled = true;
       try {
-        if (kind === "update") {
-          await invoke(node, collection, name, values);
-          toast(`${name} applied on ${node}`);
-          this.refresh();
-        } else {
-          const v = await query(node, collection, name, values);
-          result.style.display = "block";
-          result.textContent = JSON.stringify(v);
-          toast(`${name} → ${JSON.stringify(v)}`);
-        }
+        await invoke(node, collection, name, values);
+        toast(`${name} applied on ${node}`);
+        this.refresh();
       } catch (e) {
         toast(String((e as Error).message), "error");
       } finally {
         btn.disabled = false;
       }
     });
-
     block.appendChild(btn);
-    block.appendChild(result);
     return block;
+  }
+
+  private networkCard(): HTMLElement {
+    const card = el("div", "card stack");
+    card.appendChild(el("h2", "", "Network"));
+
+    const speedWrap = el("div");
+    speedWrap.appendChild(labelEl("Message delay (ms)"));
+    const row = el("div", "row");
+    const field = document.createElement("input");
+    field.type = "number";
+    field.min = "0";
+    field.step = "100";
+    field.inputMode = "numeric";
+    field.value = String(this.state!.delayMs);
+    field.style.flex = "0 0 130px";
+    field.addEventListener("change", async () => {
+      const v = Math.max(0, Number(field.value) || 0);
+      field.value = String(v);
+      try {
+        await setSpeed(v);
+      } catch (e) {
+        toast(String((e as Error).message), "error");
+      }
+    });
+    row.appendChild(field);
+    row.appendChild(el("span", "hint", "ms"));
+    speedWrap.appendChild(row);
+    speedWrap.appendChild(
+      el("p", "hint", "Click a link in the graph to partition / reconnect it."),
+    );
+    card.appendChild(speedWrap);
+    return card;
   }
 }
 
