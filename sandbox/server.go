@@ -3,14 +3,18 @@ package sandbox
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"gospr/builder"
+	"gospr/node"
 	"gospr/parser"
 )
 
@@ -274,10 +278,40 @@ type applyRequest struct {
 	Params []string `json:"params"`
 }
 
+// parseLinearize reads the two consistency headers; see the gateway's copy for
+// the rationale (NaN/Inf/out-of-range are rejected so a bad ratio is a fast 400,
+// not a quorum timeout 503).
+func parseLinearize(r *http.Request) (on bool, ratio float64, err error) {
+	on = r.Header.Get("X-Gospr-Linearize") == "true"
+	ratio = 0.5
+	if raw := r.Header.Get("X-Gospr-Sync-Ratio"); raw != "" {
+		ratio, err = strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio > 1 {
+			return on, 0, fmt.Errorf("invalid X-Gospr-Sync-Ratio %q (want a fraction in [0,1])", raw)
+		}
+	}
+	return on, ratio, nil
+}
+
+// writeOpError maps ErrQuorumUnreached → 503, anything else → 400.
+func writeOpError(w http.ResponseWriter, err error) {
+	if errors.Is(err, node.ErrQuorumUnreached) {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	collection := r.PathValue("collection")
 	action := r.PathValue("action")
+
+	linearize, ratio, lerr := parseLinearize(r)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusBadRequest)
+		return
+	}
 
 	var req applyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -291,15 +325,21 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		params[i] = p
 	}
 
+	// Hold the cluster RLock for the WHOLE op (acks are serviced by each node's
+	// own message loop, not the cluster lock, so there's no deadlock), so a 200
+	// always refers to the current cluster.
 	err := s.withCluster(func(c *Cluster) error {
 		n, ok := c.node(id)
 		if !ok {
 			return fmt.Errorf("unknown node %q", id)
 		}
+		if linearize {
+			return n.ApplyLinearizable(r.Context(), collection, action, params, ratio)
+		}
 		return n.Apply(collection, action, params)
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeOpError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -309,6 +349,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	collection := r.PathValue("collection")
 	query := r.PathValue("query")
+
+	linearize, ratio, lerr := parseLinearize(r)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusBadRequest)
+		return
+	}
 
 	var params []any
 	if raw := r.URL.Query().Get("params"); raw != "" {
@@ -323,12 +369,18 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return fmt.Errorf("unknown node %q", id)
 		}
-		v, err := n.Query(collection, query, params)
+		var v any
+		var err error
+		if linearize {
+			v, err = n.QueryLinearizable(r.Context(), collection, query, params, ratio)
+		} else {
+			v, err = n.Query(collection, query, params)
+		}
 		result = v
 		return err
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeOpError(w, err)
 		return
 	}
 	writeJSON(w, result)

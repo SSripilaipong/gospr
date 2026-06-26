@@ -126,7 +126,7 @@ func runLocal(ctx context.Context, cmd *cli.Command) error {
 	for i, n := range ns {
 		for j, peer := range ns {
 			if i != j {
-				n.AddPeer(node.NewChanPeer(peer.Inbox()))
+				n.AddPeer(peer.ID(), node.NewChanPeer(peer.Inbox(), peer.Done()))
 			}
 		}
 	}

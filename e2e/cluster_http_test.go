@@ -57,6 +57,71 @@ func TestClusterHTTP_addPropagatesAcrossNodes(t *testing.T) {
 	}, 5*time.Second, 25*time.Millisecond, "value should propagate to a peer node")
 }
 
+// TestClusterHTTP_linearizedWriteThenRead drives a real 3-node cluster over HTTP
+// with gossip effectively OFF (1h interval), so only the synchronous quorum
+// protocol can move state. A linearized write (ratio 1.0) to node1's gateway,
+// then a linearized read from node2's gateway, sees the value without waiting on
+// gossip — proving the sync push/pull legs work end-to-end over HTTP.
+func TestClusterHTTP_linearizedWriteThenRead(t *testing.T) {
+	urls := startCluster(t, time.Hour)
+	deploy(t, urls[0], counterDSL)
+
+	// Wait for the deploy to propagate (independent of gossip) so every node holds
+	// the collection and can ack the ratio=1.0 write.
+	for _, u := range urls {
+		require.Eventually(t, func() bool {
+			_, status := queryValue(t, u, "Counter")
+			return status == http.StatusOK
+		}, 5*time.Second, 25*time.Millisecond, "deploy should propagate to every node")
+	}
+
+	linearizedAdd(t, urls[0], "Counter", "5", "1.0")
+
+	v, status := linearizedQuery(t, urls[1], "Counter", "1.0")
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, "5", v, "linearized read sees the write without gossip")
+}
+
+// linearizedAdd POSTs an update with the linearize headers and expects 200.
+func linearizedAdd(t *testing.T, base, collection, k, ratio string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"params": []any{k}})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("%s/api/collections/%s/Add", base, collection),
+		bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Gospr-Linearize", "true")
+	req.Header.Set("X-Gospr-Sync-Ratio", ratio)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode, "linearized Add should succeed")
+}
+
+// linearizedQuery GETs a query with the linearize headers, returning the decoded
+// value and status.
+func linearizedQuery(t *testing.T, base, collection, ratio string) (string, int) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/api/collections/%s/Value", base, collection), nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Gospr-Linearize", "true")
+	req.Header.Set("X-Gospr-Sync-Ratio", ratio)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	if resp.StatusCode != http.StatusOK {
+		return "", resp.StatusCode
+	}
+	var v string
+	require.NoError(t, json.Unmarshal(data, &v))
+	return v, resp.StatusCode
+}
+
 // startCluster wires n=3 nodes exactly like main.go (each peers with the other
 // two), starts their loops, and fronts each with a real HTTP server on an
 // ephemeral port. Returns the three base URLs. All servers are torn down via
@@ -71,7 +136,7 @@ func startCluster(t *testing.T, gossip time.Duration) []string {
 	for i, n := range nodes {
 		for j, peer := range nodes {
 			if i != j {
-				n.AddPeer(node.NewChanPeer(peer.Inbox()))
+				n.AddPeer(peer.ID(), node.NewChanPeer(peer.Inbox(), peer.Done()))
 			}
 		}
 	}

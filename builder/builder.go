@@ -1,6 +1,9 @@
 package builder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 
@@ -44,6 +47,11 @@ type BuiltPlan struct {
 	Models      map[string]*Model
 	Functions   map[string]crdt.Function
 	Collections []BuiltCollection
+	// Fingerprint identifies "same deployed DSL" across nodes: a hash of a
+	// canonical encoding of the input parser.Plan. Two nodes that received the
+	// same deploy share it, so a linearized op's peer can ack only when it runs
+	// the same plan (a same-name/different-semantics collection is rejected).
+	Fingerprint string
 }
 
 // vkind tags the builder's internal value type. vkUnknown is a sentinel used
@@ -411,7 +419,27 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		collections = append(collections, BuiltCollection{Name: cs.Name, Spec: m})
 	}
 
-	return BuiltPlan{Models: models, Functions: funcs, Collections: collections}, nil
+	return BuiltPlan{
+		Models:      models,
+		Functions:   funcs,
+		Collections: collections,
+		Fingerprint: fingerprint(plan),
+	}, nil
+}
+
+// fingerprint hashes a canonical encoding of the input Plan. Plan is flat slices
+// of defs (no maps), so json.Marshal is order-stable and yields the same digest
+// on every node that received the same deploy. Expr.Num (*big.Rat) marshals via
+// its TextMarshaler, so numeric literals are captured exactly.
+func fingerprint(plan parser.Plan) string {
+	data, err := json.Marshal(plan)
+	if err != nil {
+		// Plan is plain data with no un-marshalable fields; treat an unexpected
+		// failure as an empty (always-mismatching) fingerprint rather than panicking.
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // ---- name resolution -----------------------------------------------

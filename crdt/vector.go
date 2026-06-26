@@ -105,13 +105,10 @@ func (v *VectorCRDT) Apply(action string, payload []any) error {
 // vector via `reduce` — and returns the result (rat, bool, or string). The
 // lock is held across eval because a `reduce` sub-expression reads v.state.
 func (v *VectorCRDT) Query(name string, params []any) (any, error) {
-	m, ok := v.queries[name]
-	if !ok {
-		return nil, fmt.Errorf("unknown query: %s", name)
+	if err := v.ValidateQuery(name, params); err != nil {
+		return nil, err
 	}
-	if len(params) != len(m.Params) {
-		return nil, fmt.Errorf("query %s expects %d params, got %d", name, len(m.Params), len(params))
-	}
+	m := v.queries[name]
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	val, err := v.eval(m.Body, nil, 0)
@@ -119,6 +116,26 @@ func (v *VectorCRDT) Query(name string, params []any) (any, error) {
 		return nil, fmt.Errorf("query %s: %w", name, err)
 	}
 	return rtToAny(val)
+}
+
+// ValidateQuery is the non-evaluating prefix of Query: it checks the query
+// exists, its param arity matches, and each param binds to its declared numeric
+// type — but it does NOT evaluate the body. A linearized read calls this as a
+// fast preflight so a malformed query is a 400 before any quorum work, and so a
+// valid query is never spuriously failed against stale pre-sync local state
+// (body evaluation is state-dependent: recursion is bounded by maxEvalDepth).
+func (v *VectorCRDT) ValidateQuery(name string, params []any) error {
+	m, ok := v.queries[name]
+	if !ok {
+		return fmt.Errorf("unknown query: %s", name)
+	}
+	if len(params) != len(m.Params) {
+		return fmt.Errorf("query %s expects %d params, got %d", name, len(m.Params), len(params))
+	}
+	if _, err := bindParams(m.Params, params); err != nil {
+		return fmt.Errorf("query %s: %w", name, err)
+	}
+	return nil
 }
 
 // Merge applies the `zip fn` over the union of node slots. The merged result
@@ -129,6 +146,13 @@ func (v *VectorCRDT) Merge(snapshot any) error {
 	if !ok {
 		return fmt.Errorf("invalid VectorCRDT snapshot type %T", snapshot)
 	}
+	return v.mergeRemote(remote)
+}
+
+// mergeRemote applies the `zip fn` over the union of local and remote slots and
+// swaps the result in atomically (a failing user merge leaves state untouched).
+// Shared by Merge (in-process gossip) and MergeWire (the sync protocol).
+func (v *VectorCRDT) mergeRemote(remote map[string]*big.Rat) error {
 	if v.merge.Kind != parser.ExprZip || v.merge.Fn == nil {
 		return fmt.Errorf("merge is not a zip expr")
 	}
@@ -168,6 +192,35 @@ func (v *VectorCRDT) Snapshot() any {
 	}
 	v.mu.Unlock()
 	return cp
+}
+
+// SnapshotWire is the transport-safe analogue of Snapshot: it emits each slot as
+// an exact-rational string (RatString), so nothing is lost and no *big.Rat is
+// aliased across the wire (strings are immutable copies). Used by the sync
+// (quorum) protocol; gossip keeps using Snapshot.
+func (v *VectorCRDT) SnapshotWire() WireSnapshot {
+	v.mu.Lock()
+	slots := make(map[string]string, len(v.state))
+	for k, val := range v.state {
+		slots[k] = val.RatString()
+	}
+	v.mu.Unlock()
+	return WireSnapshot{Slots: slots}
+}
+
+// MergeWire parses each WireSnapshot slot into a fresh *big.Rat (rejecting
+// malformed) and runs the same zip-merge path as Merge, so merge semantics stay
+// identical to gossip. Used by the sync (quorum) protocol.
+func (v *VectorCRDT) MergeWire(snap WireSnapshot) error {
+	remote := make(map[string]*big.Rat, len(snap.Slots))
+	for k, s := range snap.Slots {
+		q, ok := new(big.Rat).SetString(s)
+		if !ok {
+			return fmt.Errorf("invalid wire snapshot slot %q: %q", k, s)
+		}
+		remote[k] = q
+	}
+	return v.mergeRemote(remote)
 }
 
 // ---- expression evaluation -----------------------------------------

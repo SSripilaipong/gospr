@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gospr/builder"
 	"gospr/node"
@@ -9,7 +10,9 @@ import (
 	"gospr/swagger"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -90,9 +93,41 @@ type applyRequest struct {
 	Params []string `json:"params"`
 }
 
+// parseLinearize reads the two consistency headers. X-Gospr-Linearize=="true"
+// turns on synchronous mode; X-Gospr-Sync-Ratio is the target fraction in [0,1]
+// (absent → 0.5). NaN/±Inf/out-of-range/malformed ratios are rejected — note
+// strconv.ParseFloat("NaN") succeeds, and a NaN ratio makes the quorum predicate
+// always false, so an unrejected NaN would turn a fast 400 into a timeout 503.
+func parseLinearize(r *http.Request) (on bool, ratio float64, err error) {
+	on = r.Header.Get("X-Gospr-Linearize") == "true"
+	ratio = 0.5
+	if raw := r.Header.Get("X-Gospr-Sync-Ratio"); raw != "" {
+		ratio, err = strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio > 1 {
+			return on, 0, fmt.Errorf("invalid X-Gospr-Sync-Ratio %q (want a fraction in [0,1])", raw)
+		}
+	}
+	return on, ratio, nil
+}
+
+// writeOpError maps a node op error to a status: ErrQuorumUnreached → 503,
+// anything else → 400 (today's behavior).
+func writeOpError(w http.ResponseWriter, err error) {
+	if errors.Is(err, node.ErrQuorumUnreached) {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
 func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	action := r.PathValue("action")
+	linearize, ratio, lerr := parseLinearize(r)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusBadRequest)
+		return
+	}
 	var req applyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON (numeric params must be strings, e.g. \"0.1\")", http.StatusBadRequest)
@@ -101,6 +136,14 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	params := make([]any, len(req.Params))
 	for i, s := range req.Params {
 		params[i] = s
+	}
+	if linearize {
+		if err := g.node.ApplyLinearizable(r.Context(), collection, action, params, ratio); err != nil {
+			writeOpError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	if err := g.node.Apply(collection, action, params); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -112,6 +155,11 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	query := r.PathValue("query")
+	linearize, ratio, lerr := parseLinearize(r)
+	if lerr != nil {
+		http.Error(w, lerr.Error(), http.StatusBadRequest)
+		return
+	}
 	var params []any
 	if raw := r.URL.Query().Get("params"); raw != "" {
 		// Pass each param through as a string; the CRDT parses it into an exact
@@ -120,9 +168,15 @@ func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 			params = append(params, strings.TrimSpace(s))
 		}
 	}
-	val, err := g.node.Query(collection, query, params)
+	var val any
+	var err error
+	if linearize {
+		val, err = g.node.QueryLinearizable(r.Context(), collection, query, params, ratio)
+	} else {
+		val, err = g.node.Query(collection, query, params)
+	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeOpError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

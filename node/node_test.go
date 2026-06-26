@@ -28,7 +28,7 @@ func TestMessageKind(t *testing.T) {
 func TestStopHaltsGossip(t *testing.T) {
 	n := New("node1", WithGossipInterval(10*time.Millisecond))
 	peer := &recordingPeer{}
-	n.AddPeer(peer)
+	n.AddPeer("node2", peer)
 	require.NoError(t, n.Initialize(builder.BuiltPlan{}))
 	n.Start()
 

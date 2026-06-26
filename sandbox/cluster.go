@@ -29,14 +29,18 @@ func newCluster(n int, net *Network, hub *Hub) *Cluster {
 	for i := range n {
 		id := fmt.Sprintf("node%d", i+1)
 		c.ids = append(c.ids, id)
-		c.nodes[id] = node.New(id, node.WithGossipInterval(1500*time.Millisecond))
+		// A modest sync timeout keeps a partitioned linearized op's 503 (and the
+		// Reset that may wait behind it) responsive in the UI.
+		c.nodes[id] = node.New(id,
+			node.WithGossipInterval(1500*time.Millisecond),
+			node.WithSyncTimeout(2*time.Second))
 	}
 	for _, from := range c.ids {
 		for _, to := range c.ids {
 			if from == to {
 				continue
 			}
-			c.nodes[from].AddPeer(interceptingPeer{
+			c.nodes[from].AddPeer(to, interceptingPeer{
 				from:  from,
 				to:    to,
 				inbox: c.nodes[to].Inbox(),
