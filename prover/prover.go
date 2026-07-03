@@ -35,24 +35,29 @@ import (
 type symKind int
 
 const (
-	symConst symKind = iota // num
-	symVar                  // name
-	symBin                  // op in + - * max min, operands a,b
-	symCmp                  // op in > < >= <= == /=, operands a,b (a boolean term)
-	symIte                  // if cond then a else b
+	symConst  symKind = iota // num
+	symVar                   // name
+	symBin                   // op in + - * max min, operands a,b
+	symCmp                   // op in > < >= <= == /=, operands a,b (a boolean term)
+	symIte                   // if cond then a else b
+	symStruct                // struct value: fields (each a sym)
 )
 
 type sym struct {
-	kind symKind
-	num  *big.Rat
-	name string
-	op   string
-	cond *sym
-	a, b *sym
+	kind   symKind
+	num    *big.Rat
+	name   string
+	op     string
+	cond   *sym
+	a, b   *sym
+	fields map[string]sym // symStruct
 }
 
 func cst(f *big.Rat) sym { return sym{kind: symConst, num: f} }
 func vr(name string) sym { return sym{kind: symVar, name: name} }
+func structSym(fields map[string]sym) sym {
+	return sym{kind: symStruct, fields: fields}
+}
 func bin(op string, a, b sym) sym {
 	return sym{kind: symBin, op: op, a: &a, b: &b}
 }
@@ -106,6 +111,41 @@ func (p *prover) eval(e parser.Expr, env map[string]sym, visited map[string]bool
 		return p.evalApp(e, env, visited)
 	case parser.ExprGuards:
 		return p.evalGuards(e, env, visited)
+	case parser.ExprStructLit:
+		fields := make(map[string]sym, len(e.StructFields))
+		for _, sf := range e.StructFields {
+			if sf.Value == nil {
+				return sym{}, nil, fmt.Errorf("struct field %q has no value", sf.Name)
+			}
+			v, fn, err := p.eval(*sf.Value, env, visited)
+			if err != nil {
+				return sym{}, nil, err
+			}
+			if fn != nil {
+				return sym{}, nil, fmt.Errorf("struct field %q is not a value", sf.Name)
+			}
+			fields[sf.Name] = v
+		}
+		return structSym(fields), nil, nil
+	case parser.ExprField:
+		if e.Target == nil {
+			return sym{}, nil, fmt.Errorf("field access has no target")
+		}
+		tv, tf, err := p.eval(*e.Target, env, visited)
+		if err != nil {
+			return sym{}, nil, err
+		}
+		if tf != nil {
+			return sym{}, nil, fmt.Errorf("cannot access a field of a function")
+		}
+		if tv.kind != symStruct {
+			return sym{}, nil, fmt.Errorf("cannot access field %q of a non-struct value", e.Field)
+		}
+		fv, ok := tv.fields[e.Field]
+		if !ok {
+			return sym{}, nil, fmt.Errorf("struct has no field %q", e.Field)
+		}
+		return fv, nil, nil
 	case parser.ExprStrLit:
 		return sym{}, nil, fmt.Errorf("string values cannot appear in a merge/update function")
 	case parser.ExprReduce, parser.ExprZip, parser.ExprLocal:
@@ -270,11 +310,31 @@ type goal struct {
 	rhs  sym
 }
 
+// symVarOf builds a symbolic value for a variable of element type t named after
+// path-index prefixes (a struct field i of "a" becomes "a_i", nesting to
+// "a_i_j"), appending each scalar leaf's varDecl. Path-index names keep DSL
+// identifiers (possibly Unicode) out of the solver, exactly as update params map
+// to p0/p1.
+func symVarOf(prefix string, t crdt.ElemT, decls *[]varDecl) sym {
+	if t.Struct {
+		fields := make(map[string]sym, len(t.Fields))
+		for i, f := range t.Fields {
+			fields[f.Name] = symVarOf(fmt.Sprintf("%s_%d", prefix, i), f.Type, decls)
+		}
+		return structSym(fields)
+	}
+	*decls = append(*decls, varDecl{prefix, t.Num})
+	return vr(prefix)
+}
+
 // Prove discharges both CvRDT obligations for a type. It proves the merge laws
 // first (a certified join is what makes the induced-order update check
 // meaningful), then each update's inflationary property. Any obligation that
 // cannot be proven yields an error, which builder turns into a deploy rejection.
-func Prove(elem numtype.NumType, merge parser.Expr, updates map[string]crdt.Method, funcs map[string]crdt.Function) error {
+// For a struct element the merge fn is a product (or joint) map over the fields;
+// each obligation's struct equality is discharged as the conjunction of its leaf
+// scalar equalities in one Z3 call (see smt.go).
+func Prove(elem crdt.ElemT, merge parser.Expr, updates map[string]crdt.Method, funcs map[string]crdt.Function) error {
 	if merge.Kind != parser.ExprZip || merge.Fn == nil {
 		return fmt.Errorf("merge is not a zip expr")
 	}
@@ -283,47 +343,53 @@ func Prove(elem numtype.NumType, merge parser.Expr, updates map[string]crdt.Meth
 	if err != nil {
 		return fmt.Errorf("merge: %w", err)
 	}
-
-	a, b, c := vr("a"), vr("b"), vr("c")
 	apply2 := func(args ...sym) (sym, error) { return f.call(args) }
 
 	// Commutativity: f(a,b) = f(b,a).
-	fab, err := apply2(a, b)
+	var commDecls []varDecl
+	ca := symVarOf("a", elem, &commDecls)
+	cb := symVarOf("b", elem, &commDecls)
+	fab, err := apply2(ca, cb)
 	if err != nil {
 		return err
 	}
-	fba, err := apply2(b, a)
+	fba, err := apply2(cb, ca)
 	if err != nil {
 		return err
 	}
 	// Associativity: f(a,f(b,c)) = f(f(a,b),c).
-	fbc, err := apply2(b, c)
+	var assocDecls []varDecl
+	aa := symVarOf("a", elem, &assocDecls)
+	ab := symVarOf("b", elem, &assocDecls)
+	ac := symVarOf("c", elem, &assocDecls)
+	fbc, err := apply2(ab, ac)
 	if err != nil {
 		return err
 	}
-	left, err := apply2(a, fbc)
+	left, err := apply2(aa, fbc)
 	if err != nil {
 		return err
 	}
-	fab2, err := apply2(a, b)
+	fab2, err := apply2(aa, ab)
 	if err != nil {
 		return err
 	}
-	right, err := apply2(fab2, c)
+	right, err := apply2(fab2, ac)
 	if err != nil {
 		return err
 	}
 	// Idempotence: f(a,a) = a.
-	faa, err := apply2(a, a)
+	var idemDecls []varDecl
+	ia := symVarOf("a", elem, &idemDecls)
+	faa, err := apply2(ia, ia)
 	if err != nil {
 		return err
 	}
 
-	elemVar := varDecl{"a", elem}
 	mergeGoals := []goal{
-		{"commutativity", []varDecl{{"a", elem}, {"b", elem}}, fab, fba},
-		{"associativity", []varDecl{{"a", elem}, {"b", elem}, {"c", elem}}, left, right},
-		{"idempotence", []varDecl{elemVar}, faa, a},
+		{"commutativity", commDecls, fab, fba},
+		{"associativity", assocDecls, left, right},
+		{"idempotence", idemDecls, faa, ia},
 	}
 	for _, g := range mergeGoals {
 		if err := checkGoal(g); err != nil {
@@ -331,18 +397,17 @@ func Prove(elem numtype.NumType, merge parser.Expr, updates map[string]crdt.Meth
 		}
 	}
 
-	// Updates: prove inflationary in merge's induced order. Each update param is
-	// declared from its own numeric type (not the element type).
+	// Updates: prove inflationary in merge's induced order. The slot is the element
+	// type (scalar or struct); each update param is a scalar declared from its own
+	// numeric type and mapped to an internal SMT name (p0, p1, …).
 	for _, name := range sortedKeys(updates) {
 		m := updates[name]
 		if m.Body.Kind != parser.ExprLocal || m.Body.Fn == nil {
 			return fmt.Errorf("update %s is not a local expr", name)
 		}
-		// Map each param to an internal SMT name (p0, p1, …). DSL identifiers may
-		// contain Unicode (parser uses unicode.IsLetter), which is not a valid
-		// SMT-LIB symbol, so a param name must never reach the solver verbatim.
+		var decls []varDecl
+		x := symVarOf(slotVar, elem, &decls)
 		env := make(map[string]sym, len(m.Params))
-		decls := []varDecl{{slotVar, elem}}
 		for i, prm := range m.Params {
 			nt, ok := numtype.Parse(prm.Type)
 			if !ok {
@@ -356,7 +421,6 @@ func Prove(elem numtype.NumType, merge parser.Expr, updates map[string]crdt.Meth
 		if err != nil {
 			return fmt.Errorf("update %s: %w", name, err)
 		}
-		x := vr(slotVar)
 		hx, err := h.call([]sym{x})
 		if err != nil {
 			return fmt.Errorf("update %s: %w", name, err)

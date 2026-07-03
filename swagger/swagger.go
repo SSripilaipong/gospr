@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"gospr/builder"
+	"gospr/crdt"
 	"gospr/numtype"
 	"gospr/parser"
 	"strings"
@@ -87,7 +88,7 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	for _, bc := range plan.Collections {
 		if m, ok := bc.Spec.(*builder.Model); ok {
 			for queryName, qs := range m.Queries {
-				addGetPath(paths, bc.Name, queryName, qs.Params, qs.Result, qs.ResultNum)
+				addGetPath(paths, bc.Name, queryName, qs.Params, qs.Result, qs.ResultNum, qs.ResultStruct)
 			}
 			for actionName, us := range m.Updates {
 				addPostPath(paths, bc.Name, actionName, us.Params)
@@ -103,14 +104,18 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	return json.MarshalIndent(spec, "", "  ")
 }
 
-func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType, resultNum numtype.NumType) {
+func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType, resultNum numtype.NumType, resultStruct *crdt.ElemT) {
 	key := "/api/collections/" + collection + "/" + queryName
+	resultSchema := valTypeSchema(result, resultNum)
+	if resultStruct != nil {
+		resultSchema = structSchema(*resultStruct)
+	}
 	op := &operation{
 		Summary: queryName + " on " + collection,
 		Responses: map[string]response{
 			"200": {
 				Description: "Query result",
-				Content:     map[string]mediaType{"application/json": {Schema: valTypeSchema(result, resultNum)}},
+				Content:     map[string]mediaType{"application/json": {Schema: resultSchema}},
 			},
 			"400": {Description: "Error"},
 		},
@@ -191,6 +196,21 @@ func valTypeSchema(t parser.ValType, nt numtype.NumType) schema {
 	default:
 		return numSchema(nt)
 	}
+}
+
+// structSchema renders a struct element/result type as an OpenAPI object schema,
+// each field a nested schema (scalar leaves are string-typed exact rationals),
+// recursing for nested structs.
+func structSchema(t crdt.ElemT) schema {
+	props := make(map[string]schema, len(t.Fields))
+	for _, f := range t.Fields {
+		if f.Type.Struct {
+			props[f.Name] = structSchema(f.Type)
+		} else {
+			props[f.Name] = numSchema(f.Type.Num)
+		}
+	}
+	return schema{Type: "object", Properties: props}
 }
 
 // numSchema renders a numeric type as a JSON schema. Numbers cross the boundary

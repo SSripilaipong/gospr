@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"os/exec"
+	"sort"
 
 	"gospr/numtype"
 )
@@ -72,9 +73,44 @@ func buildScript(g goal) string {
 			fmt.Fprintf(&b, "(assert (= %s 0.0))\n", d.name)
 		}
 	}
-	fmt.Fprintf(&b, "(assert (not (= %s %s)))\n", serialize(g.lhs), serialize(g.rhs))
+	// A struct obligation lhs == rhs decomposes to the conjunction of its leaf
+	// scalar equalities; assert the negation of that conjunction (unsat ⇒ every
+	// leaf equal ⇒ proven). A scalar obligation is the degenerate single-leaf case.
+	eqs := leafEqs(g.lhs, g.rhs)
+	fmt.Fprintf(&b, "(assert (not %s))\n", conjunction(eqs))
 	b.WriteString("(check-sat)\n")
 	return b.String()
+}
+
+// leafEqs flattens a (possibly struct) equality into per-leaf scalar equality
+// s-expressions. Both sides share the same shape (they are the two sides of one
+// obligation over the same element type), so struct fields are matched by name.
+func leafEqs(l, r sym) []string {
+	if l.kind == symStruct && r.kind == symStruct {
+		var out []string
+		for _, k := range sortedFields(l.fields) {
+			out = append(out, leafEqs(l.fields[k], r.fields[k])...)
+		}
+		return out
+	}
+	return []string{fmt.Sprintf("(= %s %s)", serialize(l), serialize(r))}
+}
+
+// conjunction joins leaf equalities with `and`. A single leaf needs no wrapper.
+func conjunction(eqs []string) string {
+	if len(eqs) == 1 {
+		return eqs[0]
+	}
+	return "(and " + strings.Join(eqs, " ") + ")"
+}
+
+func sortedFields(m map[string]sym) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // serialize renders a sym to an SMT-LIB s-expression. max/min become ite over a

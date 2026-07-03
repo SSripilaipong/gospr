@@ -26,6 +26,10 @@ type Method struct {
 	// Result == TypeReal); it names the domain/sign in the Swagger schema's
 	// description (numeric fields are string-typed, exact rationals on the wire).
 	ResultNum numtype.NumType
+	// ResultStruct is non-nil when a query returns a whole struct value; it carries
+	// the resolved struct descriptor so swagger can render an object schema. Nil
+	// for scalar/bool/string results (described by Result/ResultNum).
+	ResultStruct *ElemT
 }
 
 // Function is a resolved user-defined function: its params plus a resolved
@@ -43,7 +47,8 @@ type Function struct {
 // the prover discharges (no float rounding to break convergence).
 type VectorCRDT struct {
 	nodeID  string
-	state   map[string]*big.Rat
+	elem    ElemT // resolved element descriptor (scalar or struct); drives zero-slot defaults and wire decoding
+	state   map[string]rtVal
 	merge   parser.Expr // a Zip expr (Fn resolved)
 	queries map[string]Method
 	updates map[string]Method
@@ -51,10 +56,11 @@ type VectorCRDT struct {
 	mu      sync.Mutex
 }
 
-func NewVector(nodeID string, merge parser.Expr, queries, updates map[string]Method, funcs map[string]Function) *VectorCRDT {
+func NewVector(nodeID string, elem ElemT, merge parser.Expr, queries, updates map[string]Method, funcs map[string]Function) *VectorCRDT {
 	return &VectorCRDT{
 		nodeID:  nodeID,
-		state:   make(map[string]*big.Rat),
+		elem:    elem,
+		state:   make(map[string]rtVal),
 		merge:   merge,
 		queries: queries,
 		updates: updates,
@@ -66,6 +72,33 @@ func NewVector(nodeID string, merge parser.Expr, queries, updates map[string]Met
 // because *big.Rat is mutable: sharing a pointer would let a caller (or a peer's
 // snapshot) mutate a value aliased into another CRDT's state and corrupt it.
 func cloneRat(r *big.Rat) *big.Rat { return new(big.Rat).Set(r) }
+
+// cloneSlot deep-copies a slot value (scalar or struct). Like cloneRat it is used
+// at the Snapshot/Merge/Apply boundaries so no mutable *big.Rat is aliased across
+// CRDTs.
+func cloneSlot(val rtVal) rtVal {
+	if val.kind == kStruct {
+		fields := make(map[string]rtVal, len(val.fields))
+		for k, f := range val.fields {
+			fields[k] = cloneSlot(f)
+		}
+		return structVal(fields)
+	}
+	return numVal(cloneRat(val.num))
+}
+
+// zeroSlot builds the default value for an absent slot: 0 for a scalar element,
+// or a struct with every (nested) leaf set to 0.
+func zeroSlot(t ElemT) rtVal {
+	if t.Struct {
+		fields := make(map[string]rtVal, len(t.Fields))
+		for _, f := range t.Fields {
+			fields[f.Name] = zeroSlot(f.Type)
+		}
+		return structVal(fields)
+	}
+	return numVal(new(big.Rat))
+}
 
 // Apply runs an update's `local <unary fn>` against the local node's slot.
 func (v *VectorCRDT) Apply(action string, payload []any) error {
@@ -83,21 +116,21 @@ func (v *VectorCRDT) Apply(action string, payload []any) error {
 	if m.Body.Kind != parser.ExprLocal || m.Body.Fn == nil {
 		return fmt.Errorf("action %s: body is not a local expr", action)
 	}
-	f, err := v.evalFn(*m.Body.Fn, env, 1)
+	f, err := v.evalFuncVal(*m.Body.Fn, env, 1, 0)
 	if err != nil {
 		return fmt.Errorf("action %s: %w", action, err)
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	cur := v.state[v.nodeID]
-	if cur == nil {
-		cur = new(big.Rat) // absent slot defaults to 0
+	cur, ok := v.state[v.nodeID]
+	if !ok {
+		cur = zeroSlot(v.elem) // absent slot defaults to 0 (scalar) or a zero struct
 	}
-	next, err := f([]*big.Rat{cur})
+	next, err := apply(f, []rtVal{cur})
 	if err != nil {
 		return fmt.Errorf("action %s: %w", action, err)
 	}
-	v.state[v.nodeID] = cloneRat(next) // detach from any aliased operand
+	v.state[v.nodeID] = cloneSlot(next) // detach from any aliased operand
 	return nil
 }
 
@@ -142,7 +175,7 @@ func (v *VectorCRDT) ValidateQuery(name string, params []any) error {
 // is built in a copy and swapped in only after every slot succeeds, so a
 // failing user-defined merge fn leaves state untouched.
 func (v *VectorCRDT) Merge(snapshot any) error {
-	remote, ok := snapshot.(map[string]*big.Rat)
+	remote, ok := snapshot.(map[string]rtVal)
 	if !ok {
 		return fmt.Errorf("invalid VectorCRDT snapshot type %T", snapshot)
 	}
@@ -151,33 +184,34 @@ func (v *VectorCRDT) Merge(snapshot any) error {
 
 // mergeRemote applies the `zip fn` over the union of local and remote slots and
 // swaps the result in atomically (a failing user merge leaves state untouched).
-// Shared by Merge (in-process gossip) and MergeWire (the sync protocol).
-func (v *VectorCRDT) mergeRemote(remote map[string]*big.Rat) error {
+// Shared by Merge (in-process gossip) and MergeWire (the sync protocol). Slot
+// values are runtime values (scalar or struct); the zip fn is (E,E)->E.
+func (v *VectorCRDT) mergeRemote(remote map[string]rtVal) error {
 	if v.merge.Kind != parser.ExprZip || v.merge.Fn == nil {
 		return fmt.Errorf("merge is not a zip expr")
 	}
-	fn, err := v.evalFn(*v.merge.Fn, nil, 2)
+	fn, err := v.evalFuncVal(*v.merge.Fn, nil, 2, 0)
 	if err != nil {
 		return err
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	// Deep-clone every value into the working copy: *big.Rat is mutable, so
-	// sharing pointers would alias local state with the (possibly still-live)
-	// remote snapshot or with merge-fn operands.
-	merged := make(map[string]*big.Rat, len(v.state))
+	// Deep-clone every value into the working copy: slot values hold mutable
+	// *big.Rat, so sharing them would alias local state with the (possibly
+	// still-live) remote snapshot or with merge-fn operands.
+	merged := make(map[string]rtVal, len(v.state))
 	for k, val := range v.state {
-		merged[k] = cloneRat(val)
+		merged[k] = cloneSlot(val)
 	}
 	for k, rv := range remote {
 		if cur, ok := merged[k]; ok {
-			nv, err := fn([]*big.Rat{cur, rv})
+			nv, err := apply(fn, []rtVal{cur, cloneSlot(rv)})
 			if err != nil {
 				return err // state left untouched
 			}
-			merged[k] = cloneRat(nv)
+			merged[k] = cloneSlot(nv)
 		} else {
-			merged[k] = cloneRat(rv) // slot absent locally: adopt a copy of remote
+			merged[k] = cloneSlot(rv) // slot absent locally: adopt a copy of remote
 		}
 	}
 	v.state = merged
@@ -186,9 +220,9 @@ func (v *VectorCRDT) mergeRemote(remote map[string]*big.Rat) error {
 
 func (v *VectorCRDT) Snapshot() any {
 	v.mu.Lock()
-	cp := make(map[string]*big.Rat, len(v.state))
+	cp := make(map[string]rtVal, len(v.state))
 	for k, val := range v.state {
-		cp[k] = cloneRat(val) // hand out copies so a caller cannot mutate our state
+		cp[k] = cloneSlot(val) // hand out copies so a caller cannot mutate our state
 	}
 	v.mu.Unlock()
 	return cp
@@ -200,27 +234,78 @@ func (v *VectorCRDT) Snapshot() any {
 // (quorum) protocol; gossip keeps using Snapshot.
 func (v *VectorCRDT) SnapshotWire() WireSnapshot {
 	v.mu.Lock()
-	slots := make(map[string]string, len(v.state))
+	slots := make(map[string]SlotWire, len(v.state))
 	for k, val := range v.state {
-		slots[k] = val.RatString()
+		slots[k] = slotToWire(val)
 	}
 	v.mu.Unlock()
 	return WireSnapshot{Slots: slots}
 }
 
-// MergeWire parses each WireSnapshot slot into a fresh *big.Rat (rejecting
-// malformed) and runs the same zip-merge path as Merge, so merge semantics stay
-// identical to gossip. Used by the sync (quorum) protocol.
-func (v *VectorCRDT) MergeWire(snap WireSnapshot) error {
-	remote := make(map[string]*big.Rat, len(snap.Slots))
-	for k, s := range snap.Slots {
-		q, ok := new(big.Rat).SetString(s)
-		if !ok {
-			return fmt.Errorf("invalid wire snapshot slot %q: %q", k, s)
+// slotToWire recursively encodes a runtime slot value as a transport SlotWire:
+// scalars become exact-rational strings, structs become nested objects.
+func slotToWire(val rtVal) SlotWire {
+	if val.kind == kStruct {
+		m := make(map[string]SlotWire, len(val.fields))
+		for k, f := range val.fields {
+			m[k] = slotToWire(f)
 		}
-		remote[k] = q
+		return SlotWire{Struct: m}
+	}
+	return SlotWire{Num: val.num.RatString()}
+}
+
+// MergeWire decodes each WireSnapshot slot against the element descriptor
+// (rejecting a malformed or off-domain slot) and runs the same zip-merge path as
+// Merge, so merge semantics stay identical to gossip. Used by the sync protocol.
+func (v *VectorCRDT) MergeWire(snap WireSnapshot) error {
+	remote := make(map[string]rtVal, len(snap.Slots))
+	for k, s := range snap.Slots {
+		rv, err := wireToSlot(s, v.elem)
+		if err != nil {
+			return fmt.Errorf("invalid wire snapshot slot %q: %w", k, err)
+		}
+		remote[k] = rv
 	}
 	return v.mergeRemote(remote)
+}
+
+// wireToSlot decodes a SlotWire into a runtime value against the expected element
+// descriptor: exact field-set match for structs, numeric leaves parsed and
+// validated against their leaf NumType. A shape or domain mismatch is rejected.
+func wireToSlot(s SlotWire, t ElemT) (rtVal, error) {
+	if t.Struct {
+		if s.Struct == nil {
+			return rtVal{}, fmt.Errorf("expected a struct value")
+		}
+		if len(s.Struct) != len(t.Fields) {
+			return rtVal{}, fmt.Errorf("struct has %d fields, expected %d", len(s.Struct), len(t.Fields))
+		}
+		fields := make(map[string]rtVal, len(t.Fields))
+		for _, f := range t.Fields {
+			fs, ok := s.Struct[f.Name]
+			if !ok {
+				return rtVal{}, fmt.Errorf("missing field %q", f.Name)
+			}
+			fv, err := wireToSlot(fs, f.Type)
+			if err != nil {
+				return rtVal{}, fmt.Errorf("field %q: %w", f.Name, err)
+			}
+			fields[f.Name] = fv
+		}
+		return structVal(fields), nil
+	}
+	if s.Num == "" {
+		return rtVal{}, fmt.Errorf("expected a scalar value")
+	}
+	q, ok := new(big.Rat).SetString(s.Num)
+	if !ok {
+		return rtVal{}, fmt.Errorf("invalid number %q", s.Num)
+	}
+	if !numtype.Allows(t.Num, q) {
+		return rtVal{}, fmt.Errorf("value %s is not a valid %s", q.RatString(), t.Num)
+	}
+	return numVal(q), nil
 }
 
 // ---- expression evaluation -----------------------------------------
@@ -233,22 +318,25 @@ const (
 	kNum rtKind = iota
 	kStr
 	kBool
+	kStruct
 	kFunc
 )
 
 // rtVal is a runtime value. Only the field(s) relevant to kind are set.
 type rtVal struct {
-	kind  rtKind
-	num   *big.Rat
-	str   string
-	b     bool
-	arity int
-	call  func(args []rtVal) (rtVal, error)
+	kind   rtKind
+	num    *big.Rat
+	str    string
+	b      bool
+	fields map[string]rtVal // kStruct
+	arity  int
+	call   func(args []rtVal) (rtVal, error)
 }
 
-func numVal(f *big.Rat) rtVal { return rtVal{kind: kNum, num: f} }
-func strVal(s string) rtVal   { return rtVal{kind: kStr, str: s} }
-func boolVal(x bool) rtVal    { return rtVal{kind: kBool, b: x} }
+func numVal(f *big.Rat) rtVal            { return rtVal{kind: kNum, num: f} }
+func strVal(s string) rtVal              { return rtVal{kind: kStr, str: s} }
+func boolVal(x bool) rtVal               { return rtVal{kind: kBool, b: x} }
+func structVal(f map[string]rtVal) rtVal { return rtVal{kind: kStruct, fields: f} }
 
 func (r rtVal) asNum() (*big.Rat, error) {
 	if r.kind != kNum {
@@ -268,37 +356,38 @@ func rtToAny(r rtVal) (any, error) {
 		return r.str, nil
 	case kBool:
 		return r.b, nil
+	case kStruct:
+		obj := make(map[string]any, len(r.fields))
+		for k, f := range r.fields {
+			fv, err := rtToAny(f)
+			if err != nil {
+				return nil, err
+			}
+			obj[k] = fv
+		}
+		return obj, nil
 	default:
 		return nil, fmt.Errorf("query did not produce a value")
 	}
 }
 
-// evalFn evaluates a function-valued term into a Go closure of the wanted arity
-// over rationals. Used for the zip (merge), local (update), and reduce slots, all
-// of which are rat^want -> rat.
-func (v *VectorCRDT) evalFn(e parser.Expr, env map[string]rtVal, want int) (func([]*big.Rat) (*big.Rat, error), error) {
-	val, err := v.eval(e, env, 0)
+// evalFuncVal evaluates a function-valued term into an rtVal function of the
+// wanted arity. Used for the zip (merge), local (update), and reduce slots, whose
+// element operands may be scalar OR struct — so the function is applied via the
+// generic rtVal calling convention rather than a scalar closure.
+func (v *VectorCRDT) evalFuncVal(e parser.Expr, env map[string]rtVal, want, depth int) (rtVal, error) {
+	val, err := v.eval(e, env, depth)
 	if err != nil {
-		return nil, err
+		return rtVal{}, err
 	}
 	if val.kind != kFunc || val.arity != want {
 		got := 0
 		if val.kind == kFunc {
 			got = val.arity
 		}
-		return nil, fmt.Errorf("expected a function of %d argument(s), got one of %d", want, got)
+		return rtVal{}, fmt.Errorf("expected a function of %d argument(s), got one of %d", want, got)
 	}
-	return func(args []*big.Rat) (*big.Rat, error) {
-		rv := make([]rtVal, len(args))
-		for i, a := range args {
-			rv[i] = numVal(a)
-		}
-		r, err := val.call(rv)
-		if err != nil {
-			return nil, err
-		}
-		return r.asNum()
-	}, nil
+	return val, nil
 }
 
 // eval evaluates a resolved term. Literals produce values; Refs and partial
@@ -358,22 +447,57 @@ func (v *VectorCRDT) eval(e parser.Expr, env map[string]rtVal, depth int) (rtVal
 			}
 		}
 		return rtVal{}, fmt.Errorf("non-exhaustive guards") // unreachable: build requires otherwise
+	case parser.ExprStructLit:
+		fields := make(map[string]rtVal, len(e.StructFields))
+		for _, sf := range e.StructFields {
+			if sf.Value == nil {
+				return rtVal{}, fmt.Errorf("struct field %q has no value", sf.Name)
+			}
+			fv, err := v.eval(*sf.Value, env, depth)
+			if err != nil {
+				return rtVal{}, err
+			}
+			if fv.kind == kFunc {
+				return rtVal{}, fmt.Errorf("struct field %q is not a value", sf.Name)
+			}
+			fields[sf.Name] = fv
+		}
+		return structVal(fields), nil
+	case parser.ExprField:
+		if e.Target == nil {
+			return rtVal{}, fmt.Errorf("field access has no target")
+		}
+		tv, err := v.eval(*e.Target, env, depth)
+		if err != nil {
+			return rtVal{}, err
+		}
+		if tv.kind != kStruct {
+			return rtVal{}, fmt.Errorf("cannot access field %q of a non-struct value", e.Field)
+		}
+		fv, ok := tv.fields[e.Field]
+		if !ok {
+			return rtVal{}, fmt.Errorf("struct has no field %q", e.Field)
+		}
+		return fv, nil
 	case parser.ExprReduce:
 		if e.Fn == nil || e.Init == nil {
 			return rtVal{}, fmt.Errorf("malformed reduce")
 		}
-		fn, err := v.evalFn(*e.Fn, env, 2)
+		fn, err := v.evalFuncVal(*e.Fn, env, 2, depth)
 		if err != nil {
 			return rtVal{}, err
 		}
-		acc := cloneRat(e.Init.Num) // empty vector -> returns init (copy, never mutate the AST literal)
+		acc, err := v.eval(*e.Init, env, depth) // empty vector -> returns the init value
+		if err != nil {
+			return rtVal{}, err
+		}
 		for _, val := range v.state {
-			acc, err = fn([]*big.Rat{acc, val})
+			acc, err = apply(fn, []rtVal{acc, cloneSlot(val)})
 			if err != nil {
 				return rtVal{}, err
 			}
 		}
-		return numVal(acc), nil
+		return acc, nil
 	default:
 		return rtVal{}, fmt.Errorf("cannot evaluate expression of kind %d", e.Kind)
 	}

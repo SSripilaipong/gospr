@@ -7,8 +7,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"gospr/numtype"
 	"gospr/parser"
 )
+
+// ratElem is the scalar `rat` element descriptor used by the scalar tests.
+var ratElem = ElemT{Num: numtype.NumType{Domain: numtype.DRat, Sign: numtype.SAny}}
 
 // ---- resolved-term builders (post-Build shapes) --------------------
 
@@ -57,7 +61,7 @@ func localAddK() Method {
 }
 
 func newT(nodeID string) *VectorCRDT {
-	return NewVector(nodeID, zipMax(),
+	return NewVector(nodeID, ratElem, zipMax(),
 		map[string]Method{"Value": reducePlus0()},
 		map[string]Method{"Add": localAddK()},
 		nil)
@@ -92,9 +96,9 @@ func TestVector_exactRationalArithmetic(t *testing.T) {
 func TestVector_localOnlyAffectsLocalSlot(t *testing.T) {
 	v := newT("nodeA")
 	v.Apply("Add", []any{"4"})
-	snap := v.Snapshot().(map[string]*big.Rat)
+	snap := v.Snapshot().(map[string]rtVal)
 	assert.Len(t, snap, 1)
-	assert.Equal(t, big.NewRat(4, 1), snap["nodeA"])
+	assert.Equal(t, big.NewRat(4, 1), snap["nodeA"].num)
 }
 
 func TestVector_mergeIsElementwiseMax(t *testing.T) {
@@ -111,10 +115,10 @@ func TestVector_mergeIsElementwiseMax(t *testing.T) {
 
 	// merge is max per slot: a re-adds, then a stale lower snapshot must not lower it.
 	a.Apply("Add", []any{"10"}) // nodeA: 13
-	stale := map[string]*big.Rat{"nodeA": big.NewRat(1, 1)}
+	stale := map[string]rtVal{"nodeA": numVal(big.NewRat(1, 1))}
 	a.Merge(stale)
-	snap := a.Snapshot().(map[string]*big.Rat)
-	assert.Equal(t, big.NewRat(13, 1), snap["nodeA"])
+	snap := a.Snapshot().(map[string]rtVal)
+	assert.Equal(t, big.NewRat(13, 1), snap["nodeA"].num)
 }
 
 // Snapshot must hand out deep copies: mutating a returned *big.Rat must not
@@ -122,11 +126,11 @@ func TestVector_mergeIsElementwiseMax(t *testing.T) {
 func TestVector_snapshotIsDeepCopied(t *testing.T) {
 	v := newT("nodeA")
 	v.Apply("Add", []any{"4"})
-	snap := v.Snapshot().(map[string]*big.Rat)
-	snap["nodeA"].Add(snap["nodeA"], big.NewRat(100, 1)) // mutate the handed-out value
+	snap := v.Snapshot().(map[string]rtVal)
+	snap["nodeA"].num.Add(snap["nodeA"].num, big.NewRat(100, 1)) // mutate the handed-out value
 
-	again := v.Snapshot().(map[string]*big.Rat)
-	assert.Equal(t, big.NewRat(4, 1), again["nodeA"], "CRDT state must be unaffected by snapshot mutation")
+	again := v.Snapshot().(map[string]rtVal)
+	assert.Equal(t, big.NewRat(4, 1), again["nodeA"].num, "CRDT state must be unaffected by snapshot mutation")
 }
 
 // Merge must not alias the remote snapshot into local state: mutating a remote
@@ -136,19 +140,19 @@ func TestVector_mergeDoesNotAliasRemote(t *testing.T) {
 	a := newT("nodeA")
 	a.Apply("Add", []any{"3"}) // a: {nodeA:3}
 
-	remote := map[string]*big.Rat{
-		"nodeA": big.NewRat(5, 1), // overlapping slot -> max(3,5)=5
-		"nodeB": big.NewRat(7, 1), // absent locally -> adopted
+	remote := map[string]rtVal{
+		"nodeA": numVal(big.NewRat(5, 1)), // overlapping slot -> max(3,5)=5
+		"nodeB": numVal(big.NewRat(7, 1)), // absent locally -> adopted
 	}
 	require.NoError(t, a.Merge(remote))
 
 	// Mutate the remote values after the merge.
-	remote["nodeA"].Add(remote["nodeA"], big.NewRat(100, 1))
-	remote["nodeB"].Add(remote["nodeB"], big.NewRat(100, 1))
+	remote["nodeA"].num.Add(remote["nodeA"].num, big.NewRat(100, 1))
+	remote["nodeB"].num.Add(remote["nodeB"].num, big.NewRat(100, 1))
 
-	snap := a.Snapshot().(map[string]*big.Rat)
-	assert.Equal(t, big.NewRat(5, 1), snap["nodeA"], "merged slot must not alias remote")
-	assert.Equal(t, big.NewRat(7, 1), snap["nodeB"], "adopted slot must not alias remote")
+	snap := a.Snapshot().(map[string]rtVal)
+	assert.Equal(t, big.NewRat(5, 1), snap["nodeA"].num, "merged slot must not alias remote")
+	assert.Equal(t, big.NewRat(7, 1), snap["nodeB"].num, "adopted slot must not alias remote")
 }
 
 func TestVector_unknownActionAndQuery(t *testing.T) {
@@ -173,7 +177,7 @@ func TestVector_runtimeParamValidation(t *testing.T) {
 			Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &sec},
 		}
 	}
-	v := NewVector("nodeA", zipMax(), nil, map[string]Method{"Add": nonNeg()}, nil)
+	v := NewVector("nodeA", ratElem, zipMax(), nil, map[string]Method{"Add": nonNeg()}, nil)
 	require.NoError(t, v.Apply("Add", []any{"5"}))
 	require.Error(t, v.Apply("Add", []any{"-1"}), "negative value must be rejected for rat0+")
 
@@ -184,7 +188,7 @@ func TestVector_runtimeParamValidation(t *testing.T) {
 			Body:   parser.Expr{Kind: parser.ExprLocal, Fn: &sec},
 		}
 	}
-	w := NewVector("nodeA", zipMax(), nil, map[string]Method{"Add": intOnly()}, nil)
+	w := NewVector("nodeA", ratElem, zipMax(), nil, map[string]Method{"Add": intOnly()}, nil)
 	require.NoError(t, w.Apply("Add", []any{"3"}))
 	require.Error(t, w.Apply("Add", []any{"2.5"}), "non-integer must be rejected for int")
 }
@@ -195,7 +199,7 @@ func TestEval_application(t *testing.T) {
 	// fn add a b = + a b
 	add := Function{Name: "add", Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 		Body: app(prim("+"), vr("a"), vr("b"))}
-	v := NewVector("n", zipMax(), nil, nil, map[string]Function{"add": add})
+	v := NewVector("n", ratElem, zipMax(), nil, nil, map[string]Function{"add": add})
 
 	got, err := v.eval(app(fnRef("add", 2), lit(2), lit(3)), nil, 0)
 	require.NoError(t, err)
@@ -204,7 +208,7 @@ func TestEval_application(t *testing.T) {
 }
 
 func TestEval_partialApplication(t *testing.T) {
-	v := NewVector("n", zipMax(), nil, nil, nil)
+	v := NewVector("n", ratElem, zipMax(), nil, nil, nil)
 	// (+ 1) is a unary function value
 	got, err := v.eval(app(prim("+"), lit(1)), nil, 0)
 	require.NoError(t, err)
@@ -216,7 +220,7 @@ func TestEval_partialApplication(t *testing.T) {
 }
 
 func TestEval_primitiveRef(t *testing.T) {
-	v := NewVector("n", zipMax(), nil, nil, nil)
+	v := NewVector("n", ratElem, zipMax(), nil, nil, nil)
 	got, err := v.eval(prim("max"), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, kFunc, got.kind)
@@ -241,7 +245,7 @@ func gotherwise(result parser.Expr) parser.GuardCase {
 }
 
 func TestEval_comparisonReturnsBool(t *testing.T) {
-	v := NewVector("n", zipMax(), nil, nil, nil)
+	v := NewVector("n", ratElem, zipMax(), nil, nil, nil)
 	got, err := v.eval(app(prim(">"), lit(5), lit(3)), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, kBool, got.kind)
@@ -253,7 +257,7 @@ func TestEval_comparisonReturnsBool(t *testing.T) {
 }
 
 func TestEval_stringLiteral(t *testing.T) {
-	v := NewVector("n", zipMax(), nil, nil, nil)
+	v := NewVector("n", ratElem, zipMax(), nil, nil, nil)
 	got, err := v.eval(str("hi"), nil, 0)
 	require.NoError(t, err)
 	require.Equal(t, kStr, got.kind)
@@ -268,7 +272,7 @@ func TestEval_guardsSelectFirstTrueElseOtherwise(t *testing.T) {
 		gotherwise(str("F")),
 	)
 	grade := Function{Name: "grade", Params: []parser.ParamSpec{{Name: "x", Type: "rat"}}, Body: body}
-	v := NewVector("n", zipMax(), nil, nil, map[string]Function{"grade": grade})
+	v := NewVector("n", ratElem, zipMax(), nil, nil, map[string]Function{"grade": grade})
 
 	call := func(x float64) string {
 		got, err := v.eval(app(fnRef("grade", 1), lit(x)), nil, 0)
@@ -287,9 +291,9 @@ func TestEval_reduceInExpression(t *testing.T) {
 	init := lit(0)
 	reduceBody := parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}
 	body := app(prim("+"), lit(1), reduceBody)
-	v := NewVector("n", zipMax(), map[string]Method{"Q": {Body: body, Result: parser.TypeReal}}, nil, nil)
-	v.state["a"] = big.NewRat(2, 1)
-	v.state["b"] = big.NewRat(3, 1)
+	v := NewVector("n", ratElem, zipMax(), map[string]Method{"Q": {Body: body, Result: parser.TypeReal}}, nil, nil)
+	v.state["a"] = numVal(big.NewRat(2, 1))
+	v.state["b"] = numVal(big.NewRat(3, 1))
 	got, err := v.Query("Q", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "6", got) // 1 + (2 + 3)
@@ -304,10 +308,10 @@ func TestVector_recursionGuardAndMergeAtomicity(t *testing.T) {
 		fn := fnRef("loop", 2)
 		return parser.Expr{Kind: parser.ExprZip, Fn: &fn}
 	}
-	v := NewVector("nodeA", zipLoop(), nil, nil, map[string]Function{"loop": loop})
-	v.state["nodeA"] = big.NewRat(1, 1)
+	v := NewVector("nodeA", ratElem, zipLoop(), nil, nil, map[string]Function{"loop": loop})
+	v.state["nodeA"] = numVal(big.NewRat(1, 1))
 
-	err := v.Merge(map[string]*big.Rat{"nodeA": big.NewRat(2, 1)}) // overlapping slot triggers loop
+	err := v.Merge(map[string]rtVal{"nodeA": numVal(big.NewRat(2, 1))}) // overlapping slot triggers loop
 	require.Error(t, err)
-	assert.Equal(t, big.NewRat(1, 1), v.state["nodeA"], "state must be unchanged after a failing merge")
+	assert.Equal(t, big.NewRat(1, 1), v.state["nodeA"].num, "state must be unchanged after a failing merge")
 }

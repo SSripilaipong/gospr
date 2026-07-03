@@ -10,6 +10,7 @@ import (
 
 	"gospr/builder"
 	"gospr/crdt"
+	"gospr/numtype"
 	"gospr/parser"
 )
 
@@ -25,7 +26,7 @@ func makeModelPlan() builder.BuiltPlan {
 
 	model := &builder.Model{
 		Name:  "MyVec",
-		Elem:  parser.ElemType{Kind: parser.KindReal, Scalar: "rat"},
+		Elem:  crdt.ElemT{Num: numtype.NumType{Domain: numtype.DRat, Sign: numtype.SAny}},
 		Merge: parser.Expr{Kind: parser.ExprZip, Fn: &max},
 		Queries: map[string]crdt.Method{
 			"Value": {Body: parser.Expr{Kind: parser.ExprReduce, Fn: &plus, Init: &zero}},

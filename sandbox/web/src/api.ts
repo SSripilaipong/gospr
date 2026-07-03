@@ -10,10 +10,14 @@ export interface CollectionSchema {
   queries: Record<string, ParamSchema[]>;
 }
 
+// A slot value is a scalar (exact-rational string) or a struct (a nested object
+// of field -> SlotValue), matching the server's recursive wire encoding.
+export type SlotValue = string | { [field: string]: SlotValue };
+
 export interface NodeState {
   id: string;
   initialized: boolean;
-  collections: Record<string, Record<string, string>>; // collection -> slot -> ratString
+  collections: Record<string, Record<string, SlotValue>>; // collection -> slot -> value
 }
 
 export interface SandboxState {

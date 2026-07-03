@@ -1,4 +1,4 @@
-import type { SandboxState } from "../api";
+import type { SandboxState, SlotValue } from "../api";
 import { linkKey } from "../util";
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -237,11 +237,25 @@ function setLineCoords(
   line.setAttribute("y2", String(pb.y));
 }
 
+// fmtSlot renders one slot value: a scalar as-is, a struct as `{Pos:5 Neg:2}`
+// (recursing for nested structs).
+function fmtSlot(v: SlotValue): string {
+  if (typeof v === "string") return v;
+  return (
+    "{" +
+    Object.entries(v)
+      .map(([k, x]) => `${k}:${fmtSlot(x)}`)
+      .join(" ") +
+    "}"
+  );
+}
+
 // slotChipText renders a collection's slots as bare bracketed values (no nodeID
-// keys — user preference): `[5 15 5]`, or `∅` when empty/absent.
-function slotChipText(slots: Record<string, string> | undefined): string {
+// keys — user preference): `[5 15 5]` for scalars, `[{Pos:5 Neg:2} …]` for
+// structs, or `∅` when empty/absent.
+function slotChipText(slots: Record<string, SlotValue> | undefined): string {
   if (!slots) return "∅";
-  const vals = Object.values(slots);
+  const vals = Object.values(slots).map(fmtSlot);
   if (vals.length === 0) return "∅";
   return clip(`[${vals.join(" ")}]`);
 }

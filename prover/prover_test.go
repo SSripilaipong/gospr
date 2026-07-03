@@ -43,7 +43,7 @@ func localE(fn parser.Expr) parser.Expr {
 	return parser.Expr{Kind: parser.ExprLocal, Fn: &f}
 }
 
-var tRat = numtype.NumType{Domain: numtype.DRat, Sign: numtype.SAny}
+var tRat = crdt.ElemT{Num: numtype.NumType{Domain: numtype.DRat, Sign: numtype.SAny}}
 
 func update(body parser.Expr, params ...parser.ParamSpec) crdt.Method {
 	return crdt.Method{Params: params, Body: body, Result: parser.TypeReal}
@@ -132,7 +132,7 @@ func TestProve_unicodeParamName(t *testing.T) {
 // A min merge induces the reverse order, so a non-positive increment is the
 // inflationary one there.
 func TestProve_minMergeNonPosUpdate(t *testing.T) {
-	tRatNonPos := numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonPos}
+	tRatNonPos := crdt.ElemT{Num: numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonPos}}
 	updates := map[string]crdt.Method{
 		"Dec": update(localE(appE(prim("+"), varE("k"))), parser.ParamSpec{Name: "k", Type: "rat0-"}),
 	}
@@ -149,4 +149,73 @@ func TestProve_z3MissingIsActionableError(t *testing.T) {
 	err := Prove(tRat, zipE(prim("max")), nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "z3")
+}
+
+// ---- struct element convergence ------------------------------------
+
+// structElem is a { Pos rat0+, Neg rat0+ } descriptor for the struct proofs.
+var structElem = crdt.ElemT{
+	Struct: true,
+	Name:   "X",
+	Fields: []crdt.FieldT{
+		{Name: "Pos", Type: crdt.ElemT{Num: numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonNeg}}},
+		{Name: "Neg", Type: crdt.ElemT{Num: numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonNeg}}},
+	},
+}
+
+func fieldE(target parser.Expr, name string) parser.Expr {
+	t := target
+	return parser.Expr{Kind: parser.ExprField, Target: &t, Field: name}
+}
+func structLitE(names []string, vals []parser.Expr) parser.Expr {
+	fields := make([]parser.StructField, len(names))
+	for i := range names {
+		v := vals[i]
+		fields[i] = parser.StructField{Name: names[i], Value: &v}
+	}
+	return parser.Expr{Kind: parser.ExprStructLit, StructFields: fields}
+}
+
+// jMax is `fn J a b = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }` — a product
+// join-semilattice, so the struct merge is provable.
+func jMax() crdt.Function {
+	body := structLitE(
+		[]string{"Pos", "Neg"},
+		[]parser.Expr{
+			appE(prim("max"), fieldE(varE("a"), "Pos"), fieldE(varE("b"), "Pos")),
+			appE(prim("max"), fieldE(varE("a"), "Neg"), fieldE(varE("b"), "Neg")),
+		},
+	)
+	return crdt.Function{Name: "J", Params: []parser.ParamSpec{{Name: "a", Type: "X"}, {Name: "b", Type: "X"}}, Body: body}
+}
+
+// A per-field max struct merge is a product lattice: commutative, associative,
+// idempotent — proven over the flattened leaf scalars.
+func TestProve_structPerFieldMaxAccepted(t *testing.T) {
+	require.NoError(t, Prove(structElem, zipE(fnRef("J", 2)), nil, map[string]crdt.Function{"J": jMax()}))
+}
+
+// A per-field SUM struct merge is not idempotent, so it is rejected.
+func TestProve_structPerFieldSumRejected(t *testing.T) {
+	sum := crdt.Function{Name: "S", Params: []parser.ParamSpec{{Name: "a", Type: "X"}, {Name: "b", Type: "X"}},
+		Body: structLitE([]string{"Pos", "Neg"}, []parser.Expr{
+			appE(prim("+"), fieldE(varE("a"), "Pos"), fieldE(varE("b"), "Pos")),
+			appE(prim("+"), fieldE(varE("a"), "Neg"), fieldE(varE("b"), "Neg")),
+		})}
+	err := Prove(structElem, zipE(fnRef("S", 2)), nil, map[string]crdt.Function{"S": sum})
+	require.Error(t, err)
+}
+
+// A struct update that increments one field by a rat0+ param is inflationary
+// under the per-field max merge (max(x, x+k) = x+k for k >= 0).
+func TestProve_structUpdateInflationary(t *testing.T) {
+	incPos := crdt.Function{Name: "incPos", Params: []parser.ParamSpec{{Name: "k", Type: "rat0+"}, {Name: "s", Type: "X"}},
+		Body: structLitE([]string{"Pos", "Neg"}, []parser.Expr{
+			appE(prim("+"), fieldE(varE("s"), "Pos"), varE("k")),
+			fieldE(varE("s"), "Neg"),
+		})}
+	updates := map[string]crdt.Method{
+		"AddPos": {Params: []parser.ParamSpec{{Name: "k", Type: "rat0+"}}, Body: localE(appE(fnRef("incPos", 2), varE("k")))},
+	}
+	require.NoError(t, Prove(structElem, zipE(fnRef("J", 2)), updates, map[string]crdt.Function{"J": jMax(), "incPos": incPos}))
 }

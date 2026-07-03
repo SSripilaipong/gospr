@@ -1,13 +1,13 @@
 package e2e
 
 import (
-	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"gospr/builder"
+	"gospr/crdt"
 	"gospr/parser"
 )
 
@@ -67,12 +67,81 @@ func TestE2E_vectorModel(t *testing.T) {
 
 	// Merge takes per-slot max: a stale lower value must not lower a slot.
 	a.Apply("Add", []any{"10"}) // nodeA slot -> 13
-	stale := map[string]*big.Rat{"nodeA": big.NewRat(1, 1)}
-	require.NoError(t, a.Merge(stale))
+	stale := crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{"nodeA": {Num: "1"}}}
+	require.NoError(t, a.MergeWire(stale))
 
 	got, err = a.Query("Value", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "18", got) // 13 (nodeA) + 5 (nodeB)
+}
+
+// End-to-end struct vector: a PN-counter whose slot is a struct { Pos, Neg }.
+// Exercises struct types, struct-typed fn params, struct construction literals,
+// dot field access, a whole-struct `zip` merge (product lattice: per-field max),
+// struct-typed `local` updates, and a query that folds struct slots with a
+// (non-idempotent, query-only) per-field sum then projects a field. The whole
+// pipeline runs — including the z3 convergence proof of the struct merge/updates.
+func TestE2E_structVectorPNCounter(t *testing.T) {
+	src := `type X = {
+  Pos rat0+
+  Neg rat0+
+}
+type VX = vector X
+fn J a::X b::X = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }
+fn S a::X b::X = { Pos: + a.Pos b.Pos, Neg: + a.Neg b.Neg }
+fn incPos k::rat0+ s::X = { Pos: + s.Pos k, Neg: s.Neg }
+fn incNeg k::rat0+ s::X = { Pos: s.Pos, Neg: + s.Neg k }
+merge VX = zip J
+update VX.AddPos k::rat0+ = local (incPos k)
+update VX.AddNeg k::rat0+ = local (incNeg k)
+query VX.Net = - (reduce S { Pos: 0, Neg: 0 }).Pos (reduce S { Pos: 0, Neg: 0 }).Neg
+query VX.Totals = reduce S { Pos: 0, Neg: 0 }
+collection C = VX
+`
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	built, err := builder.Build(plan)
+	require.NoError(t, err)
+
+	m := built.Models["VX"]
+	require.NotNil(t, m)
+	require.True(t, m.Elem.Struct)
+
+	a := m.New("nodeA")
+	b := m.New("nodeB")
+	require.NoError(t, a.Apply("AddPos", []any{"5"}))
+	require.NoError(t, a.Apply("AddNeg", []any{"2"}))
+	require.NoError(t, b.Apply("AddPos", []any{"3"}))
+
+	// A negative increment on a rat0+ field is rejected at the wire boundary.
+	require.Error(t, a.Apply("AddPos", []any{"-1"}))
+
+	require.NoError(t, a.Merge(b.Snapshot()))
+	require.NoError(t, b.Merge(a.Snapshot()))
+
+	// Net = (5+3) - 2 = 6 on both nodes after convergence.
+	for _, c := range []struct {
+		name string
+		crdt interface {
+			Query(string, []any) (any, error)
+		}
+	}{{"a", a}, {"b", b}} {
+		got, err := c.crdt.Query("Net", nil)
+		require.NoError(t, err, c.name)
+		assert.Equal(t, "6", got, c.name)
+	}
+
+	// A struct-valued query returns a JSON object of exact-rational strings.
+	totals, err := a.Query("Totals", nil)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"Pos": "8", "Neg": "2"}, totals)
+
+	// The wire snapshot carries struct slots and round-trips through MergeWire.
+	c := m.New("nodeC")
+	require.NoError(t, c.MergeWire(a.SnapshotWire()))
+	got, err := c.Query("Net", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "6", got)
 }
 
 // End-to-end: a guarded, string-returning function consumed by a query that

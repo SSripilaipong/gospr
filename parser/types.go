@@ -7,32 +7,32 @@ import (
 
 // ---- Element types -------------------------------------------------
 
-// ElemKind enumerates the element type of a vector. Only KindReal is
-// produced now; KindStruct is reserved so `vector { x rat }` can be
-// added later without a Plan-shape change.
+// ElemKind tags what a `type` definition describes. A struct type is a set of
+// named fields (`type X = { Pos rat0+ }`); a vector type is a distributed vector
+// whose element is another type (`type VX = vector X`, `type T = vector rat0+`).
 type ElemKind int
 
 const (
-	KindReal   ElemKind = iota
-	KindStruct          // reserved, NOT parsed yet
+	KindStruct ElemKind = iota // struct type: Fields
+	KindVector                 // vector type: element type token in Elem
 )
 
-// ElemType describes what each vector slot holds. For a scalar vector,
-// Kind == KindReal, Scalar holds the parsed numeric type name (one of the six:
-// rat, rat0+, rat0-, int, int0+, int0-), and Fields is nil. Struct support
-// later fills Fields. Scalar is a syntactic name only — the builder maps it to a
-// numtype.NumType; the parser stays semantics-free.
+// ElemType describes a `type` definition. For KindVector, Elem holds the element
+// type *token* — either a numeric type name (rat, rat0+, …) or a user struct type
+// name — which the builder resolves (the parser stays semantics-free). For
+// KindStruct, Fields holds the ordered field list.
 type ElemType struct {
 	Kind   ElemKind
-	Scalar string      // numeric type name for KindReal (e.g. "rat"); "" for KindStruct
-	Fields []FieldSpec // nil for KindReal; reserved for KindStruct
+	Elem   string      // KindVector: element type token (numtype name or struct type name)
+	Fields []FieldSpec // KindStruct: ordered fields
 }
 
-// FieldSpec is retained ONLY for the deferred struct case. It is unused
-// by the current grammar but keeps the struct door open.
+// FieldSpec is one `Name Type` line of a struct type. Type is a token (a numtype
+// name or another struct type name), resolved by the builder — a field may be
+// nested (its type is another struct type).
 type FieldSpec struct {
 	Name string
-	Type ElemType
+	Type string
 }
 
 // ---- Expression AST ------------------------------------------------
@@ -44,16 +44,18 @@ type FieldSpec struct {
 type ExprKind int
 
 const (
-	ExprNumLit ExprKind = iota // numeric literal: 0, 1, 2.5
-	ExprStrLit                 // string literal: "hello"
-	ExprName                   // PARSER-ONLY: unresolved identifier or operator token
-	ExprVar                    // BUILT-ONLY: a bound parameter reference
-	ExprRef                    // BUILT-ONLY: a function symbol (primitive or user fn)
-	ExprApp                    // application f a b ... (possibly partial)
-	ExprGuards                 // guarded body: | cond = result ... | otherwise = result
-	ExprReduce                 // reduce <fn> <init>
-	ExprZip                    // zip <fn>
-	ExprLocal                  // local <fn>
+	ExprNumLit    ExprKind = iota // numeric literal: 0, 1, 2.5
+	ExprStrLit                    // string literal: "hello"
+	ExprName                      // PARSER-ONLY: unresolved identifier or operator token
+	ExprVar                       // BUILT-ONLY: a bound parameter reference
+	ExprRef                       // BUILT-ONLY: a function symbol (primitive or user fn)
+	ExprApp                       // application f a b ... (possibly partial)
+	ExprGuards                    // guarded body: | cond = result ... | otherwise = result
+	ExprStructLit                 // struct construction: { Name: expr, ... }
+	ExprField                     // field access: target.Field
+	ExprReduce                    // reduce <fn> <init>
+	ExprZip                       // zip <fn>
+	ExprLocal                     // local <fn>
 )
 
 // ValType is a value's type. The language has three: a rational number, a boolean
@@ -122,12 +124,27 @@ type Expr struct {
 	Args []*Expr
 
 	// ExprReduce / ExprZip / ExprLocal: Fn is the function-valued term
-	// (a Ref or a partial App). Reduce additionally uses Init (a NumLit).
+	// (a Ref or a partial App). Reduce additionally uses Init (a literal —
+	// a NumLit or a StructLit).
 	Fn   *Expr
 	Init *Expr
 
 	// ExprGuards: ordered guard cases, the last of which must be `otherwise`.
 	Cases []GuardCase
+
+	// ExprStructLit: ordered field constructions { Name: Value, ... }.
+	StructFields []StructField
+
+	// ExprField: project Field out of the struct value Target.
+	Target *Expr
+	Field  string
+}
+
+// StructField is one `Name: expr` construction in a struct literal. Order is
+// preserved so the built Plan (and thus the Fingerprint) is stable.
+type StructField struct {
+	Name  string
+	Value *Expr
 }
 
 // GuardCase is one `| cond = result` line of a guarded function body. The

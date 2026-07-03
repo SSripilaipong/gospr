@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"gospr/crdt"
 	"gospr/numtype"
@@ -23,8 +24,7 @@ type CollectionSpec interface {
 // passes can walk it. Model implements CollectionSpec.
 type Model struct {
 	Name    string
-	Elem    parser.ElemType
-	ElemNum numtype.NumType        // the element's numeric type (parsed from Elem.Scalar)
+	Elem    crdt.ElemT             // resolved element descriptor (scalar numeric or a struct)
 	Merge   parser.Expr            // a Zip expr (Fn resolved)
 	Queries map[string]crdt.Method // Reduce methods (bodies resolved)
 	Updates map[string]crdt.Method // Local methods (bodies resolved)
@@ -32,7 +32,7 @@ type Model struct {
 }
 
 func (m *Model) New(nodeID string) crdt.CRDT {
-	return crdt.NewVector(nodeID, m.Merge, m.Queries, m.Updates, m.Funcs)
+	return crdt.NewVector(nodeID, m.Elem, m.Merge, m.Queries, m.Updates, m.Funcs)
 }
 
 type BuiltCollection struct {
@@ -65,13 +65,60 @@ const (
 	vkNum
 	vkBool
 	vkString
+	vkStruct
 )
 
 // vtype is the builder's internal value type. For vkNum the carried NumType says
-// which numeric subtype; for the others NumType is unused.
+// which numeric subtype; for vkStruct, fields lists the ordered field types (and
+// name is the nominal struct name, for diagnostics). Other fields are unused for
+// the scalar/bool/string kinds.
 type vtype struct {
-	kind vkind
-	num  numtype.NumType
+	kind   vkind
+	num    numtype.NumType
+	name   string   // vkStruct nominal name (diagnostics only)
+	fields []vfield // vkStruct, in declaration order
+}
+
+// vfield is one field of a struct vtype.
+type vfield struct {
+	name string
+	typ  vtype
+}
+
+// vElem lifts a resolved element descriptor into a checker vtype (scalar or
+// struct), so combinator/reduce boundary checks can treat both uniformly.
+func vElem(t crdt.ElemT) vtype {
+	if t.Struct {
+		fields := make([]vfield, len(t.Fields))
+		for i, f := range t.Fields {
+			fields[i] = vfield{name: f.Name, typ: vElem(f.Type)}
+		}
+		return vtype{kind: vkStruct, name: t.Name, fields: fields}
+	}
+	return vNum(t.Num)
+}
+
+// elemTOf lowers a struct vtype back to a crdt.ElemT descriptor (used to capture
+// a struct-valued query result). Only meaningful for vkStruct / vkNum.
+func elemTOf(t vtype) crdt.ElemT {
+	if t.kind == vkStruct {
+		fields := make([]crdt.FieldT, len(t.fields))
+		for i, f := range t.fields {
+			fields[i] = crdt.FieldT{Name: f.name, Type: elemTOf(f.typ)}
+		}
+		return crdt.ElemT{Struct: true, Name: t.name, Fields: fields}
+	}
+	return crdt.ElemT{Num: t.num}
+}
+
+// findField returns the type of a struct field by name.
+func (t vtype) findField(name string) (vtype, bool) {
+	for _, f := range t.fields {
+		if f.name == name {
+			return f.typ, true
+		}
+	}
+	return vtype{}, false
 }
 
 var (
@@ -93,6 +140,15 @@ func (t vtype) String() string {
 		return "bool"
 	case vkString:
 		return "string"
+	case vkStruct:
+		if t.name != "" {
+			return t.name
+		}
+		parts := make([]string, len(t.fields))
+		for i, f := range t.fields {
+			parts[i] = f.name + " " + f.typ.String()
+		}
+		return "{ " + strings.Join(parts, ", ") + " }"
 	default:
 		return "unknown"
 	}
@@ -127,6 +183,19 @@ func subVtype(a, b vtype) bool {
 	}
 	if a.kind == vkNum && b.kind == vkNum {
 		return numtype.Sub(a.num, b.num)
+	}
+	if a.kind == vkStruct && b.kind == vkStruct {
+		// Structural, nominal-agnostic: exact field-set match, each field a subtype.
+		if len(a.fields) != len(b.fields) {
+			return false
+		}
+		for _, bf := range b.fields {
+			af, ok := a.findField(bf.name)
+			if !ok || !subVtype(af, bf.typ) {
+				return false
+			}
+		}
+		return true
 	}
 	return a.kind == b.kind
 }
@@ -249,26 +318,15 @@ func numBin(op string, a, b numtype.NumType) numtype.NumType {
 }
 
 func Build(plan parser.Plan) (BuiltPlan, error) {
-	models := make(map[string]*Model, len(plan.Types))
-	for _, td := range plan.Types {
-		if _, dup := models[td.Name]; dup {
-			return BuiltPlan{}, fmt.Errorf("type %s declared twice", td.Name)
-		}
-		if td.Elem.Kind != parser.KindReal {
-			return BuiltPlan{}, fmt.Errorf("type %s: only a scalar `vector <numeric>` is supported", td.Name)
-		}
-		elemNum, ok := numtype.Parse(td.Elem.Scalar)
-		if !ok {
-			return BuiltPlan{}, fmt.Errorf("type %s: unknown element type %q", td.Name, td.Elem.Scalar)
-		}
-		models[td.Name] = &Model{
-			Name:    td.Name,
-			Elem:    td.Elem,
-			ElemNum: elemNum,
-			Queries: map[string]crdt.Method{},
-			Updates: map[string]crdt.Method{},
-		}
+	// Resolve every `type` definition into either a struct descriptor or a vector
+	// Model. The token resolver classifies a type-position name as a numeric type
+	// (numtype.Parse) or a user struct type, and rejects the numeric names /
+	// `vector` keyword as user type names so a type position is unambiguous.
+	types, err := resolveTypes(plan.Types)
+	if err != nil {
+		return BuiltPlan{}, err
 	}
+	models := types.models
 
 	// Collect function arities up front so bodies may reference functions
 	// defined later or themselves (recursion is allowed).
@@ -283,7 +341,9 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if len(fd.Params) == 0 {
 			return BuiltPlan{}, fmt.Errorf("function %s: must take at least one parameter", fd.Name)
 		}
-		if err := validateParams(fd.Params); err != nil {
+		// A `fn` param may be numeric OR struct-typed (fns receive struct slots
+		// from combinators). It must resolve to a known type.
+		if err := validateFnParams(fd.Params, types); err != nil {
 			return BuiltPlan{}, fmt.Errorf("function %s: %w", fd.Name, err)
 		}
 		fnArity[fd.Name] = len(fd.Params)
@@ -295,7 +355,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 	// rejected here (allowReduce=false) so global functions stay pure — only
 	// query bodies may fold the vector.
 	funcs := make(map[string]crdt.Function, len(plan.Functions))
-	chk := newChecker(env)
+	chk := newChecker(types)
 	for _, fd := range plan.Functions {
 		scope := paramSet(fd.Params)
 		body, err := env.resolve(fd.Body, scope, false)
@@ -330,7 +390,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("merge %s: %w", md.TypeName, err)
 		}
-		if err := chk.checkCombinatorFn(merge, nil, m.ElemNum); err != nil {
+		if err := chk.checkCombinatorFn(merge, nil, m.Elem); err != nil {
 			return BuiltPlan{}, fmt.Errorf("merge %s: %w", md.TypeName, err)
 		}
 		m.Merge = merge
@@ -355,11 +415,20 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		result, err := chk.checkValue(body, m.ElemNum)
+		result, err := chk.checkValue(body, m.Elem)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		m.Queries[qd.MethodName] = crdt.Method{Params: qd.Params, Body: body, Result: toValType(result), ResultNum: toResultNum(result)}
+		method := crdt.Method{Params: qd.Params, Body: body}
+		if result.kind == vkStruct {
+			et := elemTOf(result)
+			method.ResultStruct = &et
+			method.Result = parser.TypeReal // unused for a struct result; ResultStruct drives swagger
+		} else {
+			method.Result = toValType(result)
+			method.ResultNum = toResultNum(result)
+		}
+		m.Queries[qd.MethodName] = method
 	}
 
 	for _, ud := range plan.Updates {
@@ -370,14 +439,16 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if _, dup := m.Updates[ud.MethodName]; dup {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s defined twice", ud.TypeName, ud.MethodName)
 		}
-		if err := validateParams(ud.Params); err != nil {
+		// Update params cross the HTTP boundary (bindParams), which handles only
+		// scalar numeric values — so a struct-typed update param is rejected.
+		if err := validateScalarParams(ud.Params); err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
 		body, err := env.resolveCombinator(ud.Body, paramSet(ud.Params))
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
-		if err := chk.checkCombinatorFn(body, paramScope(ud.Params), m.ElemNum); err != nil {
+		if err := chk.checkCombinatorFn(body, chk.paramScope(ud.Params), m.Elem); err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
 		m.Updates[ud.MethodName] = crdt.Method{Params: ud.Params, Body: body, Result: parser.TypeReal}
@@ -394,7 +465,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 	// inflationary in its induced order. Unprovable types are rejected (the
 	// gateway surfaces this as a 400). Requires z3 on PATH.
 	for _, m := range models {
-		if err := prover.Prove(m.ElemNum, m.Merge, m.Updates, funcs); err != nil {
+		if err := prover.Prove(m.Elem, m.Merge, m.Updates, funcs); err != nil {
 			return BuiltPlan{}, fmt.Errorf("convergence proof failed for type %s: %w", m.Name, err)
 		}
 	}
@@ -520,6 +591,34 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 			cases[i] = nc
 		}
 		return parser.Expr{Kind: parser.ExprGuards, Cases: cases}, nil
+	case parser.ExprStructLit:
+		fields := make([]parser.StructField, len(expr.StructFields))
+		for i, sf := range expr.StructFields {
+			if sf.Value == nil {
+				return parser.Expr{}, fmt.Errorf("struct field %q has no value", sf.Name)
+			}
+			rv, err := e.resolve(*sf.Value, scope, allowReduce)
+			if err != nil {
+				return parser.Expr{}, err
+			}
+			if arityOf(rv) != 0 {
+				return parser.Expr{}, fmt.Errorf("struct field %q is not a value", sf.Name)
+			}
+			fields[i] = parser.StructField{Name: sf.Name, Value: &rv}
+		}
+		return parser.Expr{Kind: parser.ExprStructLit, StructFields: fields}, nil
+	case parser.ExprField:
+		if expr.Target == nil {
+			return parser.Expr{}, fmt.Errorf("field access has no target")
+		}
+		target, err := e.resolve(*expr.Target, scope, allowReduce)
+		if err != nil {
+			return parser.Expr{}, err
+		}
+		if arityOf(target) != 0 {
+			return parser.Expr{}, fmt.Errorf("cannot access a field of a function")
+		}
+		return parser.Expr{Kind: parser.ExprField, Target: &target, Field: expr.Field}, nil
 	case parser.ExprReduce:
 		if !allowReduce {
 			return parser.Expr{}, fmt.Errorf("`reduce` may only appear in a query body")
@@ -528,10 +627,17 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		if err != nil {
 			return parser.Expr{}, fmt.Errorf("reduce must be `reduce <binary fn> <init>`: %w", err)
 		}
-		if expr.Init == nil || expr.Init.Kind != parser.ExprNumLit {
-			return parser.Expr{}, fmt.Errorf("reduce init must be a number")
+		if expr.Init == nil {
+			return parser.Expr{}, fmt.Errorf("reduce init is missing")
 		}
-		init := *expr.Init
+		// The init is a literal (numeric or struct); resolve it as a pure value.
+		init, err := e.resolve(*expr.Init, scope, false)
+		if err != nil {
+			return parser.Expr{}, fmt.Errorf("reduce init: %w", err)
+		}
+		if arityOf(init) != 0 {
+			return parser.Expr{}, fmt.Errorf("reduce init must be a value")
+		}
 		return parser.Expr{Kind: parser.ExprReduce, Fn: fn, Init: &init}, nil
 	default:
 		return parser.Expr{}, fmt.Errorf("unexpected expression in this position")
@@ -609,6 +715,7 @@ func describe(e parser.Expr) string {
 // type — so anchored recursion resolves, while wholly unanchored recursion
 // (Option A) leaves vUnknown and is rejected.
 type checker struct {
+	reg        typeReg
 	fnParams   map[string][]vtype
 	fnScope    map[string]map[string]vtype
 	fnBody     map[string]parser.Expr
@@ -618,12 +725,13 @@ type checker struct {
 	// elem/hasElem give the current query's vector element type to the reduce
 	// case of typeOf. They are set only for the duration of a checkValue call;
 	// reduce is forbidden outside queries (so this is unset everywhere else).
-	elem    numtype.NumType
+	elem    crdt.ElemT
 	hasElem bool
 }
 
-func newChecker(_ env) *checker {
+func newChecker(reg typeReg) *checker {
 	return &checker{
+		reg:        reg,
 		fnParams:   map[string][]vtype{},
 		fnScope:    map[string]map[string]vtype{},
 		fnBody:     map[string]parser.Expr{},
@@ -632,19 +740,40 @@ func newChecker(_ env) *checker {
 	}
 }
 
+// paramVtype resolves a param's declared type token to a checker vtype (scalar or
+// struct). The token was validated at registration, so a failure defaults to the
+// top numeric type rather than erroring here.
+func (c *checker) paramVtype(tok string) vtype {
+	et, err := c.reg.resolveToken(tok)
+	if err != nil {
+		return numTop
+	}
+	return vElem(et)
+}
+
 // register records a resolved function body and its param scope. Each param is
-// bound to its declared numeric type.
+// bound to its declared type (numeric or struct).
 func (c *checker) register(name string, params []parser.ParamSpec, body parser.Expr) {
 	pts := make([]vtype, len(params))
 	scope := make(map[string]vtype, len(params))
 	for i, p := range params {
-		nt, _ := numtype.Parse(p.Type) // validated by validateParams
-		pts[i] = vNum(nt)
-		scope[p.Name] = vNum(nt)
+		t := c.paramVtype(p.Type)
+		pts[i] = t
+		scope[p.Name] = t
 	}
 	c.fnParams[name] = pts
 	c.fnScope[name] = scope
 	c.fnBody[name] = body
+}
+
+// paramScope builds a type-checking scope binding each param to its declared type
+// (numeric or struct).
+func (c *checker) paramScope(ps []parser.ParamSpec) map[string]vtype {
+	s := make(map[string]vtype, len(ps))
+	for _, p := range ps {
+		s[p.Name] = c.paramVtype(p.Type)
+	}
+	return s
 }
 
 // inferReturn returns a function's result type, type-checking its body on first
@@ -675,7 +804,7 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 // checkValue type-checks a term that must yield a value (not a function) and
 // returns its type. Used for query bodies; elem is the vector element type, made
 // available to any `reduce` sub-expression in the body.
-func (c *checker) checkValue(e parser.Expr, elem numtype.NumType) (vtype, error) {
+func (c *checker) checkValue(e parser.Expr, elem crdt.ElemT) (vtype, error) {
 	c.elem, c.hasElem = elem, true
 	defer func() { c.hasElem = false }()
 	s, err := c.typeOf(e, nil)
@@ -697,10 +826,11 @@ func (c *checker) checkValue(e parser.Expr, elem numtype.NumType) (vtype, error)
 // is enforced — e.g. `local (- k)` on a `vector rat0+` loses the sign and is
 // rejected. scope carries the method's params (a local update fn may reference
 // them, e.g. `local (+ k)`).
-func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, elem numtype.NumType) error {
+func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, elem crdt.ElemT) error {
 	if comb.Fn == nil {
 		return fmt.Errorf("combinator has no function")
 	}
+	elemV := vElem(elem)
 	s, err := c.typeOf(*comb.Fn, scope)
 	if err != nil {
 		return err
@@ -710,7 +840,7 @@ func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, el
 	}
 	args := make([]vtype, len(s.params))
 	for i := range args {
-		args[i] = vNum(elem)
+		args[i] = elemV
 	}
 	sat, err := c.applyArgs(s, args)
 	if err != nil {
@@ -719,8 +849,8 @@ func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, el
 	if sat.result.kind == vkUnknown {
 		return nil // unanchored recursion: result type can't be verified, allowed
 	}
-	if !subVtype(sat.result, vNum(elem)) {
-		return fmt.Errorf("combinator result %s is not assignable to element type %s", sat.result, elem)
+	if !subVtype(sat.result, elemV) {
+		return fmt.Errorf("combinator result %s is not assignable to element type %s", sat.result, elemV)
 	}
 	return nil
 }
@@ -781,6 +911,40 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 		return c.applyArgs(hs, args)
 	case parser.ExprGuards:
 		return c.typeOfGuards(e, scope)
+	case parser.ExprStructLit:
+		fields := make([]vfield, len(e.StructFields))
+		seen := make(map[string]bool, len(e.StructFields))
+		for i, sf := range e.StructFields {
+			if seen[sf.Name] {
+				return sig{}, fmt.Errorf("duplicate struct field %q", sf.Name)
+			}
+			seen[sf.Name] = true
+			fs, err := c.typeOf(*sf.Value, scope)
+			if err != nil {
+				return sig{}, err
+			}
+			if len(fs.params) != 0 {
+				return sig{}, fmt.Errorf("struct field %q is not a value", sf.Name)
+			}
+			fields[i] = vfield{name: sf.Name, typ: fs.result}
+		}
+		return sig{result: vtype{kind: vkStruct, fields: fields}}, nil
+	case parser.ExprField:
+		ts, err := c.typeOf(*e.Target, scope)
+		if err != nil {
+			return sig{}, err
+		}
+		if len(ts.params) != 0 {
+			return sig{}, fmt.Errorf("cannot access a field of a function")
+		}
+		if ts.result.kind != vkStruct {
+			return sig{}, fmt.Errorf("cannot access field %q of non-struct type %s", e.Field, ts.result)
+		}
+		ft, ok := ts.result.findField(e.Field)
+		if !ok {
+			return sig{}, fmt.Errorf("type %s has no field %q", ts.result, e.Field)
+		}
+		return sig{result: ft}, nil
 	case parser.ExprReduce:
 		return c.typeOfReduce(e, scope)
 	default:
@@ -866,30 +1030,56 @@ func (c *checker) typeOfReduce(e parser.Expr, scope map[string]vtype) (sig, erro
 	if err != nil {
 		return sig{}, err
 	}
-	if initS.result.kind != vkNum {
-		return sig{}, fmt.Errorf("reduce init must be numeric")
+	if len(initS.params) != 0 {
+		return sig{}, fmt.Errorf("reduce init must be a value")
 	}
-	elemV := vNum(c.elem)
-	acc := initS.result.num
-	// Iterate to a fixpoint; the lattice height bounds the iteration count.
+	elemV := vElem(c.elem) // fold element type: scalar or struct
+	acc := initS.result
+	// Iterate to a fixpoint; the lattice has finite height, so this terminates.
 	for i := 0; i < 16; i++ {
-		sat, err := c.applyArgs(fs, []vtype{vNum(acc), elemV})
+		sat, err := c.applyArgs(fs, []vtype{acc, elemV})
 		if err != nil {
 			return sig{}, err
 		}
 		if sat.result.kind == vkUnknown {
 			break // recursive reduce fn mid-inference: settle on the accumulator so far
 		}
-		if sat.result.kind != vkNum {
-			return sig{}, fmt.Errorf("reduce function must produce a numeric value")
+		next, err := unify(acc, sat.result)
+		if err != nil {
+			return sig{}, fmt.Errorf("reduce function result type is inconsistent: %w", err)
 		}
-		next := numtype.Join(acc, sat.result.num)
-		if next == acc {
+		if vtypeEqual(next, acc) {
 			break
 		}
 		acc = next
 	}
-	return sig{result: vNum(acc)}, nil
+	return sig{result: acc}, nil
+}
+
+// vtypeEqual reports structural equality of two value types (used to detect the
+// reduce fixpoint). Numeric types compare by NumType; structs by matching field
+// sets recursively.
+func vtypeEqual(a, b vtype) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case vkNum:
+		return a.num == b.num
+	case vkStruct:
+		if len(a.fields) != len(b.fields) {
+			return false
+		}
+		for _, af := range a.fields {
+			bf, ok := b.findField(af.name)
+			if !ok || !vtypeEqual(af.typ, bf) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
 }
 
 func (c *checker) typeOfGuards(e parser.Expr, scope map[string]vtype) (sig, error) {
@@ -951,6 +1141,23 @@ func unify(a, b vtype) (vtype, error) {
 		return a, nil
 	case a.kind == vkNum && b.kind == vkNum:
 		return vNum(numtype.Join(a.num, b.num)), nil
+	case a.kind == vkStruct && b.kind == vkStruct:
+		if len(a.fields) != len(b.fields) {
+			return vUnknown, fmt.Errorf("%s vs %s", a, b)
+		}
+		fields := make([]vfield, len(a.fields))
+		for i, af := range a.fields {
+			bf, ok := b.findField(af.name)
+			if !ok {
+				return vUnknown, fmt.Errorf("%s vs %s", a, b)
+			}
+			u, err := unify(af.typ, bf)
+			if err != nil {
+				return vUnknown, err
+			}
+			fields[i] = vfield{name: af.name, typ: u}
+		}
+		return vtype{kind: vkStruct, name: a.name, fields: fields}, nil
 	case a.kind != b.kind:
 		return vUnknown, fmt.Errorf("%s vs %s", a, b)
 	default:
@@ -958,13 +1165,150 @@ func unify(a, b vtype) (vtype, error) {
 	}
 }
 
+// ---- type registry -------------------------------------------------
+
+// typeReg holds the resolved type universe: the vector Models (by type name) and
+// the resolved struct descriptors (by struct type name). resolveToken classifies
+// a type-position token as a numeric type or a named struct type.
+type typeReg struct {
+	models  map[string]*Model
+	structs map[string]crdt.ElemT
+}
+
+// resolveToken maps a type-position token to a resolved element descriptor: a
+// numeric type (numtype.Parse) or a named struct type. A vector type name is
+// rejected — a vector cannot be a struct field or a param type.
+func (r typeReg) resolveToken(tok string) (crdt.ElemT, error) {
+	if nt, ok := numtype.Parse(tok); ok {
+		return crdt.ElemT{Num: nt}, nil
+	}
+	if s, ok := r.structs[tok]; ok {
+		return s, nil
+	}
+	if _, ok := r.models[tok]; ok {
+		return crdt.ElemT{}, fmt.Errorf("type %q is a vector and cannot be used as a field or param type", tok)
+	}
+	return crdt.ElemT{}, fmt.Errorf("unknown type %q", tok)
+}
+
+// resolveTypes folds the flat TypeDefs into a typeReg: struct type descriptors
+// (with cycle/dup-field/unknown-field detection) and vector Models. A user type
+// name may not shadow a numeric type name or the `vector` keyword, so every
+// type-position token resolves unambiguously (numtype first, else named struct).
+func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
+	reg := typeReg{models: map[string]*Model{}, structs: map[string]crdt.ElemT{}}
+	structDefs := map[string]parser.ElemType{}
+	vectorDefs := map[string]parser.ElemType{}
+	seen := map[string]bool{}
+	for _, td := range tds {
+		if seen[td.Name] {
+			return reg, fmt.Errorf("type %s declared twice", td.Name)
+		}
+		if _, isNum := numtype.Parse(td.Name); isNum || td.Name == "vector" {
+			return reg, fmt.Errorf("type name %q is reserved", td.Name)
+		}
+		seen[td.Name] = true
+		switch td.Elem.Kind {
+		case parser.KindStruct:
+			structDefs[td.Name] = td.Elem
+		case parser.KindVector:
+			vectorDefs[td.Name] = td.Elem
+		default:
+			return reg, fmt.Errorf("type %s: unsupported definition", td.Name)
+		}
+	}
+
+	// Resolve struct descriptors with cycle detection. A field type token is a
+	// numtype name or another struct type (not a vector).
+	resolving := map[string]bool{}
+	var resolveStruct func(name string) (crdt.ElemT, error)
+	resolveToken := func(tok string) (crdt.ElemT, error) {
+		if nt, ok := numtype.Parse(tok); ok {
+			return crdt.ElemT{Num: nt}, nil
+		}
+		if _, ok := structDefs[tok]; ok {
+			return resolveStruct(tok)
+		}
+		if _, ok := vectorDefs[tok]; ok {
+			return crdt.ElemT{}, fmt.Errorf("type %q is a vector and cannot be used as a field or element type", tok)
+		}
+		return crdt.ElemT{}, fmt.Errorf("unknown type %q", tok)
+	}
+	resolveStruct = func(name string) (crdt.ElemT, error) {
+		if s, ok := reg.structs[name]; ok {
+			return s, nil
+		}
+		if resolving[name] {
+			return crdt.ElemT{}, fmt.Errorf("recursive struct type %q", name)
+		}
+		resolving[name] = true
+		ed := structDefs[name]
+		fseen := map[string]bool{}
+		fields := make([]crdt.FieldT, 0, len(ed.Fields))
+		for _, f := range ed.Fields {
+			if fseen[f.Name] {
+				return crdt.ElemT{}, fmt.Errorf("struct %s: duplicate field %q", name, f.Name)
+			}
+			fseen[f.Name] = true
+			ft, err := resolveToken(f.Type)
+			if err != nil {
+				return crdt.ElemT{}, fmt.Errorf("struct %s: field %q: %w", name, f.Name, err)
+			}
+			fields = append(fields, crdt.FieldT{Name: f.Name, Type: ft})
+		}
+		st := crdt.ElemT{Struct: true, Name: name, Fields: fields}
+		reg.structs[name] = st
+		resolving[name] = false
+		return st, nil
+	}
+	for name := range structDefs {
+		if _, err := resolveStruct(name); err != nil {
+			return reg, err
+		}
+	}
+
+	// Build a Model for each vector type, resolving its element token.
+	for name, vd := range vectorDefs {
+		elem, err := resolveToken(vd.Elem)
+		if err != nil {
+			return reg, fmt.Errorf("type %s: %w", name, err)
+		}
+		reg.models[name] = &Model{
+			Name:    name,
+			Elem:    elem,
+			Queries: map[string]crdt.Method{},
+			Updates: map[string]crdt.Method{},
+		}
+	}
+	return reg, nil
+}
+
 // ---- validators ----------------------------------------------------
 
-func validateParams(ps []parser.ParamSpec) error {
+// validateFnParams validates a function's params: names unique and each type a
+// known type (numeric or struct). A `fn` may take struct-typed params.
+func validateFnParams(ps []parser.ParamSpec, reg typeReg) error {
+	seen := make(map[string]bool, len(ps))
+	for _, p := range ps {
+		if _, err := reg.resolveToken(p.Type); err != nil {
+			return fmt.Errorf("param %s: %w", p.Name, err)
+		}
+		if seen[p.Name] {
+			return fmt.Errorf("duplicate param %s", p.Name)
+		}
+		seen[p.Name] = true
+	}
+	return nil
+}
+
+// validateScalarParams validates update params: names unique and each type a
+// numeric type (not a struct) — update params cross the wire via bindParams,
+// which handles only scalar numeric values.
+func validateScalarParams(ps []parser.ParamSpec) error {
 	seen := make(map[string]bool, len(ps))
 	for _, p := range ps {
 		if _, ok := numtype.Parse(p.Type); !ok {
-			return fmt.Errorf("param %s: unknown type %q", p.Name, p.Type)
+			return fmt.Errorf("param %s: type %q must be a numeric type (struct-typed params are not supported here)", p.Name, p.Type)
 		}
 		if seen[p.Name] {
 			return fmt.Errorf("duplicate param %s", p.Name)
@@ -978,17 +1322,6 @@ func paramSet(ps []parser.ParamSpec) map[string]bool {
 	s := make(map[string]bool, len(ps))
 	for _, p := range ps {
 		s[p.Name] = true
-	}
-	return s
-}
-
-// paramScope builds a type-checking scope binding each param to its declared
-// numeric type.
-func paramScope(ps []parser.ParamSpec) map[string]vtype {
-	s := make(map[string]vtype, len(ps))
-	for _, p := range ps {
-		nt, _ := numtype.Parse(p.Type) // validated by validateParams
-		s[p.Name] = vNum(nt)
 	}
 	return s
 }

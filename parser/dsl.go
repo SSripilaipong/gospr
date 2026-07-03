@@ -113,23 +113,29 @@ func symOpP() Parser[string] {
 			Or(lit(">"), lit("<")))))))))
 }
 
-// numTypeNameP parses one of the six numeric type names. Longer names are tried
-// before their prefixes (`rat0+` before `rat`, `int0+` before `int`) so the
-// longest match wins; each alternative is Try-wrapped to backtrack cleanly. The
-// names contain `+`/`-`/`0`, which IdentP does not accept, so this dedicated
-// parser is required for type positions.
-func numTypeNameP() Parser[string] {
-	lit := func(str string) Parser[string] { return Try(StringP(str)) }
-	return Or(lit("rat0+"), Or(lit("rat0-"), Or(lit("rat"),
-		Or(lit("int0+"), Or(lit("int0-"), lit("int"))))))
+// typeNameP parses a type token in a type position: an identifier optionally
+// followed by a single `+` or `-` sign suffix. This covers both the numeric type
+// names (`rat0+`, `int`, …) and user-defined struct type names (`X`, `Inner`) in
+// one word-bounded token, so `intThing` reads as the whole identifier rather than
+// the numtype prefix `int`. The builder classifies the token (numtype vs named
+// struct type). The `+`/`-` suffix is only meaningful for numtype names; a struct
+// type name never carries one. Type positions never sit next to an expression, so
+// eagerly consuming a trailing sign here is unambiguous.
+func typeNameP() Parser[string] {
+	sign := Or(
+		Try(Map(RuneP('+'), func(rune) string { return "+" })),
+		Or(Try(Map(RuneP('-'), func(rune) string { return "-" })), Succeed("")),
+	)
+	return Map(Sequence2(IdentP(), sign), func(t Of2[string, string]) string { return t.V1 + t.V2 })
 }
 
-// paramP parses `name::type`, e.g. `k::rat0+`. The type is one of the six
-// numeric type names; an unknown name is a parse error.
+// paramP parses `name::type`, e.g. `k::rat0+` or `a::X`. The type is a numtype
+// name or a user struct type name; the builder validates it (and, per position,
+// whether a struct-typed param is allowed).
 func paramP() Parser[ParamSpec] {
 	dcolon := Sequence2(RuneP(':'), RuneP(':'))
 	return Map(
-		Sequence3(IdentP(), dcolon, numTypeNameP()),
+		Sequence3(IdentP(), dcolon, typeNameP()),
 		func(t Of3[string, Of2[rune, rune], string]) ParamSpec {
 			return ParamSpec{Name: t.V1, Type: t.V3}
 		},
@@ -156,36 +162,100 @@ func nameP() Parser[Expr] {
 	return Map(Or(symOpP(), IdentP()), func(n string) Expr { return Expr{Kind: ExprName, Name: n} })
 }
 
-// reduceFormP parses `reduce <atom> <number>`, e.g. `reduce max 0`. It is a
-// value-producing primary (it folds the vector to a number), so it may appear
-// anywhere an atom may — but the builder restricts it to query bodies, keeping
-// global functions pure. The trailing reference to atomP is deferred to parse
-// time to break the construction cycle (atomP itself lists reduceFormP).
+// wsP consumes spaces, tabs, and newlines. It is used inside `{ ... }` braces
+// (struct type defs and struct literals), which may span multiple physical lines,
+// so newlines there are insignificant whitespace rather than construct delimiters.
+func wsP() Parser[struct{}] {
+	return Map(Many(Satisfy(func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' }, "whitespace")), func(_ []rune) struct{} { return struct{}{} })
+}
+
+// ws1P is wsP but requires at least one whitespace/newline char. Used to separate
+// struct-type field lines (`Pos rat0+` then a newline then `Neg rat0+`).
+func ws1P() Parser[struct{}] {
+	return Map(Many1(Satisfy(func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' }, "whitespace")), func(_ []rune) struct{} { return struct{}{} })
+}
+
+// structLitP parses a struct construction literal `{ Name: expr, Name: expr }`.
+// Fields are comma-separated with an optional trailing comma, and whitespace
+// (including newlines) is allowed throughout, so a literal may span lines. At
+// least one field is required. The trailing reference to exprP is deferred to
+// parse time to break the construction cycle.
+func structLitP() Parser[Expr] {
+	fieldP := Map(
+		Sequence5(IdentP(), Prefix(wsP(), RuneP(':')), wsP(), exprP(), Succeed(struct{}{})),
+		func(t Of5[string, rune, struct{}, Expr, struct{}]) StructField {
+			v := t.V4
+			return StructField{Name: t.V1, Value: &v}
+		},
+	)
+	comma := Sequence2(wsP(), RuneP(','))
+	more := Many(Try(Prefix(comma, Prefix(wsP(), fieldP))))
+	trailingComma := Or(Try(Discard(comma)), Succeed(struct{}{}))
+	return Map(
+		Sequence5(
+			RuneP('{'),
+			Prefix(wsP(), fieldP),
+			more,
+			Prefix(Sequence2(trailingComma, wsP()), RuneP('}')),
+			Succeed(struct{}{}),
+		),
+		func(t Of5[rune, StructField, []StructField, rune, struct{}]) Expr {
+			fields := append([]StructField{t.V2}, t.V3...)
+			return Expr{Kind: ExprStructLit, StructFields: fields}
+		},
+	)
+}
+
+// reduceFormP parses `reduce <atom> <init-atom>`, e.g. `reduce max 0` or
+// `reduce M { Pos: 0, Neg: 0 }`. It is a value-producing primary (it folds the
+// vector), so it may appear anywhere an atom may — but the builder restricts it
+// to query bodies. The init is a literal atom (numeric or struct literal); the
+// builder type-checks it against the fold type. The trailing reference to atomP
+// is deferred to parse time (atomP itself lists reduceFormP).
 func reduceFormP() Parser[Expr] {
 	return Map(
-		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), atomP()), Spaces1P(), numberP()),
-		func(t Of3[Expr, struct{}, *big.Rat]) Expr {
+		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), atomP()), Spaces1P(), atomP()),
+		func(t Of3[Expr, struct{}, Expr]) Expr {
 			fn := t.V1
-			init := Expr{Kind: ExprNumLit, Num: t.V3}
+			init := t.V3
 			return Expr{Kind: ExprReduce, Fn: &fn, Init: &init}
 		},
 	)
 }
 
-// atomP parses a single argument-position term: a number, a string literal, a
-// `reduce` form, a parenthesised expression, or a name. Application is built
-// from a head atom + trailing atoms (see applicationP). `reduce` is tried
-// before nameP so the keyword is not read as an identifier (Try lets a name
-// like `reducer` still parse).
-func atomP() Parser[Expr] {
+// baseAtomP parses a single argument-position term without trailing field
+// access: a number, a string literal, a `reduce` form, a struct literal, a
+// parenthesised expression, or a name. `reduce` is tried before nameP so the
+// keyword is not read as an identifier (Try lets a name like `reducer` still
+// parse).
+func baseAtomP() Parser[Expr] {
 	num := Map(Try(numberP()), func(f *big.Rat) Expr { return Expr{Kind: ExprNumLit, Num: f} })
 	str := stringLitP()
 	reduceAtom := Try(func(s Stream) ParseResult[Expr] { return reduceFormP()(s) })
+	structLit := Try(func(s Stream) ParseResult[Expr] { return structLitP()(s) })
 	paren := Map(
 		Sequence3(RuneP('('), Prefix(SpacesP(), exprP()), Sequence2(SpacesP(), RuneP(')'))),
 		func(t Of3[rune, Expr, Of2[struct{}, rune]]) Expr { return t.V2 },
 	)
-	return Or(num, Or(str, Or(reduceAtom, Or(paren, nameP()))))
+	return Or(num, Or(str, Or(reduceAtom, Or(structLit, Or(paren, nameP())))))
+}
+
+// atomP parses a base atom followed by zero or more `.Field` accesses, so
+// `a.Pos` and `(reduce M {…}).Net` are single atoms. A numeric literal's own `.`
+// (e.g. `2.5`) is consumed by numberP first, and `.Field` requires an identifier,
+// so the two never collide.
+func atomP() Parser[Expr] {
+	return Map(
+		Sequence2(baseAtomP(), Many(Try(Prefix(RuneP('.'), IdentP())))),
+		func(t Of2[Expr, []string]) Expr {
+			e := t.V1
+			for _, f := range t.V2 {
+				target := e
+				e = Expr{Kind: ExprField, Target: &target, Field: f}
+			}
+			return e
+		},
+	)
 }
 
 // applicationP parses `head arg1 arg2 ...` (prefix application). A bare atom
@@ -218,13 +288,39 @@ func exprP() Parser[Expr] {
 	}
 }
 
-// elemTypeP parses the vector element type, e.g. `vector rat0+`. The element is
-// a scalar numeric type (one of the six names); the struct form is deferred.
-func elemTypeP() Parser[ElemType] {
-	return Map(
-		Sequence3(StringP("vector"), Spaces1P(), numTypeNameP()),
-		func(t Of3[string, struct{}, string]) ElemType { return ElemType{Kind: KindReal, Scalar: t.V3} },
+// structTypeP parses a struct type body `{ Name Type ... }`. Fields are
+// `Name Type` (space-separated), separated from one another by whitespace
+// (typically newlines), with at least one field. Type is a token (numtype name
+// or a user struct type name), resolved by the builder.
+func structTypeP() Parser[ElemType] {
+	fieldSpec := Map(
+		Sequence2(IdentP(), Prefix(Spaces1P(), typeNameP())),
+		func(t Of2[string, string]) FieldSpec { return FieldSpec{Name: t.V1, Type: t.V2} },
 	)
+	more := Many(Try(Prefix(ws1P(), fieldSpec)))
+	return Map(
+		Sequence4(
+			RuneP('{'),
+			Prefix(wsP(), fieldSpec),
+			more,
+			Prefix(wsP(), RuneP('}')),
+		),
+		func(t Of4[rune, FieldSpec, []FieldSpec, rune]) ElemType {
+			return ElemType{Kind: KindStruct, Fields: append([]FieldSpec{t.V2}, t.V3...)}
+		},
+	)
+}
+
+// elemTypeP parses a type definition's right-hand side: either a struct body
+// `{ ... }` or a vector `vector <element>` whose element is a numeric type name
+// or a named struct type. structTypeP fails without consuming on a non-`{` head,
+// so the choice falls through to the vector form cleanly.
+func elemTypeP() Parser[ElemType] {
+	vec := Map(
+		Sequence3(StringP("vector"), Spaces1P(), typeNameP()),
+		func(t Of3[string, struct{}, string]) ElemType { return ElemType{Kind: KindVector, Elem: t.V3} },
+	)
+	return Or(structTypeP(), vec)
 }
 
 func eqP() Parser[Of3[struct{}, rune, struct{}]] {

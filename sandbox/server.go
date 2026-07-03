@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
-	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"gospr/builder"
+	"gospr/crdt"
 	"gospr/node"
 	"gospr/parser"
 )
@@ -71,9 +71,9 @@ type stateResponse struct {
 }
 
 type nodeState struct {
-	ID          string                       `json:"id"`
-	Initialized bool                         `json:"initialized"`
-	Collections map[string]map[string]string `json:"collections"` // collection -> slot -> ratString
+	ID          string                    `json:"id"`
+	Initialized bool                      `json:"initialized"`
+	Collections map[string]map[string]any `json:"collections"` // collection -> slot -> (ratString | struct object)
 }
 
 type collectionSchema struct {
@@ -96,7 +96,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 			ns := nodeState{
 				ID:          id,
 				Initialized: n.Initialized(),
-				Collections: snapshotToStrings(n.Snapshot()),
+				Collections: wireToState(n.SnapshotWireAll()),
 			}
 			resp.Nodes = append(resp.Nodes, ns)
 		}
@@ -116,22 +116,32 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
-// snapshotToStrings converts a node snapshot (collection -> CRDT snapshot) into
-// collection -> slot -> exact-rational string for the wire.
-func snapshotToStrings(snap map[string]any) map[string]map[string]string {
-	out := map[string]map[string]string{}
-	for name, s := range snap {
-		state, ok := s.(map[string]*big.Rat)
-		if !ok {
-			continue
-		}
-		slots := make(map[string]string, len(state))
-		for slot, v := range state {
-			slots[slot] = v.RatString()
+// wireToState converts each collection's WireSnapshot into collection -> slot ->
+// JSON value for the SPA: a scalar slot is an exact-rational string, a struct slot
+// is a (possibly nested) object of field -> value.
+func wireToState(snap map[string]crdt.WireSnapshot) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	for name, ws := range snap {
+		slots := make(map[string]any, len(ws.Slots))
+		for slot, sw := range ws.Slots {
+			slots[slot] = slotWireToAny(sw)
 		}
 		out[name] = slots
 	}
 	return out
+}
+
+// slotWireToAny renders a SlotWire as a JSON value: scalar -> its rational string,
+// struct -> an object of field -> value (recursing).
+func slotWireToAny(sw crdt.SlotWire) any {
+	if sw.Struct != nil {
+		obj := make(map[string]any, len(sw.Struct))
+		for k, f := range sw.Struct {
+			obj[k] = slotWireToAny(f)
+		}
+		return obj
+	}
+	return sw.Num
 }
 
 // planSchema describes the deployed plan's collections so the UI can render one

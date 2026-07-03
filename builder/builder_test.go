@@ -63,7 +63,7 @@ func gotherwise(result parser.Expr) parser.GuardCase {
 // under a max merge when k is non-negative, which the convergence prover checks.
 func canonicalPlan() parser.Plan {
 	return parser.Plan{
-		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindReal, Scalar: "rat"}}},
+		Types: []parser.TypeDef{{Name: "T", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}}},
 		Functions: []parser.FnDef{
 			{Name: "lub", Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 				Body: app(name("max"), name("a"), name("b"))},
@@ -90,7 +90,8 @@ func TestBuild_integration(t *testing.T) {
 	require.Contains(t, built.Models, "T")
 	m := built.Models["T"]
 
-	assert.Equal(t, parser.KindReal, m.Elem.Kind)
+	assert.False(t, m.Elem.Struct)
+	assert.Equal(t, numtype.NumType{Domain: numtype.DRat, Sign: numtype.SAny}, m.Elem.Num)
 
 	// merge: zip lub -> Fn resolved to a user-function Ref of arity 2.
 	assert.Equal(t, parser.ExprZip, m.Merge.Kind)
@@ -473,4 +474,126 @@ func TestBuild_anchoredRecursionThroughOperator(t *testing.T) {
 `
 	_, err := Build(mustParse(t, src))
 	require.NoError(t, err)
+}
+
+// ---- struct vectors ------------------------------------------------
+
+// The canonical struct-vector PN-counter builds: struct type, vector of it,
+// whole-struct max merge (a product join-semilattice), struct-typed updates
+// proven inflationary, and struct construction / field access type-check.
+func TestBuild_structVectorAccepts(t *testing.T) {
+	const src = `type X = {
+  Pos rat0+
+  Neg rat0+
+}
+type VX = vector X
+fn J a::X b::X = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }
+fn incPos k::rat0+ s::X = { Pos: + s.Pos k, Neg: s.Neg }
+merge VX = zip J
+update VX.AddPos k::rat0+ = local (incPos k)
+query VX.Net = (reduce J { Pos: 0, Neg: 0 }).Pos
+collection C = VX
+`
+	built, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+	m := built.Models["VX"]
+	require.NotNil(t, m)
+	require.True(t, m.Elem.Struct)
+	require.Len(t, m.Elem.Fields, 2)
+	assert.Equal(t, "Pos", m.Elem.Fields[0].Name)
+	assert.Equal(t, numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonNeg}, m.Elem.Fields[0].Type.Num)
+	// A struct type is not itself a collectable model.
+	_, isModel := built.Models["X"]
+	assert.False(t, isModel)
+}
+
+// A per-field SUM merge is commutative/associative but NOT idempotent, so the
+// convergence prover rejects it (the classic counter mistake).
+func TestBuild_structPerFieldSumMergeRejected(t *testing.T) {
+	const src = `type X = { Pos rat0+  Neg rat0+ }
+type VX = vector X
+fn S a::X b::X = { Pos: + a.Pos b.Pos, Neg: + a.Neg b.Neg }
+merge VX = zip S
+collection C = VX
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "convergence")
+}
+
+// Accessing a field the struct does not have is a build error.
+func TestBuild_unknownFieldRejected(t *testing.T) {
+	const src = `type X = { Pos rat0+ }
+type VX = vector X
+fn J a::X b::X = { Pos: max a.Pos b.Pos }
+fn bad s::X = { Pos: s.Nope }
+merge VX = zip J
+update VX.U = local bad
+collection C = VX
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Nope")
+}
+
+// A struct literal whose field type is not assignable to the element field type
+// (here `- s.Pos 1` loses the non-negative sign of a rat0+ field) is rejected.
+func TestBuild_structFieldTypeMismatchRejected(t *testing.T) {
+	const src = `type X = { Pos rat0+ }
+type VX = vector X
+fn J a::X b::X = { Pos: max a.Pos b.Pos }
+fn bad s::X = { Pos: - s.Pos 1 }
+merge VX = zip J
+update VX.U = local bad
+collection C = VX
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not assignable")
+}
+
+// A struct type cannot be instantiated as a collection (only vectors can).
+func TestBuild_structCollectionRejected(t *testing.T) {
+	const src = `type X = { Pos rat0+ }
+collection C = X
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+}
+
+// Dot access on a scalar (non-struct) value is a build error.
+func TestBuild_fieldOfScalarRejected(t *testing.T) {
+	const src = `type T = vector rat0+
+merge T = zip max
+query T.Bad = (reduce max 0).Pos
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-struct")
+}
+
+// A user type name may not shadow a numeric type name.
+func TestBuild_reservedTypeNameRejected(t *testing.T) {
+	const src = `type int = { A rat0+ }
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved")
+}
+
+// A struct-typed update param is rejected (update params cross the wire as
+// scalars).
+func TestBuild_structUpdateParamRejected(t *testing.T) {
+	const src = `type X = { Pos rat0+ }
+type VX = vector X
+fn J a::X b::X = { Pos: max a.Pos b.Pos }
+fn pick a::X b::X = { Pos: max a.Pos b.Pos }
+merge VX = zip J
+update VX.U p::X = local (pick p)
+collection C = VX
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "numeric type")
 }

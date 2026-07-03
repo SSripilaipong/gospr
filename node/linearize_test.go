@@ -271,7 +271,7 @@ func TestChanPeer_sendBoundByDone(t *testing.T) {
 // Test 9: every sync DTO round-trips through both gob and JSON (no unexported
 // field dropped, no any/*big.Rat that fails to encode), and reqIDs are monotonic.
 func TestSyncMessages_codecRoundTrip(t *testing.T) {
-	snap := crdt.WireSnapshot{Slots: map[string]string{"n1": "1/2", "n2": "3"}}
+	snap := crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{"n1": {Num: "1/2"}, "n2": {Num: "3"}}}
 	push := SyncPushMsg{FromID: "node1", ReqID: "node1-7", Collection: "C", Fingerprint: "abc", Snapshot: snap}
 	pull := SyncPullMsg{FromID: "node1", ReqID: "node1-8", Collection: "C", Fingerprint: "abc"}
 	ack := SyncAckMsg{FromID: "node2", ReqID: "node1-7", Snapshot: snap}
@@ -334,9 +334,9 @@ func TestSyncAck_distinctPeerCounting(t *testing.T) {
 		// A known peer returns a corrupt wire snapshot (invalid rational); another
 		// returns a valid one.
 		n.handleSyncAck(SyncAckMsg{FromID: "node2", ReqID: rid,
-			Snapshot: crdt.WireSnapshot{Slots: map[string]string{"node2": "not-a-rational"}}})
+			Snapshot: crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{"node2": {Num: "not-a-rational"}}}})
 		n.handleSyncAck(SyncAckMsg{FromID: "node3", ReqID: rid,
-			Snapshot: crdt.WireSnapshot{Slots: map[string]string{"node3": "4"}}})
+			Snapshot: crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{"node3": {Num: "4"}}}})
 
 		onAck := func(ack SyncAckMsg) error { return n.mergeCollection("Counter", ack.Snapshot) }
 		// ratio 1.0 needs both peers as holders, but node2's merge fails ⇒ only 1

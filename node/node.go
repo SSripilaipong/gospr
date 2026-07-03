@@ -261,6 +261,20 @@ func (n *Node) Snapshot() map[string]any {
 	return snap
 }
 
+// SnapshotWireAll returns each collection's transport-safe WireSnapshot (scalar
+// or struct slots). It is the public accessor the sandbox uses to render node
+// state — the in-process Snapshot returns an opaque runtime shape, whereas this
+// is the stable wire encoding.
+func (n *Node) SnapshotWireAll() map[string]crdt.WireSnapshot {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make(map[string]crdt.WireSnapshot, len(n.collections))
+	for name, c := range n.collections {
+		out[name] = c.SnapshotWire()
+	}
+	return out
+}
+
 func (n *Node) MergeSnapshot(snap map[string]any) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()

@@ -28,7 +28,8 @@ update T.Add k::rat = local (+ k)
 	require.Len(t, plan.Types, 1)
 	td := plan.Types[0]
 	assert.Equal(t, "T", td.Name)
-	assert.Equal(t, KindReal, td.Elem.Kind)
+	assert.Equal(t, KindVector, td.Elem.Kind)
+	assert.Equal(t, "rat", td.Elem.Elem)
 
 	// --- function: fn lub a b = max a b ---
 	require.Len(t, plan.Functions, 1)
@@ -203,13 +204,75 @@ func TestParse_numericTypeNames(t *testing.T) {
 		plan, err := Parse("type T = vector " + name + "\n")
 		require.NoError(t, err, "elem %q", name)
 		require.Len(t, plan.Types, 1, "elem %q", name)
-		assert.Equal(t, name, plan.Types[0].Elem.Scalar, "elem %q", name)
+		assert.Equal(t, name, plan.Types[0].Elem.Elem, "elem %q", name)
 
 		plan, err = Parse("fn f k::" + name + " = k\n")
 		require.NoError(t, err, "param %q", name)
 		require.Len(t, plan.Functions, 1, "param %q", name)
 		assert.Equal(t, name, plan.Functions[0].Params[0].Type, "param %q", name)
 	}
+}
+
+// A struct-vector program parses: a named struct type spanning multiple lines, a
+// vector of it, a merge/update fn using struct params, struct literals, and dot
+// field access, plus a query projecting a field off a `reduce` fold.
+func TestParse_structVector(t *testing.T) {
+	src := `type X = {
+  Pos rat0+
+  Neg rat0+
+}
+
+type VX = vector X
+
+fn J a::X b::X = {
+  Pos: max a.Pos b.Pos,
+  Neg: max a.Neg b.Neg,
+}
+
+fn incPos k::rat0+ s::X = { Pos: + s.Pos k, Neg: s.Neg }
+
+merge VX = zip J
+
+update VX.AddPos k::rat0+ = local (incPos k)
+
+query VX.Net = - (reduce J { Pos: 0, Neg: 0 }).Pos (reduce J { Pos: 0, Neg: 0 }).Neg
+
+collection C = VX
+`
+	plan, err := Parse(src)
+	require.NoError(t, err)
+
+	require.Len(t, plan.Types, 2)
+	x := plan.Types[0]
+	assert.Equal(t, "X", x.Name)
+	assert.Equal(t, KindStruct, x.Elem.Kind)
+	require.Len(t, x.Elem.Fields, 2)
+	assert.Equal(t, "Pos", x.Elem.Fields[0].Name)
+	assert.Equal(t, "rat0+", x.Elem.Fields[0].Type)
+	assert.Equal(t, "Neg", x.Elem.Fields[1].Name)
+
+	vx := plan.Types[1]
+	assert.Equal(t, KindVector, vx.Elem.Kind)
+	assert.Equal(t, "X", vx.Elem.Elem)
+
+	require.Len(t, plan.Functions, 2)
+	j := plan.Functions[0]
+	assert.Equal(t, "J", j.Name)
+	assert.Equal(t, "X", j.Params[0].Type)
+	require.Equal(t, ExprStructLit, j.Body.Kind)
+	require.Len(t, j.Body.StructFields, 2)
+	assert.Equal(t, "Pos", j.Body.StructFields[0].Name)
+
+	require.Len(t, plan.Updates, 1)
+	require.Len(t, plan.Queries, 1)
+	q := plan.Queries[0]
+	assert.Equal(t, "Net", q.MethodName)
+	// - <field> <field>
+	require.Equal(t, ExprApp, q.Body.Kind)
+	require.Len(t, q.Body.Args, 2)
+	assert.Equal(t, ExprField, q.Body.Args[0].Kind)
+	assert.Equal(t, "Pos", q.Body.Args[0].Field)
+	assert.Equal(t, ExprReduce, q.Body.Args[0].Target.Kind)
 }
 
 func TestParse_collection(t *testing.T) {
@@ -310,9 +373,12 @@ func TestParse_empty(t *testing.T) {
 }
 
 // A recognized-but-malformed line is a parse error, not silently skipped,
-// because Or is committed once the keyword prefix is consumed.
+// because Or is committed once the keyword prefix is consumed. (An unknown but
+// well-formed element token like `vector foo` is now a build error, not a parse
+// error — the parser is semantics-free about type names — so this uses a genuine
+// syntax error: `vector` with no element token.)
 func TestParse_malformedTypeIsError(t *testing.T) {
-	_, err := Parse("type T = vector foo\n")
+	_, err := Parse("type T = vector\n")
 	require.Error(t, err)
 }
 
@@ -323,7 +389,7 @@ func TestParse_fnWithoutParamsIsError(t *testing.T) {
 }
 
 func TestParse_errorHasPosition(t *testing.T) {
-	_, err := Parse("type T = vector foo\n")
+	_, err := Parse("type T = vector\n")
 	require.Error(t, err)
 	var pe ParseError
 	require.ErrorAs(t, err, &pe)
