@@ -11,8 +11,25 @@ type lineResult struct {
 	collection *CollectionSpec
 }
 
+// commentP consumes a `#` and the rest of the physical line (up to but not
+// including the newline). A comment is treated as insignificant whitespace
+// everywhere a line may end (via newlineOrEOF) and, inside `{ ... }` bodies,
+// wherever whitespace separates tokens (via wsP/ws1P). `#` is unused elsewhere in
+// the grammar, and stringLitP consumes its own chars, so there is no collision.
+func commentP() Parser[struct{}] {
+	return Discard(Sequence2(RuneP('#'), TillEOL()))
+}
+
 func newlineOrEOF() Parser[struct{}] {
-	return Or(Discard(RuneP('\n')), EOF())
+	return Prefix(Or(commentP(), Succeed(struct{}{})), Or(Discard(RuneP('\n')), EOF()))
+}
+
+// blankOrCommentP matches a line that is only optional spaces/tabs followed by an
+// optional trailing comment, then the newline/EOF. It is the single definition of
+// "a line with no statement on it" — reused by blankOrCommentLineP (top level) and
+// as the inter-case separator inside guarded functions.
+func blankOrCommentP() Parser[struct{}] {
+	return Discard(Sequence2(SpacesP(), newlineOrEOF()))
 }
 
 func digitsP() Parser[string] {
@@ -22,21 +39,26 @@ func digitsP() Parser[string] {
 	)
 }
 
-// numberP parses a non-negative decimal literal (a leading '-' is the '-'
-// operator, never a literal sign; negative literals are deferred). The value is
-// an exact rational: a decimal like 0.1 becomes exactly 1/10, with no float
-// rounding (so the runtime and the convergence proof reason over the same value).
+// numberP parses a decimal literal with an optional leading '-' sign. The syntax
+// is decimal-only (digits with an optional fractional part) — there is no '/'
+// rational literal form. A '-' must be immediately followed by digits, so `-5` is
+// the literal negative five while `- 5` (with a space) is the '-' operator applied;
+// the sole caller wraps numberP in Try, so consuming `-` and then failing on the
+// space cleanly backtracks to the operator. The value is an exact rational: a
+// decimal like 0.1 becomes exactly 1/10, with no float rounding (so the runtime and
+// the convergence proof reason over the same value).
 func numberP() Parser[*big.Rat] {
+	sign := Or(Try(Map(RuneP('-'), func(rune) string { return "-" })), Succeed(""))
 	frac := Or(
 		Try(Map(Sequence2(RuneP('.'), digitsP()), func(t Of2[rune, string]) string { return "." + t.V2 })),
 		Succeed(""),
 	)
 	return func(s Stream) ParseResult[*big.Rat] {
-		r := Sequence2(digitsP(), frac)(s)
+		r := Sequence3(sign, digitsP(), frac)(s)
 		if !r.Ok {
 			return failure[*big.Rat](r.Err, r.Consumed)
 		}
-		text := r.Value.V1 + r.Value.V2
+		text := r.Value.V1 + r.Value.V2 + r.Value.V3
 		q, ok := new(big.Rat).SetString(text)
 		if !ok {
 			line, col := runePos(s.Items, s.Pos)
@@ -162,17 +184,22 @@ func nameP() Parser[Expr] {
 	return Map(Or(symOpP(), IdentP()), func(n string) Expr { return Expr{Kind: ExprName, Name: n} })
 }
 
-// wsP consumes spaces, tabs, and newlines. It is used inside `{ ... }` braces
-// (struct type defs and struct literals), which may span multiple physical lines,
-// so newlines there are insignificant whitespace rather than construct delimiters.
-func wsP() Parser[struct{}] {
-	return Map(Many(Satisfy(func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' }, "whitespace")), func(_ []rune) struct{} { return struct{}{} })
+func oneWSCharP() Parser[rune] {
+	return Satisfy(func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' }, "whitespace")
 }
 
-// ws1P is wsP but requires at least one whitespace/newline char. Used to separate
-// struct-type field lines (`Pos rat0+` then a newline then `Neg rat0+`).
+// wsP consumes spaces, tabs, newlines, and `#` comments. It is used inside `{ ... }`
+// braces (struct type defs and struct literals), which may span multiple physical
+// lines, so newlines and comments there are insignificant whitespace rather than
+// construct delimiters.
+func wsP() Parser[struct{}] {
+	return Discard(Many(Or(Discard(oneWSCharP()), commentP())))
+}
+
+// ws1P is wsP but requires at least one whitespace/newline/comment unit. Used to
+// separate struct-type field lines (`Pos rat0+` then a newline then `Neg rat0+`).
 func ws1P() Parser[struct{}] {
-	return Map(Many1(Satisfy(func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' }, "whitespace")), func(_ []rune) struct{} { return struct{}{} })
+	return Discard(Many1(Or(Discard(oneWSCharP()), commentP())))
 }
 
 // structLitP parses a struct construction literal `{ Name: expr, Name: expr }`.
@@ -380,8 +407,14 @@ func fnLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("fn"), Spaces1P()))
 	header := Sequence2(IdentP(), paramsP1())
 	singleBody := Prefix(eqP(), Suffix(endP(), exprP()))
+	// A guard case may be preceded by blank/comment-only lines. guardSep is
+	// Try-wrapped so an indented `| ...` line (whose leading spaces guardSep would
+	// otherwise eat) is not mistaken for a blank line, and each Many1 iteration is
+	// Try-wrapped so trailing blank/comment lines after the last case are restored
+	// for the top-level line loop.
+	guardSep := Discard(Many(Try(blankOrCommentP())))
 	guardedBody := Map(
-		Prefix(endP(), Many1(Try(guardLineP()))),
+		Prefix(endP(), Many1(Try(Prefix(guardSep, guardLineP())))),
 		func(cases []GuardCase) Expr { return Expr{Kind: ExprGuards, Cases: cases} },
 	)
 	rest := Map(
@@ -459,16 +492,31 @@ func collectionLineP() Parser[lineResult] {
 	return Prefix(prefix, rest)
 }
 
-func skipLineP() Parser[lineResult] {
-	return Map(Suffix(newlineOrEOF(), TillEOL()), func(_ string) lineResult { return lineResult{} })
+// blankOrCommentLineP matches a blank line or a whole-line/indented comment and
+// produces an empty result (no statement). Try-wrapped so a line carrying real
+// content backtracks and reaches unknownLineP.
+func blankOrCommentLineP() Parser[lineResult] {
+	return Map(Try(blankOrCommentP()), func(struct{}) lineResult { return lineResult{} })
+}
+
+// unknownLineP is the last alternative in lineP: any line that matched no keyword,
+// no stray-`|`, and is not blank/comment is an unrecognized statement. It commits a
+// parse error (rather than silently skipping) so a typo like `udpate T.Add ...`
+// fails loudly instead of vanishing. The committed failure propagates out of
+// Many(lineP()) as the overall parse error.
+func unknownLineP() Parser[lineResult] {
+	return func(s Stream) ParseResult[lineResult] {
+		line, col := runePos(s.Items, s.Pos)
+		return failure[lineResult](ParseError{Pos: s.Pos, Line: line, Col: col, Message: "unrecognized statement"}, true)
+	}
 }
 
 // barLineP rejects a stray `| ...` line. A guard line belongs to guarded-function
 // syntax and is consumed by fnLineP; any `|` reaching the top level (e.g. a
 // malformed guard after `otherwise`, or a `|` with no `fn` header) is a syntax
 // error, not a blank/unknown line to skip. Detection is Try-wrapped so a line
-// that merely has leading spaces but no `|` falls through to skipLineP; once a
-// `|` is seen the failure is committed.
+// that merely has leading spaces but no `|` falls through to blankOrCommentLineP;
+// once a `|` is seen the failure is committed.
 func barLineP() Parser[lineResult] {
 	detect := Try(Sequence2(SpacesP(), RuneP('|')))
 	return func(s Stream) ParseResult[lineResult] {
@@ -488,7 +536,8 @@ func lineP() Parser[lineResult] {
 					Or(updateLineP(),
 						Or(collectionLineP(),
 							Or(barLineP(),
-								skipLineP())))))))
+								Or(blankOrCommentLineP(),
+									unknownLineP()))))))))
 }
 
 func dslParser() Parser[Plan] {

@@ -952,19 +952,23 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 	}
 }
 
-// literalType types a numeric literal. All literals are non-negative; the
-// literal 0 gets the internal Zero sign so it is assignable to any numeric type
-// (non-negative AND non-positive targets). Integer-valued literals are int;
-// others are rat.
+// literalType types a numeric literal. The literal 0 gets the internal Zero sign
+// so it is assignable to any numeric type (non-negative AND non-positive targets);
+// a positive literal is non-negative (SNonNeg), a negative one is non-positive
+// (SNonPos). Integer-valued literals are int; others are rat.
 func literalType(n *big.Rat) vtype {
-	switch {
-	case n.Sign() == 0:
+	if n.Sign() == 0 {
 		return vNum(numtype.NumType{Domain: numtype.DInt, Sign: numtype.SZero})
-	case n.IsInt():
-		return vNum(numtype.NumType{Domain: numtype.DInt, Sign: numtype.SNonNeg})
-	default:
-		return vNum(numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonNeg})
 	}
+	sign := numtype.SNonNeg
+	if n.Sign() < 0 {
+		sign = numtype.SNonPos
+	}
+	domain := numtype.DRat
+	if n.IsInt() {
+		domain = numtype.DInt
+	}
+	return vNum(numtype.NumType{Domain: domain, Sign: sign})
 }
 
 // applyArgs applies args to a (possibly partial) signature. Each arg must be

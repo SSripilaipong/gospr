@@ -359,10 +359,77 @@ func TestParse_reduceFnIsAtomNotApplication(t *testing.T) {
 	assert.Equal(t, big.NewRat(0, 1), body.Init.Num)
 }
 
-func TestParse_skipBlankAndUnknownLines(t *testing.T) {
+func TestParse_skipBlankAndCommentLines(t *testing.T) {
 	plan, err := Parse("\n# a comment\ntype T = vector rat\n\n")
 	require.NoError(t, err)
 	assert.Len(t, plan.Types, 1)
+}
+
+func TestParse_unknownLineIsError(t *testing.T) {
+	// A typo like `udpate` matches no keyword and must fail loudly rather than
+	// being silently swallowed.
+	_, err := Parse("type T = vector rat0+\nudpate T.Add k::rat0+ = local (+ k)\ncollection X = T\n")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unrecognized statement")
+}
+
+func TestParse_trailingComments(t *testing.T) {
+	src := "type T = vector rat0+   # a counter\n" +
+		"merge T = zip max   # elementwise max\n" +
+		"update T.Add k::rat0+ = local (+ k)   # bump\n" +
+		"collection X = T   # instance\n"
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	assert.Len(t, plan.Types, 1)
+	assert.Len(t, plan.Merges, 1)
+	assert.Len(t, plan.Updates, 1)
+	assert.Len(t, plan.Collections, 1)
+}
+
+func TestParse_commentInsideStructBody(t *testing.T) {
+	// A comment on the `{` line and on a field line (the form used in the docs).
+	src := "type X = {   # a struct\n  Pos rat0+   # positive part\n  Neg rat0+\n}\n"
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	require.Len(t, plan.Types, 1)
+	assert.Equal(t, KindStruct, plan.Types[0].Elem.Kind)
+	assert.Len(t, plan.Types[0].Elem.Fields, 2)
+}
+
+func TestParse_commentBetweenGuardCases(t *testing.T) {
+	src := "fn grade x::rat\n" +
+		"| (> x 90) = \"A\"\n" +
+		"# comment between guards\n" +
+		"| otherwise = \"F\"\n"
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	require.Len(t, plan.Functions, 1)
+	body := plan.Functions[0].Body
+	require.Equal(t, ExprGuards, body.Kind)
+	assert.Len(t, body.Cases, 2)
+}
+
+func TestParse_negativeLiterals(t *testing.T) {
+	// `-5` and `-2.5` are negative literals; `- 5` (with a space) is the operator.
+	plan, err := Parse("fn f a::rat = max a -5\n")
+	require.NoError(t, err)
+	neg := plan.Functions[0].Body.Args[1] // max a (-5)
+	require.Equal(t, ExprNumLit, neg.Kind)
+	assert.Equal(t, big.NewRat(-5, 1), neg.Num)
+
+	plan, err = Parse("fn g a::rat = max a -2.5\n")
+	require.NoError(t, err)
+	neg = plan.Functions[0].Body.Args[1]
+	require.Equal(t, ExprNumLit, neg.Kind)
+	assert.Equal(t, big.NewRat(-5, 2), neg.Num)
+
+	// `- 5` stays the subtraction operator applied to two args.
+	plan, err = Parse("fn h a::rat = - a 5\n")
+	require.NoError(t, err)
+	body := plan.Functions[0].Body
+	require.Equal(t, ExprApp, body.Kind)
+	assert.Equal(t, "-", body.Head.Name)
+	assert.Len(t, body.Args, 2)
 }
 
 func TestParse_empty(t *testing.T) {

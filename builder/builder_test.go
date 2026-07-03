@@ -443,6 +443,32 @@ collection C = T
 	require.NoError(t, err)
 }
 
+// A negative literal is typed non-positive (SNonPos), so `+ (-5)` on a `vector
+// rat0-` stays non-positive, is assignable to the slot, and is proven inflationary
+// under min.
+func TestBuild_negativeLiteralAssignableToNonPos(t *testing.T) {
+	src := `type T = vector rat0-
+merge T = zip min
+update T.Dec = local (+ -5)
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+}
+
+// Conversely a negative literal's non-positive sign propagates: `+ a (-5)` over a
+// non-negative operand is SAny (`rat`), which is not assignable back to a `rat0+`
+// slot, so the merge boundary rejects it.
+func TestBuild_negativeLiteralRejectedWhereNonNeg(t *testing.T) {
+	src := `type T = vector rat0+
+fn addneg a::rat0+ b::rat0+ = + a -5
+merge T = zip addneg
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+}
+
 // Mixed domains: a `vector rat` slot with an int0+ increment param builds and
 // is proven inflationary under max — the prover declares the slot as Real and
 // the param as an integer (is_int), so the cross-domain `+` is well-sorted.
