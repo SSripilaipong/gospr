@@ -132,7 +132,7 @@ builder/
   builder_test.go     hard-coded-AST integration test + error/duplicate/fn/arity/type + numeric-subtype + convergence-rejection cases
 
 prover/
-  prover.go           Prove(elem crdt.ElemT, merge, updates, funcs); sym IR (+symStruct) + lower (eval/refFn/evalApp/evalGuards + StructLit/Field, user-fn inlining + recursion guard); symVarOf flattens a struct var to path-index leaf vars; merge-law + per-update inflationary obligation builders
+  prover.go           Prove(elem crdt.ElemT, merge, updates, funcs); sym IR (+symStruct) + lower (eval/refFn/evalApp/evalGuards + StructLit/Field, user-fn inlining + recursion guard); symVarOf flattens a struct var to path-index leaf vars; guarded ite distributes over struct fields via iteSym; merge-law + per-update inflationary obligation builders
   smt.go              sym → SMT-LIB (single Real sort over-approximating ℚ, is_int/sign asserts, fmtRat→(/ p.0 q.0), max/min→ite, ==/ /= → =/distinct); leafEqs+conjunction flatten a struct equality to a leaf-conjunction negated in one goal; checkGoal/runZ3 via os/exec `z3 -smt2 -in`, unsat=proven; lookPath/z3Binary seams
   prover_test.go      z3-backed accept/reject (max/min join, sum/avg rejected, inflationary, mixed-domain, recursion) + z3-missing seam
 
@@ -247,6 +247,7 @@ Tests use `github.com/stretchr/testify` (`assert` + `require`):
 - **Name resolution invariant:** `ExprName` appears ONLY in parser output; after `Build`, every leaf is an `ExprVar` (bound param), `ExprRef` (symbol, with `Arity`/`RefKind`), or a literal (`ExprNumLit`/`ExprStrLit`). Proof/optimization passes can rely on this — no unresolved leaves in a `*Model` or `Functions` entry.
 - **Totality of guards:** the builder requires a guarded `fn` to end with `otherwise` (a `GuardCase.Otherwise` marker — an always-true `Cond` does NOT count), so the runtime's "non-exhaustive guards" error is unreachable. `otherwise` may appear only as the last case.
 - **`reduce` reads state, so it's query-scoped:** `reduce` evaluates by folding `v.state`, hence its eval requires `v.mu` held (Query holds it). The builder forbids `reduce` in `fn`/merge/update bodies so those stay pure value-functions.
+- **Prover soundness with structs:** a `sym` node must never carry a whole struct through scalar position, or the SMT flattening skips its fields and can spuriously prove a non-lattice merge. When adding a sym form reachable from a struct-valued fn, distribute it per-field (see `iteSym` in `prover/prover.go` and `TestProve_structGuardedNonCommutativeRejected` for why).
 - **Return-type inference (Option A):** `checker.inferReturn` is memoized DFS; a recursive call caught mid-inference yields `vUnknown`, which unifies with any concrete type. If a function's type stays `vUnknown` (no concrete branch), Build rejects it.
 - `exprP` is recursive (parenthesised atoms hold expressions); the body is deferred to parse time (`exprP` returns a thunk) to break the parser-construction cycle.
 - `Model.Queries`/`Updates` are always non-nil maps (init in `Build`) so swagger/crdt can range/lookup safely; `Model.Funcs`/`BuiltPlan.Functions` is the shared global function env.

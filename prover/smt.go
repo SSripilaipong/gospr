@@ -143,6 +143,12 @@ func serialize(s sym) string {
 		}
 	case symIte:
 		return fmt.Sprintf("(ite %s %s %s)", serialize(*s.cond), serialize(*s.a), serialize(*s.b))
+	case symStruct:
+		// A struct must be flattened to leaf equalities by leafEqs before it can be
+		// serialized; reaching here means a struct leaked into scalar position (e.g.
+		// an un-distributed guard ite). Emit an undeclared symbol so z3 errors out and
+		// the build fails closed rather than silently "proving" a garbage obligation.
+		return "|struct-not-flattened|"
 	default:
 		return "0.0"
 	}

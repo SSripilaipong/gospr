@@ -219,3 +219,20 @@ func TestProve_structUpdateInflationary(t *testing.T) {
 	}
 	require.NoError(t, Prove(structElem, zipE(fnRef("J", 2)), updates, map[string]crdt.Function{"J": jMax(), "incPos": incPos}))
 }
+
+// A guarded struct-valued merge that is not commutative must be rejected. The
+// prover distributes the guard `ite` over struct fields (iteSym) so the SMT
+// flattening sees the real per-field structure; a scalar ite over whole struct
+// branches would hide it and spuriously "prove" a non-lattice merge.
+func TestProve_structGuardedNonCommutativeRejected(t *testing.T) {
+	// fn First a b | (> 1 0) = a | otherwise = b  (returns a always ⇒ not commutative)
+	first := crdt.Function{Name: "First", Params: []parser.ParamSpec{{Name: "a", Type: "X"}, {Name: "b", Type: "X"}},
+		Body: parser.Expr{Kind: parser.ExprGuards, Cases: []parser.GuardCase{
+			{Cond: ptr(appE(prim(">"), numE(1), numE(0))), Result: ptr(varE("a"))},
+			{Otherwise: true, Result: ptr(varE("b"))},
+		}}}
+	err := Prove(structElem, zipE(fnRef("First", 2)), nil, map[string]crdt.Function{"First": first})
+	require.Error(t, err)
+}
+
+func ptr(e parser.Expr) *parser.Expr { return &e }

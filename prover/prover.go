@@ -273,9 +273,40 @@ func (p *prover) evalGuards(e parser.Expr, env map[string]sym, visited map[strin
 		if cf != nil || rf != nil {
 			return sym{}, nil, fmt.Errorf("guard condition/result is not a value")
 		}
-		acc = ite(cv, rv, acc)
+		acc, err = iteSym(cv, rv, acc)
+		if err != nil {
+			return sym{}, nil, err
+		}
 	}
 	return acc, nil, nil
+}
+
+// iteSym builds `if cond then a else b`, distributing over struct fields when the
+// branches are structs: ite(c, {p:tp,…}, {p:ep,…}) == {p: ite(c,tp,ep), …}. This
+// keeps guarded struct-valued functions faithful — a scalar ite wrapping whole
+// struct branches would hide the per-field structure from the SMT flattening
+// (leafEqs sees a symIte leaf, not a symStruct), making a non-lattice merge like
+// `fn First a b | c = a | otherwise = b` spuriously provable.
+func iteSym(cond, a, b sym) (sym, error) {
+	if a.kind == symStruct || b.kind == symStruct {
+		if a.kind != symStruct || b.kind != symStruct {
+			return sym{}, fmt.Errorf("guard branches have mismatched struct/scalar shape")
+		}
+		fields := make(map[string]sym, len(a.fields))
+		for name, af := range a.fields {
+			bf, ok := b.fields[name]
+			if !ok {
+				return sym{}, fmt.Errorf("guard branches have mismatched struct fields (missing %q)", name)
+			}
+			f, err := iteSym(cond, af, bf)
+			if err != nil {
+				return sym{}, err
+			}
+			fields[name] = f
+		}
+		return structSym(fields), nil
+	}
+	return ite(cond, a, b), nil
 }
 
 // evalFn lowers a function-valued term and asserts its arity, returning the
