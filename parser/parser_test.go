@@ -463,3 +463,67 @@ func TestParse_errorHasPosition(t *testing.T) {
 	assert.NotZero(t, pe.Line)
 	assert.NotZero(t, pe.Col)
 }
+
+// ---- V.Elem parsing, inline vector struct, element-ref aliases -------------
+
+// An inline struct vector element parses as KindVector carrying an Inner struct;
+// `V.Elem` param and field tokens survive verbatim; `type X = V.Elem` is KindElemRef.
+func TestParse_inlineVectorStructAndElemRef(t *testing.T) {
+	src := `type V = vector {
+  Pos rat0+
+  Neg rat0+
+}
+fn J a::V.Elem b::V.Elem = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }
+type X = V.Elem
+`
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	require.Len(t, plan.Types, 2)
+
+	v := plan.Types[0]
+	assert.Equal(t, "V", v.Name)
+	assert.Equal(t, KindVector, v.Elem.Kind)
+	assert.Equal(t, "", v.Elem.Elem) // inline: no token
+	require.NotNil(t, v.Elem.Inner)
+	assert.Equal(t, KindStruct, v.Elem.Inner.Kind)
+	require.Len(t, v.Elem.Inner.Fields, 2)
+	assert.Equal(t, "Pos", v.Elem.Inner.Fields[0].Name)
+	assert.Equal(t, "rat0+", v.Elem.Inner.Fields[0].Type)
+
+	j := plan.Functions[0]
+	assert.Equal(t, "V.Elem", j.Params[0].Type)
+	assert.Equal(t, "V.Elem", j.Params[1].Type)
+
+	x := plan.Types[1]
+	assert.Equal(t, "X", x.Name)
+	assert.Equal(t, KindElemRef, x.Elem.Kind)
+	assert.Equal(t, "V.Elem", x.Elem.Elem)
+}
+
+// A type name beginning with the `vector` keyword must not be swallowed by the
+// vector alternative — `vectorClock.Elem` parses as an element-ref (guards the
+// Try(vector ...) committed-choice fix).
+func TestParse_vectorPrefixedNameBoundary(t *testing.T) {
+	src := `type vectorClock = vector rat0+
+type X = vectorClock.Elem
+`
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	require.Len(t, plan.Types, 2)
+	assert.Equal(t, KindVector, plan.Types[0].Elem.Kind)
+	assert.Equal(t, "rat0+", plan.Types[0].Elem.Elem)
+	assert.Equal(t, KindElemRef, plan.Types[1].Elem.Kind)
+	assert.Equal(t, "vectorClock.Elem", plan.Types[1].Elem.Elem)
+}
+
+// A vector whose element is itself a `.Elem` token keeps the token in Elem.
+func TestParse_vectorOfElemRefToken(t *testing.T) {
+	src := `type W = vector V.Elem
+`
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	require.Len(t, plan.Types, 1)
+	assert.Equal(t, KindVector, plan.Types[0].Elem.Kind)
+	assert.Equal(t, "V.Elem", plan.Types[0].Elem.Elem)
+	assert.Nil(t, plan.Types[0].Elem.Inner)
+}

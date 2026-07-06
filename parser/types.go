@@ -13,17 +13,22 @@ import (
 type ElemKind int
 
 const (
-	KindStruct ElemKind = iota // struct type: Fields
-	KindVector                 // vector type: element type token in Elem
+	KindStruct  ElemKind = iota // struct type: Fields
+	KindVector                  // vector type: element in Elem (token) or Inner (inline struct)
+	KindElemRef                 // element-ref alias: `type X = V.Elem` — dotted token in Elem
 )
 
-// ElemType describes a `type` definition. For KindVector, Elem holds the element
-// type *token* — either a numeric type name (rat, rat0+, …) or a user struct type
-// name — which the builder resolves (the parser stays semantics-free). For
-// KindStruct, Fields holds the ordered field list.
+// ElemType describes a `type` definition. For KindVector the element is either a
+// *token* in Elem — a numeric type name (rat, rat0+, …), a user struct/alias type
+// name, or a dotted `V.Elem` reference — or, when the element is written inline as
+// a struct body (`vector { ... }`), the nested struct ElemType in Inner (exactly
+// one of Elem/Inner is set). For KindStruct, Fields holds the ordered field list.
+// For KindElemRef, Elem holds the dotted `Base.Elem` reference token. The builder
+// resolves every token (the parser stays semantics-free).
 type ElemType struct {
 	Kind   ElemKind
-	Elem   string      // KindVector: element type token (numtype name or struct type name)
+	Elem   string      // KindVector (token element) / KindElemRef: type token
+	Inner  *ElemType   // KindVector: inline struct element (mutually exclusive with Elem)
 	Fields []FieldSpec // KindStruct: ordered fields
 }
 

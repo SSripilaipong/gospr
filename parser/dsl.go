@@ -139,19 +139,22 @@ func symOpP() Parser[string] {
 }
 
 // typeNameP parses a type token in a type position: an identifier optionally
-// followed by a single `+` or `-` sign suffix. This covers both the numeric type
-// names (`rat0+`, `int`, …) and user-defined struct type names (`X`, `Inner`) in
-// one word-bounded token, so `intThing` reads as the whole identifier rather than
-// the numtype prefix `int`. The builder classifies the token (numtype vs named
-// struct type). The `+`/`-` suffix is only meaningful for numtype names; a struct
-// type name never carries one. Type positions never sit next to an expression, so
-// eagerly consuming a trailing sign here is unambiguous.
+// followed by EITHER a `.Member` suffix (a `V.Elem` element reference) OR a single
+// `+`/`-` numtype sign suffix. This covers the numeric type names (`rat0+`, `int`,
+// …), user-defined struct/alias type names (`X`, `Inner`), and vector element
+// references (`V.Elem`) in one word-bounded token, so `intThing` reads as the whole
+// identifier rather than the numtype prefix `int`. The builder classifies the token
+// (numtype vs named type vs dotted element ref) and validates that a dotted member
+// is `Elem`. A dotted token never carries a sign, and a sign is only meaningful for
+// numtype names; type positions never sit next to an expression, so eagerly
+// consuming the trailing suffix here is unambiguous.
 func typeNameP() Parser[string] {
+	member := Try(Map(Sequence2(RuneP('.'), IdentP()), func(t Of2[rune, string]) string { return "." + t.V2 }))
 	sign := Or(
 		Try(Map(RuneP('+'), func(rune) string { return "+" })),
 		Or(Try(Map(RuneP('-'), func(rune) string { return "-" })), Succeed("")),
 	)
-	return Map(Sequence2(IdentP(), sign), func(t Of2[string, string]) string { return t.V1 + t.V2 })
+	return Map(Sequence2(IdentP(), Or(member, sign)), func(t Of2[string, string]) string { return t.V1 + t.V2 })
 }
 
 // paramP parses `name::type`, e.g. `k::rat0+` or `a::X`. The type is a numtype
@@ -341,16 +344,32 @@ func structTypeP() Parser[ElemType] {
 	)
 }
 
-// elemTypeP parses a type definition's right-hand side: either a struct body
-// `{ ... }` or a vector `vector <element>` whose element is a numeric type name
-// or a named struct type. structTypeP fails without consuming on a non-`{` head,
-// so the choice falls through to the vector form cleanly.
+// elemTypeP parses a type definition's right-hand side, one of three forms:
+//   - a struct body `{ ... }` (structTypeP);
+//   - a vector `vector <element>` whose element is an inline struct body
+//     `{ ... }` or a token (numtype name, named struct/alias type, or a `V.Elem`
+//     reference);
+//   - a bare element reference `Base.Elem` (`type X = V.Elem`), which names a
+//     vector's element type.
+//
+// The vector alternative is Try-wrapped: `Or` commits once input is consumed, and
+// `StringP("vector")` matches the prefix of an identifier like `vectorClock`, so
+// without Try a `type X = vectorClock.Elem` would fail the following Spaces1P and
+// commit, starving the element-ref form. Try lets that partial match backtrack so
+// the element-ref alternative runs. A non-dotted bare token (`type X = Y`) matches
+// none of the three and remains a parse error, so plain aliases stay unsupported.
 func elemTypeP() Parser[ElemType] {
-	vec := Map(
-		Sequence3(StringP("vector"), Spaces1P(), typeNameP()),
-		func(t Of3[string, struct{}, string]) ElemType { return ElemType{Kind: KindVector, Elem: t.V3} },
+	structElem := Map(structTypeP(), func(inner ElemType) ElemType {
+		i := inner
+		return ElemType{Kind: KindVector, Inner: &i}
+	})
+	tokenElem := Map(typeNameP(), func(tok string) ElemType { return ElemType{Kind: KindVector, Elem: tok} })
+	vec := Prefix(Sequence2(StringP("vector"), Spaces1P()), Or(structElem, tokenElem))
+	elemRef := Map(
+		Sequence3(IdentP(), RuneP('.'), IdentP()),
+		func(t Of3[string, rune, string]) ElemType { return ElemType{Kind: KindElemRef, Elem: t.V1 + "." + t.V3} },
 	)
-	return Or(structTypeP(), vec)
+	return Or(structTypeP(), Or(Try(vec), elemRef))
 }
 
 func eqP() Parser[Of3[struct{}, rune, struct{}]] {

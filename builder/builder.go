@@ -407,22 +407,24 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		}
 		// Query params cross the HTTP boundary (bindParams), which handles only
 		// scalar numeric values — so a struct-typed query param is rejected, same
-		// as an update param.
-		if err := validateScalarParams(qd.Params); err != nil {
+		// as an update param. Tokens (incl. `V.Elem`/aliases) are normalized to
+		// concrete numtype names for the downstream wire/prover/swagger consumers.
+		qparams, err := resolveScalarParams(qd.Params, types)
+		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
 		// A query body is a general expression that may fold the vector via
 		// `reduce` (allowReduce=true) and may reference the query's params. Its
 		// result type (rat/bool/string) is recorded for serialization/swagger.
-		body, err := env.resolve(qd.Body, paramSet(qd.Params), true)
+		body, err := env.resolve(qd.Body, paramSet(qparams), true)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		result, err := chk.checkValue(body, chk.paramScope(qd.Params), m.Elem)
+		result, err := chk.checkValue(body, chk.paramScope(qparams), m.Elem)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		method := crdt.Method{Params: qd.Params, Body: body}
+		method := crdt.Method{Params: qparams, Body: body}
 		if result.kind == vkStruct {
 			et := elemTOf(result)
 			method.ResultStruct = &et
@@ -443,18 +445,20 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s defined twice", ud.TypeName, ud.MethodName)
 		}
 		// Update params cross the HTTP boundary (bindParams), which handles only
-		// scalar numeric values — so a struct-typed update param is rejected.
-		if err := validateScalarParams(ud.Params); err != nil {
-			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
-		}
-		body, err := env.resolveCombinator(ud.Body, paramSet(ud.Params))
+		// scalar numeric values — so a struct-typed update param is rejected;
+		// tokens (incl. `V.Elem`/aliases) are normalized to concrete numtype names.
+		uparams, err := resolveScalarParams(ud.Params, types)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
-		if err := chk.checkCombinatorFn(body, chk.paramScope(ud.Params), m.Elem); err != nil {
+		body, err := env.resolveCombinator(ud.Body, paramSet(uparams))
+		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
-		m.Updates[ud.MethodName] = crdt.Method{Params: ud.Params, Body: body, Result: parser.TypeReal}
+		if err := chk.checkCombinatorFn(body, chk.paramScope(uparams), m.Elem); err != nil {
+			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
+		}
+		m.Updates[ud.MethodName] = crdt.Method{Params: uparams, Body: body, Result: parser.TypeReal}
 	}
 
 	// Every type must define a merge — a vector without a join isn't a CRDT.
@@ -1175,23 +1179,52 @@ func unify(a, b vtype) (vtype, error) {
 
 // ---- type registry -------------------------------------------------
 
-// typeReg holds the resolved type universe: the vector Models (by type name) and
-// the resolved struct descriptors (by struct type name). resolveToken classifies
-// a type-position token as a numeric type or a named struct type.
+// typeReg holds the resolved type universe: the vector Models (by type name), the
+// resolved struct descriptors (by struct type name), and element-ref aliases
+// (`type X = V.Elem`, by alias name). resolveToken classifies a type-position token
+// as a numeric type, a named struct/alias type, or a dotted `V.Elem` reference.
 type typeReg struct {
 	models  map[string]*Model
 	structs map[string]crdt.ElemT
+	aliases map[string]crdt.ElemT
+}
+
+// splitDotted splits a `Base.Member` type token at its first `.`; ok is false for a
+// non-dotted token. typeNameP admits at most one `.Member`, so a malformed member
+// (a further dot) simply fails the `Elem` check downstream.
+func splitDotted(tok string) (base, member string, ok bool) {
+	i := strings.IndexByte(tok, '.')
+	if i < 0 {
+		return "", "", false
+	}
+	return tok[:i], tok[i+1:], true
 }
 
 // resolveToken maps a type-position token to a resolved element descriptor: a
-// numeric type (numtype.Parse) or a named struct type. A vector type name is
-// rejected — a vector cannot be a struct field or a param type.
+// dotted `V.Elem` reference (the vector's element), a numeric type (numtype.Parse),
+// a named struct type, or an element-ref alias. This is the post-resolveTypes form:
+// every type is already memoized in the reg, so a `V.Elem` reads Model.Elem
+// directly. A (non-dotted) vector type name is rejected — a vector cannot be a
+// struct field or a param type.
 func (r typeReg) resolveToken(tok string) (crdt.ElemT, error) {
+	if base, member, ok := splitDotted(tok); ok {
+		if member != "Elem" {
+			return crdt.ElemT{}, fmt.Errorf("unknown type member %q in %q (only .Elem is supported)", member, tok)
+		}
+		m, ok := r.models[base]
+		if !ok {
+			return crdt.ElemT{}, fmt.Errorf("type %q is not a vector; cannot take `.Elem`", base)
+		}
+		return m.Elem, nil
+	}
 	if nt, ok := numtype.Parse(tok); ok {
 		return crdt.ElemT{Num: nt}, nil
 	}
 	if s, ok := r.structs[tok]; ok {
 		return s, nil
+	}
+	if a, ok := r.aliases[tok]; ok {
+		return a, nil
 	}
 	if _, ok := r.models[tok]; ok {
 		return crdt.ElemT{}, fmt.Errorf("type %q is a vector and cannot be used as a field or param type", tok)
@@ -1199,14 +1232,19 @@ func (r typeReg) resolveToken(tok string) (crdt.ElemT, error) {
 	return crdt.ElemT{}, fmt.Errorf("unknown type %q", tok)
 }
 
-// resolveTypes folds the flat TypeDefs into a typeReg: struct type descriptors
-// (with cycle/dup-field/unknown-field detection) and vector Models. A user type
-// name may not shadow a numeric type name or the `vector` keyword, so every
-// type-position token resolves unambiguously (numtype first, else named struct).
+// resolveTypes folds the flat TypeDefs into a typeReg: struct type descriptors,
+// vector Models (element = a token or an inline struct body), and element-ref
+// aliases (`type X = V.Elem`). All three are resolved on demand and memoized,
+// sharing one cycle-detection set — so an alias may be used as a struct field type
+// or a vector element (it resolves *during* type resolution), and any cycle
+// (recursive struct, `type V = vector V.Elem`, or an alias↔vector loop) is caught.
+// A user type name may not shadow a numeric type name or the `vector` keyword, so
+// every type-position token resolves unambiguously.
 func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
-	reg := typeReg{models: map[string]*Model{}, structs: map[string]crdt.ElemT{}}
+	reg := typeReg{models: map[string]*Model{}, structs: map[string]crdt.ElemT{}, aliases: map[string]crdt.ElemT{}}
 	structDefs := map[string]parser.ElemType{}
 	vectorDefs := map[string]parser.ElemType{}
+	aliasDefs := map[string]parser.ElemType{}
 	seen := map[string]bool{}
 	for _, td := range tds {
 		if seen[td.Name] {
@@ -1221,27 +1259,66 @@ func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
 			structDefs[td.Name] = td.Elem
 		case parser.KindVector:
 			vectorDefs[td.Name] = td.Elem
+		case parser.KindElemRef:
+			aliasDefs[td.Name] = td.Elem
 		default:
 			return reg, fmt.Errorf("type %s: unsupported definition", td.Name)
 		}
 	}
 
-	// Resolve struct descriptors with cycle detection. A field type token is a
-	// numtype name or another struct type (not a vector).
+	// The three resolvers share `resolving` for cross-category cycle detection.
+	// vectorElem memoizes each vector's resolved element (also stored on Model.Elem).
 	resolving := map[string]bool{}
-	var resolveStruct func(name string) (crdt.ElemT, error)
-	resolveToken := func(tok string) (crdt.ElemT, error) {
+	vectorElem := map[string]crdt.ElemT{}
+	var (
+		resolveToken      func(tok string) (crdt.ElemT, error)
+		resolveFields     func(fs []parser.FieldSpec) ([]crdt.FieldT, error)
+		resolveStruct     func(name string) (crdt.ElemT, error)
+		resolveVectorElem func(name string) (crdt.ElemT, error)
+		resolveAlias      func(name string) (crdt.ElemT, error)
+	)
+
+	resolveToken = func(tok string) (crdt.ElemT, error) {
+		if base, member, ok := splitDotted(tok); ok {
+			if member != "Elem" {
+				return crdt.ElemT{}, fmt.Errorf("unknown type member %q in %q (only .Elem is supported)", member, tok)
+			}
+			return resolveVectorElem(base)
+		}
 		if nt, ok := numtype.Parse(tok); ok {
 			return crdt.ElemT{Num: nt}, nil
 		}
 		if _, ok := structDefs[tok]; ok {
 			return resolveStruct(tok)
 		}
+		if _, ok := aliasDefs[tok]; ok {
+			return resolveAlias(tok)
+		}
 		if _, ok := vectorDefs[tok]; ok {
 			return crdt.ElemT{}, fmt.Errorf("type %q is a vector and cannot be used as a field or element type", tok)
 		}
 		return crdt.ElemT{}, fmt.Errorf("unknown type %q", tok)
 	}
+
+	// resolveFields resolves a struct field list (numtype, struct/alias, or a
+	// `V.Elem` field type), with dup-field detection.
+	resolveFields = func(fs []parser.FieldSpec) ([]crdt.FieldT, error) {
+		fseen := map[string]bool{}
+		fields := make([]crdt.FieldT, 0, len(fs))
+		for _, f := range fs {
+			if fseen[f.Name] {
+				return nil, fmt.Errorf("duplicate field %q", f.Name)
+			}
+			fseen[f.Name] = true
+			ft, err := resolveToken(f.Type)
+			if err != nil {
+				return nil, fmt.Errorf("field %q: %w", f.Name, err)
+			}
+			fields = append(fields, crdt.FieldT{Name: f.Name, Type: ft})
+		}
+		return fields, nil
+	}
+
 	resolveStruct = func(name string) (crdt.ElemT, error) {
 		if s, ok := reg.structs[name]; ok {
 			return s, nil
@@ -1250,36 +1327,90 @@ func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
 			return crdt.ElemT{}, fmt.Errorf("recursive struct type %q", name)
 		}
 		resolving[name] = true
-		ed := structDefs[name]
-		fseen := map[string]bool{}
-		fields := make([]crdt.FieldT, 0, len(ed.Fields))
-		for _, f := range ed.Fields {
-			if fseen[f.Name] {
-				return crdt.ElemT{}, fmt.Errorf("struct %s: duplicate field %q", name, f.Name)
-			}
-			fseen[f.Name] = true
-			ft, err := resolveToken(f.Type)
-			if err != nil {
-				return crdt.ElemT{}, fmt.Errorf("struct %s: field %q: %w", name, f.Name, err)
-			}
-			fields = append(fields, crdt.FieldT{Name: f.Name, Type: ft})
+		fields, err := resolveFields(structDefs[name].Fields)
+		resolving[name] = false
+		if err != nil {
+			return crdt.ElemT{}, fmt.Errorf("struct %s: %w", name, err)
 		}
 		st := crdt.ElemT{Struct: true, Name: name, Fields: fields}
 		reg.structs[name] = st
-		resolving[name] = false
 		return st, nil
 	}
+
+	// resolveVectorElem resolves the element of vector `name`: an inline struct body
+	// (`vector { ... }`, nominal Name = the vector's) or an element token.
+	resolveVectorElem = func(name string) (crdt.ElemT, error) {
+		if e, ok := vectorElem[name]; ok {
+			return e, nil
+		}
+		vd, ok := vectorDefs[name]
+		if !ok {
+			if _, isStruct := structDefs[name]; isStruct {
+				return crdt.ElemT{}, fmt.Errorf("type %q is a struct, not a vector; `.Elem` requires a vector", name)
+			}
+			return crdt.ElemT{}, fmt.Errorf("type %q is not a vector; cannot take `.Elem`", name)
+		}
+		if resolving[name] {
+			return crdt.ElemT{}, fmt.Errorf("recursive type %q", name)
+		}
+		resolving[name] = true
+		var elem crdt.ElemT
+		var err error
+		if vd.Inner != nil {
+			var fields []crdt.FieldT
+			fields, err = resolveFields(vd.Inner.Fields)
+			if err == nil {
+				elem = crdt.ElemT{Struct: true, Name: name, Fields: fields}
+			}
+		} else {
+			elem, err = resolveToken(vd.Elem)
+		}
+		resolving[name] = false
+		if err != nil {
+			return crdt.ElemT{}, fmt.Errorf("type %s: %w", name, err)
+		}
+		vectorElem[name] = elem
+		return elem, nil
+	}
+
+	// resolveAlias resolves `type name = <ref>.Elem`. A struct element is also
+	// exposed as a named struct type (reg.structs), renamed to the alias, so `a::name`
+	// and swagger treat it nominally; a numeric element lives only in reg.aliases.
+	resolveAlias = func(name string) (crdt.ElemT, error) {
+		if a, ok := reg.aliases[name]; ok {
+			return a, nil
+		}
+		if resolving[name] {
+			return crdt.ElemT{}, fmt.Errorf("recursive type %q", name)
+		}
+		resolving[name] = true
+		elem, err := resolveToken(aliasDefs[name].Elem)
+		resolving[name] = false
+		if err != nil {
+			return crdt.ElemT{}, fmt.Errorf("type %s: %w", name, err)
+		}
+		if elem.Struct {
+			elem.Name = name
+			reg.structs[name] = elem
+		}
+		reg.aliases[name] = elem
+		return elem, nil
+	}
+
 	for name := range structDefs {
 		if _, err := resolveStruct(name); err != nil {
 			return reg, err
 		}
 	}
-
-	// Build a Model for each vector type, resolving its element token.
-	for name, vd := range vectorDefs {
-		elem, err := resolveToken(vd.Elem)
+	for name := range aliasDefs {
+		if _, err := resolveAlias(name); err != nil {
+			return reg, err
+		}
+	}
+	for name := range vectorDefs {
+		elem, err := resolveVectorElem(name)
 		if err != nil {
-			return reg, fmt.Errorf("type %s: %w", name, err)
+			return reg, err
 		}
 		reg.models[name] = &Model{
 			Name:    name,
@@ -1309,21 +1440,30 @@ func validateFnParams(ps []parser.ParamSpec, reg typeReg) error {
 	return nil
 }
 
-// validateScalarParams validates update params: names unique and each type a
-// numeric type (not a struct) — update params cross the wire via bindParams,
-// which handles only scalar numeric values.
-func validateScalarParams(ps []parser.ParamSpec) error {
+// resolveScalarParams validates and NORMALIZES update/query params: names unique
+// and each type resolving to a numeric type (not a struct). Update/query params
+// cross the wire via bindParams (scalar-only), and downstream (bindParams, prover,
+// swagger) parses the stored token via numtype.Parse — so a `V.Elem`/alias token
+// must be rewritten to its concrete numtype name here. The returned slice preserves
+// order and names with Type set to the resolved numtype's canonical name.
+func resolveScalarParams(ps []parser.ParamSpec, reg typeReg) ([]parser.ParamSpec, error) {
 	seen := make(map[string]bool, len(ps))
-	for _, p := range ps {
-		if _, ok := numtype.Parse(p.Type); !ok {
-			return fmt.Errorf("param %s: type %q must be a numeric type (struct-typed params are not supported here)", p.Name, p.Type)
+	out := make([]parser.ParamSpec, len(ps))
+	for i, p := range ps {
+		et, err := reg.resolveToken(p.Type)
+		if err != nil {
+			return nil, fmt.Errorf("param %s: %w", p.Name, err)
+		}
+		if et.Struct {
+			return nil, fmt.Errorf("param %s: type %q must be a numeric type (struct-typed params are not supported here)", p.Name, p.Type)
 		}
 		if seen[p.Name] {
-			return fmt.Errorf("duplicate param %s", p.Name)
+			return nil, fmt.Errorf("duplicate param %s", p.Name)
 		}
 		seen[p.Name] = true
+		out[i] = parser.ParamSpec{Name: p.Name, Type: et.Num.String()}
 	}
-	return nil
+	return out, nil
 }
 
 func paramSet(ps []parser.ParamSpec) map[string]bool {

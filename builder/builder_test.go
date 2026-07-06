@@ -650,3 +650,127 @@ collection C = VX
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "numeric type")
 }
+
+// ---- vector element access (V.Elem), inline struct elements, aliases -------
+
+// An inline struct vector element (`vector { ... }`) plus `V.Elem` fn params
+// builds and proves — no separate named struct type needed.
+func TestBuild_inlineVectorStructWithElemParams(t *testing.T) {
+	const src = `type V = vector {
+  Pos rat0+
+  Neg rat0+
+}
+fn J a::V.Elem b::V.Elem = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }
+fn incPos k::rat0+ s::V.Elem = { Pos: + s.Pos k, Neg: s.Neg }
+merge V = zip J
+update V.AddPos k::rat0+ = local (incPos k)
+query V.Totals = reduce J { Pos: 0, Neg: 0 }
+collection C = V
+`
+	built, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+	m := built.Models["V"]
+	require.NotNil(t, m)
+	require.True(t, m.Elem.Struct)
+	require.Len(t, m.Elem.Fields, 2)
+	assert.Equal(t, "Pos", m.Elem.Fields[0].Name)
+	// A whole-struct query returns the struct element type.
+	require.NotNil(t, m.Queries["Totals"].ResultStruct)
+	assert.True(t, m.Queries["Totals"].ResultStruct.Struct)
+}
+
+// `type X = V.Elem` naming a NUMERIC vector element, used as an update/query
+// param, must normalize the stored param token to the concrete numtype name so
+// bindParams/prover/swagger (which numtype.Parse the token) accept it.
+func TestBuild_numericElemAliasParamNormalized(t *testing.T) {
+	const src = `type V = vector rat0+
+type Amount = V.Elem
+fn add a::rat0+ b::rat0+ = + a b
+merge V = zip max
+update V.Add k::Amount = local (add k)
+query V.AtLeast k::Amount = reduce max 0
+collection C = V
+`
+	built, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+	m := built.Models["V"]
+	require.NotNil(t, m)
+	// Stored tokens must be the concrete numtype name, not "V.Elem"/"Amount".
+	assert.Equal(t, "rat0+", m.Updates["Add"].Params[0].Type)
+	assert.Equal(t, "rat0+", m.Queries["AtLeast"].Params[0].Type)
+}
+
+// An alias resolves DURING type resolution, so it can be used as a vector element.
+func TestBuild_aliasAsVectorElement(t *testing.T) {
+	const src = `type V = vector rat0+
+type Amount = V.Elem
+type W = vector Amount
+merge V = zip max
+merge W = zip max
+collection C = V
+collection D = W
+`
+	built, err := Build(mustParse(t, src))
+	require.NoError(t, err)
+	w := built.Models["W"]
+	require.NotNil(t, w)
+	assert.Equal(t, numtype.NumType{Domain: numtype.DRat, Sign: numtype.SNonNeg}, w.Elem.Num)
+}
+
+// A struct `V.Elem` used as an update param (a scalar wire position) is rejected.
+func TestBuild_structElemUpdateParamRejected(t *testing.T) {
+	const src = `type V = vector { Pos rat0+ }
+fn J a::V.Elem b::V.Elem = { Pos: max a.Pos b.Pos }
+fn pick a::V.Elem b::V.Elem = { Pos: max a.Pos b.Pos }
+merge V = zip J
+update V.U p::V.Elem = local (pick p)
+collection C = V
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "numeric type")
+}
+
+// `.Elem` on a non-vector (a struct type) is a build error.
+func TestBuild_elemOfNonVectorRejected(t *testing.T) {
+	const src = `type S = { A rat0+ }
+type X = S.Elem
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a vector")
+}
+
+// A member other than `.Elem` is rejected.
+func TestBuild_unknownTypeMemberRejected(t *testing.T) {
+	const src = `type V = vector rat0+
+type X = V.Foo
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Foo")
+}
+
+// A self-referential vector element (`vector V.Elem`) is a cycle.
+func TestBuild_recursiveVectorElemRejected(t *testing.T) {
+	const src = `type V = vector V.Elem
+merge V = zip max
+collection C = V
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "recursive")
+}
+
+// An alias<->vector cycle (`type X = V.Elem; type V = vector X`) is caught by the
+// shared cycle-detection set.
+func TestBuild_aliasVectorCycleRejected(t *testing.T) {
+	const src = `type X = V.Elem
+type V = vector X
+merge V = zip max
+collection C = V
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "recursive")
+}
