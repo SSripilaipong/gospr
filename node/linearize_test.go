@@ -94,14 +94,14 @@ func deployAll(t *testing.T, built builder.BuiltPlan, ns ...*Node) {
 
 // Test 1: a linearized write synchronously pushes the new slot to a quorum, so a
 // peer's LOCAL read sees it immediately — gossip (disabled here) could not have.
-func TestApplyLinearizable_syncWrite(t *testing.T) {
+func TestApplySync_syncWrite(t *testing.T) {
 	built := buildPlan(t, counterDSL)
 	ns := newSyncNodes("node1", "node2", "node3")
 	wireMesh(ns)
 	startAll(t, ns)
 	deployAll(t, built, ns...)
 
-	require.NoError(t, ns[0].ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 1.0))
+	require.NoError(t, ns[0].ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 1.0))
 
 	v, err := ns[1].Query("Counter", "Value", nil)
 	require.NoError(t, err)
@@ -110,7 +110,7 @@ func TestApplyLinearizable_syncWrite(t *testing.T) {
 
 // Test 2: a linearized read is two-phase. Gather pulls+merges a peer's slot (so
 // the query returns it); write-back leaves a THIRD node holding the merged value.
-func TestQueryLinearizable_twoPhaseRead(t *testing.T) {
+func TestQuerySync_twoPhaseRead(t *testing.T) {
 	built := buildPlan(t, counterDSL)
 	ns := newSyncNodes("node1", "node2", "node3")
 	wireMesh(ns)
@@ -120,7 +120,7 @@ func TestQueryLinearizable_twoPhaseRead(t *testing.T) {
 	// Write locally on node2 ONLY (no sync), so node1 and node3 don't have it yet.
 	require.NoError(t, ns[1].Apply("Counter", "Add", []any{"7"}))
 
-	v, err := ns[0].QueryLinearizable(context.Background(), "Counter", "Value", nil, 1.0)
+	v, err := ns[0].QuerySync(context.Background(), "Counter", "Value", nil, 1.0)
 	require.NoError(t, err)
 	assert.Equal(t, "7", v, "gather pulled+merged node2's slot")
 
@@ -132,7 +132,7 @@ func TestQueryLinearizable_twoPhaseRead(t *testing.T) {
 
 // Test 3: a quorum that can't be met returns ErrQuorumUnreached, and a cancelled
 // context produces the same error.
-func TestApplyLinearizable_quorumFailure(t *testing.T) {
+func TestApplySync_quorumFailure(t *testing.T) {
 	built := buildPlan(t, counterDSL)
 	n1 := New("node1", WithGossipInterval(time.Hour), WithSyncTimeout(testSyncTimeout))
 	n2 := New("node2", WithGossipInterval(time.Hour), WithSyncTimeout(testSyncTimeout))
@@ -147,19 +147,19 @@ func TestApplyLinearizable_quorumFailure(t *testing.T) {
 	require.NoError(t, n2.Initialize(built))
 
 	// holders = 1 (self) + 1 (node2) = 2; 2/3 >= 1.0 never holds.
-	err := n1.ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 1.0)
+	err := n1.ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 1.0)
 	require.ErrorIs(t, err, ErrQuorumUnreached)
 
 	// Context-cancel variant: an already-cancelled ctx yields the same error.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = n1.ApplyLinearizable(ctx, "Counter", "Add", []any{"5"}, 1.0)
+	err = n1.ApplySync(ctx, "Counter", "Add", []any{"5"}, 1.0)
 	require.ErrorIs(t, err, ErrQuorumUnreached)
 }
 
 // Test 4: an un-deployed peer never acks (validity gated on Initialized + plan),
 // so it is not miscounted; once deployed, the retry reaches quorum.
-func TestApplyLinearizable_ackValidity_undeployed(t *testing.T) {
+func TestApplySync_ackValidity_undeployed(t *testing.T) {
 	built := buildPlan(t, counterDSL)
 	ns := newSyncNodes("node1", "node2", "node3")
 	wireMesh(ns)
@@ -167,17 +167,17 @@ func TestApplyLinearizable_ackValidity_undeployed(t *testing.T) {
 	// Deploy to node1 + node2 only; leave node3 Uninitialized.
 	deployAll(t, built, ns[0], ns[1])
 
-	err := ns[0].ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 1.0)
+	err := ns[0].ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 1.0)
 	require.ErrorIs(t, err, ErrQuorumUnreached, "uninitialized node3 must not be counted")
 
 	// Now deploy node3 and retry ⇒ both peers ack ⇒ success.
 	require.NoError(t, ns[2].Initialize(built))
-	require.NoError(t, ns[0].ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 1.0))
+	require.NoError(t, ns[0].ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 1.0))
 }
 
 // Test 5: a peer running a DIFFERENT plan (same collection name + value shape,
 // different fingerprint) drops the push and is not miscounted.
-func TestApplyLinearizable_fingerprintMismatch(t *testing.T) {
+func TestApplySync_fingerprintMismatch(t *testing.T) {
 	planA := buildPlan(t, counterDSL)
 	planB := buildPlan(t, counterDSLVariant)
 	require.NotEqual(t, planA.Fingerprint, planB.Fingerprint, "variant must hash differently")
@@ -189,13 +189,13 @@ func TestApplyLinearizable_fingerprintMismatch(t *testing.T) {
 	require.NoError(t, ns[2].Initialize(planB)) // node3 runs the incompatible plan
 
 	// node3's fingerprint differs ⇒ it drops the push ⇒ only node2 acks ⇒ 2/3 < 1.0.
-	err := ns[0].ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 1.0)
+	err := ns[0].ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 1.0)
 	require.ErrorIs(t, err, ErrQuorumUnreached)
 }
 
 // Test 6: when self alone satisfies the ratio, the op succeeds without
 // broadcasting or waiting — even with every peer blackholed.
-func TestApplyLinearizable_zeroAckShortCircuit(t *testing.T) {
+func TestApplySync_zeroAckShortCircuit(t *testing.T) {
 	built := buildPlan(t, counterDSL)
 
 	// (a) ratio=0 on a 3-node cluster, all peers blackholed.
@@ -207,10 +207,11 @@ func TestApplyLinearizable_zeroAckShortCircuit(t *testing.T) {
 	require.NoError(t, n1.Initialize(built))
 
 	start := time.Now()
-	require.NoError(t, n1.ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 0.0))
+	require.NoError(t, n1.ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 0.0))
 	assert.Less(t, time.Since(start), testSyncTimeout, "ratio=0 returns without waiting")
 
-	// (b) 2-node cluster, peer blackholed, default ratio 0.5 ⇒ holders 1/2 = 0.5 ≥ 0.5.
+	// (b) 2-node cluster, peer blackholed, sub-majority ratio 0.4 ⇒ holders 1/2 =
+	// 0.5 > 0.4, so self alone satisfies it without waiting.
 	m1 := New("node1", WithGossipInterval(time.Hour), WithSyncTimeout(testSyncTimeout))
 	m1.AddPeer("node2", blackholePeer{})
 	m1.Start()
@@ -218,14 +219,32 @@ func TestApplyLinearizable_zeroAckShortCircuit(t *testing.T) {
 	require.NoError(t, m1.Initialize(built))
 
 	start = time.Now()
-	require.NoError(t, m1.ApplyLinearizable(context.Background(), "Counter", "Add", []any{"5"}, 0.5))
-	assert.Less(t, time.Since(start), testSyncTimeout, "self alone satisfies 0.5 in a 2-node cluster")
+	require.NoError(t, m1.ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 0.4))
+	assert.Less(t, time.Since(start), testSyncTimeout, "self alone satisfies a sub-majority ratio")
+}
+
+// Test 6b: the strict-majority rule regression guard. In a 2-node cluster, ratio
+// 0.5 is a *strict* majority (holders/N > 0.5), so self alone is NOT enough — the
+// (blackholed) peer must ack, so an isolated coordinator 503s. Under the old `>=`
+// rule 0.5 short-circuited on self, silently breaking read/write overlap for even
+// N; this test fails if that behavior comes back.
+func TestApplySync_majorityRequiresPeer(t *testing.T) {
+	built := buildPlan(t, counterDSL)
+
+	m1 := New("node1", WithGossipInterval(time.Hour), WithSyncTimeout(testSyncTimeout))
+	m1.AddPeer("node2", blackholePeer{})
+	m1.Start()
+	t.Cleanup(m1.Stop)
+	require.NoError(t, m1.Initialize(built))
+
+	err := m1.ApplySync(context.Background(), "Counter", "Add", []any{"5"}, 0.5)
+	require.ErrorIs(t, err, ErrQuorumUnreached, "0.5 in a 2-node cluster is a strict majority — self alone must not satisfy it")
 }
 
 // Test 7: a linearized read validates BEFORE any quorum work — a bad query is a
 // fast validation error, never a quorum timeout; a valid query under the same
 // (blackholed) setup instead 503s because it reaches the gather phase.
-func TestQueryLinearizable_preflight(t *testing.T) {
+func TestQuerySync_preflight(t *testing.T) {
 	built := buildPlan(t, counterDSL)
 	n1 := New("node1", WithGossipInterval(time.Hour), WithSyncTimeout(testSyncTimeout))
 	n1.AddPeer("node2", blackholePeer{})
@@ -235,13 +254,13 @@ func TestQueryLinearizable_preflight(t *testing.T) {
 	require.NoError(t, n1.Initialize(built))
 
 	start := time.Now()
-	_, err := n1.QueryLinearizable(context.Background(), "Counter", "NoSuchQuery", nil, 1.0)
+	_, err := n1.QuerySync(context.Background(), "Counter", "NoSuchQuery", nil, 1.0)
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrQuorumUnreached, "validation fails before quorum work")
 	assert.Less(t, time.Since(start), testSyncTimeout, "bad query fails fast")
 
 	// A valid query reaches the gather phase and times out (no peer can ack).
-	_, err = n1.QueryLinearizable(context.Background(), "Counter", "Value", nil, 1.0)
+	_, err = n1.QuerySync(context.Background(), "Counter", "Value", nil, 1.0)
 	require.ErrorIs(t, err, ErrQuorumUnreached)
 }
 

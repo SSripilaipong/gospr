@@ -288,19 +288,27 @@ type applyRequest struct {
 	Params []string `json:"params"`
 }
 
-// parseLinearize reads the two consistency headers; see the gateway's copy for
-// the rationale (NaN/Inf/out-of-range are rejected so a bad ratio is a fast 400,
-// not a quorum timeout 503).
-func parseLinearize(r *http.Request) (on bool, ratio float64, err error) {
-	on = r.Header.Get("X-Gospr-Linearize") == "true"
-	ratio = 0.5
-	if raw := r.Header.Get("X-Gospr-Sync-Ratio"); raw != "" {
-		ratio, err = strconv.ParseFloat(strings.TrimSpace(raw), 64)
-		if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio > 1 {
-			return on, 0, fmt.Errorf("invalid X-Gospr-Sync-Ratio %q (want a fraction in [0,1])", raw)
-		}
+// parseSync reads the presence-based X-Gospr-Sync-Ratio header; see the gateway's
+// copy for the full rationale (absent ⇒ async; present ⇒ synchronous quorum at a
+// fraction in [0,1) or "all"; present-but-empty / >=1 / NaN/Inf/out-of-range are
+// rejected so a bad ratio is a fast 400, not a quorum timeout 503).
+func parseSync(r *http.Request) (on bool, ratio float64, err error) {
+	vals := r.Header.Values("X-Gospr-Sync-Ratio")
+	if len(vals) == 0 {
+		return false, 0, nil // header absent ⇒ async, local-only
 	}
-	return on, ratio, nil
+	raw := strings.TrimSpace(vals[0])
+	if raw == "" {
+		return false, 0, fmt.Errorf("X-Gospr-Sync-Ratio present but empty (want a fraction in [0,1), or \"all\")")
+	}
+	if strings.EqualFold(raw, "all") {
+		return true, node.AllRatio, nil
+	}
+	ratio, err = strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio >= 1 {
+		return false, 0, fmt.Errorf("invalid X-Gospr-Sync-Ratio %q (want a fraction in [0,1), or \"all\")", raw)
+	}
+	return true, ratio, nil
 }
 
 // writeOpError maps ErrQuorumUnreached → 503, anything else → 400.
@@ -317,7 +325,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	action := r.PathValue("action")
 
-	linearize, ratio, lerr := parseLinearize(r)
+	syncOn, ratio, lerr := parseSync(r)
 	if lerr != nil {
 		http.Error(w, lerr.Error(), http.StatusBadRequest)
 		return
@@ -343,8 +351,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return fmt.Errorf("unknown node %q", id)
 		}
-		if linearize {
-			return n.ApplyLinearizable(r.Context(), collection, action, params, ratio)
+		if syncOn {
+			return n.ApplySync(r.Context(), collection, action, params, ratio)
 		}
 		return n.Apply(collection, action, params)
 	})
@@ -360,7 +368,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	query := r.PathValue("query")
 
-	linearize, ratio, lerr := parseLinearize(r)
+	syncOn, ratio, lerr := parseSync(r)
 	if lerr != nil {
 		http.Error(w, lerr.Error(), http.StatusBadRequest)
 		return
@@ -381,8 +389,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		var v any
 		var err error
-		if linearize {
-			v, err = n.QueryLinearizable(r.Context(), collection, query, params, ratio)
+		if syncOn {
+			v, err = n.QuerySync(r.Context(), collection, query, params, ratio)
 		} else {
 			v, err = n.Query(collection, query, params)
 		}

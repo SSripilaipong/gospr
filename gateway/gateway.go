@@ -93,21 +93,32 @@ type applyRequest struct {
 	Params []string `json:"params"`
 }
 
-// parseLinearize reads the two consistency headers. X-Gospr-Linearize=="true"
-// turns on synchronous mode; X-Gospr-Sync-Ratio is the target fraction in [0,1]
-// (absent → 0.5). NaN/±Inf/out-of-range/malformed ratios are rejected — note
-// strconv.ParseFloat("NaN") succeeds, and a NaN ratio makes the quorum predicate
-// always false, so an unrejected NaN would turn a fast 400 into a timeout 503.
-func parseLinearize(r *http.Request) (on bool, ratio float64, err error) {
-	on = r.Header.Get("X-Gospr-Linearize") == "true"
-	ratio = 0.5
-	if raw := r.Header.Get("X-Gospr-Sync-Ratio"); raw != "" {
-		ratio, err = strconv.ParseFloat(strings.TrimSpace(raw), 64)
-		if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio > 1 {
-			return on, 0, fmt.Errorf("invalid X-Gospr-Sync-Ratio %q (want a fraction in [0,1])", raw)
-		}
+// parseSync reads the X-Gospr-Sync-Ratio consistency header. It is presence-based:
+// an absent header means async (local-only, today's default); a present header
+// turns synchronous quorum mode on. The value is either a fraction in [0,1) — the
+// quorum is holders/N > ratio, so 0.5 is a true majority and >=0.5 is linearizable
+// — or the literal "all" for every node. A present-but-empty value, a numeric
+// value >= 1 (use "all"), and NaN/±Inf/out-of-range/malformed ratios are all
+// rejected with a 400: note strconv.ParseFloat("NaN") succeeds and a NaN ratio
+// makes the quorum predicate always false, so an unrejected NaN would turn a fast
+// 400 into a timeout 503.
+func parseSync(r *http.Request) (on bool, ratio float64, err error) {
+	vals := r.Header.Values("X-Gospr-Sync-Ratio")
+	if len(vals) == 0 {
+		return false, 0, nil // header absent ⇒ async, local-only
 	}
-	return on, ratio, nil
+	raw := strings.TrimSpace(vals[0])
+	if raw == "" {
+		return false, 0, fmt.Errorf("X-Gospr-Sync-Ratio present but empty (want a fraction in [0,1), or \"all\")")
+	}
+	if strings.EqualFold(raw, "all") {
+		return true, node.AllRatio, nil
+	}
+	ratio, err = strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 || ratio >= 1 {
+		return false, 0, fmt.Errorf("invalid X-Gospr-Sync-Ratio %q (want a fraction in [0,1), or \"all\")", raw)
+	}
+	return true, ratio, nil
 }
 
 // writeOpError maps a node op error to a status: ErrQuorumUnreached → 503,
@@ -123,7 +134,7 @@ func writeOpError(w http.ResponseWriter, err error) {
 func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	action := r.PathValue("action")
-	linearize, ratio, lerr := parseLinearize(r)
+	syncOn, ratio, lerr := parseSync(r)
 	if lerr != nil {
 		http.Error(w, lerr.Error(), http.StatusBadRequest)
 		return
@@ -137,8 +148,8 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	for i, s := range req.Params {
 		params[i] = s
 	}
-	if linearize {
-		if err := g.node.ApplyLinearizable(r.Context(), collection, action, params, ratio); err != nil {
+	if syncOn {
+		if err := g.node.ApplySync(r.Context(), collection, action, params, ratio); err != nil {
 			writeOpError(w, err)
 			return
 		}
@@ -155,7 +166,7 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	query := r.PathValue("query")
-	linearize, ratio, lerr := parseLinearize(r)
+	syncOn, ratio, lerr := parseSync(r)
 	if lerr != nil {
 		http.Error(w, lerr.Error(), http.StatusBadRequest)
 		return
@@ -170,8 +181,8 @@ func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	var val any
 	var err error
-	if linearize {
-		val, err = g.node.QueryLinearizable(r.Context(), collection, query, params, ratio)
+	if syncOn {
+		val, err = g.node.QuerySync(r.Context(), collection, query, params, ratio)
 	} else {
 		val, err = g.node.Query(collection, query, params)
 	}

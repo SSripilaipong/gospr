@@ -115,8 +115,14 @@ func TestGenerate_getZeroParamQuery(t *testing.T) {
 	paths := doc["paths"].(map[string]any)
 	getPath := paths["/api/collections/MyVec/Value"].(map[string]any)
 	get := getPath["get"].(map[string]any)
-	_, hasParams := get["parameters"]
-	assert.False(t, hasParams)
+	// Even a zero-param query carries exactly one parameter: the opt-in sync
+	// header (no `params` query parameter).
+	params := get["parameters"].([]any)
+	require.Len(t, params, 1)
+	assertSyncHeaderParam(t, params[0].(map[string]any))
+	// The synchronous failure mode is documented.
+	_, has503 := get["responses"].(map[string]any)["503"]
+	assert.True(t, has503, "GET should document a 503 for an unmet sync quorum")
 }
 
 func TestGenerate_getParamQueryRequired(t *testing.T) {
@@ -137,9 +143,39 @@ func TestGenerate_getParamQueryRequired(t *testing.T) {
 
 	paths := doc["paths"].(map[string]any)
 	get := paths["/api/collections/MyVec/Above"].(map[string]any)["get"].(map[string]any)
+	// Two parameters now: the sync header plus the `params` query parameter.
 	params := get["parameters"].([]any)
+	require.Len(t, params, 2)
+	byName := map[string]map[string]any{}
+	for _, p := range params {
+		pm := p.(map[string]any)
+		byName[pm["name"].(string)] = pm
+	}
+	require.Contains(t, byName, "params")
+	assert.Equal(t, true, byName["params"]["required"])
+	require.Contains(t, byName, "X-Gospr-Sync-Ratio")
+	assertSyncHeaderParam(t, byName["X-Gospr-Sync-Ratio"])
+}
+
+// assertSyncHeaderParam checks the shared opt-in consistency header parameter.
+func assertSyncHeaderParam(t *testing.T, p map[string]any) {
+	t.Helper()
+	assert.Equal(t, "X-Gospr-Sync-Ratio", p["name"])
+	assert.Equal(t, "header", p["in"])
+	assert.Equal(t, false, p["required"])
+}
+
+func TestGenerate_postDocumentsSyncHeaderAnd503(t *testing.T) {
+	data, err := Generate(makeModelPlan())
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	paths := doc["paths"].(map[string]any)
+	post := paths["/api/collections/MyVec/Add"].(map[string]any)["post"].(map[string]any)
+	params := post["parameters"].([]any)
 	require.Len(t, params, 1)
-	p := params[0].(map[string]any)
-	assert.Equal(t, "params", p["name"])
-	assert.Equal(t, true, p["required"])
+	assertSyncHeaderParam(t, params[0].(map[string]any))
+	_, has503 := post["responses"].(map[string]any)["503"]
+	assert.True(t, has503, "POST should document a 503 for an unmet sync quorum")
 }

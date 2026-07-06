@@ -75,9 +75,9 @@ func TestClusterHTTP_linearizedWriteThenRead(t *testing.T) {
 		}, 5*time.Second, 25*time.Millisecond, "deploy should propagate to every node")
 	}
 
-	linearizedAdd(t, urls[0], "Counter", "5", "1.0")
+	linearizedAdd(t, urls[0], "Counter", "5", "all")
 
-	v, status := linearizedQuery(t, urls[1], "Counter", "1.0")
+	v, status := linearizedQuery(t, urls[1], "Counter", "all")
 	require.Equal(t, http.StatusOK, status)
 	require.Equal(t, "5", v, "linearized read sees the write without gossip")
 }
@@ -92,7 +92,6 @@ func linearizedAdd(t *testing.T, base, collection, k, ratio string) {
 		bytes.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Gospr-Linearize", "true")
 	req.Header.Set("X-Gospr-Sync-Ratio", ratio)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -107,7 +106,6 @@ func linearizedQuery(t *testing.T, base, collection, ratio string) (string, int)
 	req, err := http.NewRequest(http.MethodGet,
 		fmt.Sprintf("%s/api/collections/%s/Value", base, collection), nil)
 	require.NoError(t, err)
-	req.Header.Set("X-Gospr-Linearize", "true")
 	req.Header.Set("X-Gospr-Sync-Ratio", ratio)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)

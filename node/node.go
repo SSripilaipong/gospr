@@ -109,7 +109,7 @@ func MessageKind(msg any) string {
 	}
 }
 
-// ErrQuorumUnreached is returned by a linearized op when the sync-ratio is not
+// ErrQuorumUnreached is returned by a synchronous op when the sync-ratio is not
 // met before the per-phase timeout or request-context cancellation. The HTTP
 // layers map it to 503 via errors.Is.
 var ErrQuorumUnreached = errors.New("quorum not reached")
@@ -151,7 +151,7 @@ func WithGossipInterval(d time.Duration) Option {
 	return func(n *Node) { n.gossipInterval = d }
 }
 
-// WithSyncTimeout overrides the default per-phase deadline for a linearized op.
+// WithSyncTimeout overrides the default per-phase deadline for a synchronous op.
 // It must exceed a full request+ack round trip; tests use a short value so a
 // failed quorum 503s quickly.
 func WithSyncTimeout(d time.Duration) Option {
@@ -456,7 +456,7 @@ func (n *Node) snapshotCollection(name string) (crdt.WireSnapshot, bool) {
 	return c.SnapshotWire(), true
 }
 
-// ValidateQuery is the non-evaluating preflight for a linearized read: it checks
+// ValidateQuery is the non-evaluating preflight for a synchronous read: it checks
 // the collection and query exist and the params bind, without evaluating the
 // query body (which is state-dependent).
 func (n *Node) ValidateQuery(collection, query string, params []any) error {
@@ -474,30 +474,44 @@ func (n *Node) ValidateQuery(collection, query string, params []any) error {
 // clusterSize is N = peers + self.
 func (n *Node) clusterSize() int { return len(n.peers) + 1 }
 
-// reached reports whether the sync-ratio predicate holds given `distinct` acking
-// peers. The coordinator counts itself as a holder, so holders = 1 + distinct.
+// AllRatio is the sync-ratio marker meaning "every node". On the wire it is
+// spelled `all`; numeric ratios are restricted to [0,1), so this value is only
+// ever produced by the `all` keyword, never by a numeric parse.
+const AllRatio = 1.0
+
+// reached reports whether the sync predicate holds given `distinct` acking peers.
+// The coordinator counts itself as a holder, so holders = 1 + distinct. An
+// explicit ratio r requires a strict majority-style overlap: quorum = the
+// smallest holder count with holders/N > r, so r=0.5 is a true majority
+// (floor(N/2)+1) — the linearizable knee. r=0 is satisfied by self alone; the
+// AllRatio sentinel (>= 1) requires every node.
 func (n *Node) reached(distinct int, ratio float64) bool {
-	return float64(1+distinct)/float64(n.clusterSize()) >= ratio
+	holders := 1 + distinct
+	if ratio >= AllRatio {
+		return holders >= n.clusterSize()
+	}
+	return float64(holders)/float64(n.clusterSize()) > ratio
 }
 
-// ApplyLinearizable applies an update locally, then synchronously pushes the new
-// state to a quorum fraction of peers before returning. A 503 (ErrQuorumUnreached)
-// is indeterminate: the local slot is already mutated (CRDT merges don't roll
-// back) and may still converge via gossip — retrying a non-idempotent Add can
+// ApplySync applies an update locally, then synchronously pushes the new state to
+// a quorum fraction of peers before returning. A 503 (ErrQuorumUnreached) is
+// indeterminate: the local slot is already mutated (CRDT merges don't roll back)
+// and may still converge via gossip — retrying a non-idempotent Add can
 // double-count.
-func (n *Node) ApplyLinearizable(ctx context.Context, collection, action string, payload []any, ratio float64) error {
+func (n *Node) ApplySync(ctx context.Context, collection, action string, payload []any, ratio float64) error {
 	if err := n.Apply(collection, action, payload); err != nil {
 		return err
 	}
 	return n.pushQuorum(ctx, collection, ratio)
 }
 
-// QueryLinearizable performs an ABD-style two-phase read: a non-evaluating
-// preflight (so a bad query is a fast 400, never a 503 timeout), then gather
-// (pull+merge from a quorum), then write-back (push the merged state to a
-// quorum), then the authoritative local query. With ratio > 0.5 the read and
-// write quorums overlap, giving linearizability.
-func (n *Node) QueryLinearizable(ctx context.Context, collection, query string, params []any, ratio float64) (any, error) {
+// QuerySync performs an ABD-style two-phase read: a non-evaluating preflight (so
+// a bad query is a fast 400, never a 503 timeout), then gather (pull+merge from a
+// quorum), then write-back (push the merged state to a quorum), then the
+// authoritative local query. At ratio >= 0.5 (or `all`) the read and write
+// quorums overlap, giving linearizability; a weaker ratio only guarantees
+// synchronous replication to that fraction.
+func (n *Node) QuerySync(ctx context.Context, collection, query string, params []any, ratio float64) (any, error) {
 	if err := n.ValidateQuery(collection, query, params); err != nil {
 		return nil, err
 	}

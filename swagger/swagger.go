@@ -104,6 +104,26 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	return json.MarshalIndent(spec, "", "  ")
 }
 
+// syncHeaderParam documents the opt-in X-Gospr-Sync-Ratio consistency header,
+// shared by every update and query operation. The parameter struct has no
+// Description field, so the explanatory text rides on Schema.Description (as the
+// `params` query parameter does).
+func syncHeaderParam() parameter {
+	return parameter{
+		Name:     "X-Gospr-Sync-Ratio",
+		In:       "header",
+		Required: false,
+		Schema: schema{
+			Type: "string",
+			Description: "Opt-in synchronous quorum. Absent ⇒ async (local-only). " +
+				"Present ⇒ sync to a fraction of the cluster: a value in [0,1) where the " +
+				"quorum is holders/N > ratio (so 0.5 is a strict majority, and ≥0.5 is " +
+				"linearizable), or \"all\" for every node. A numeric value ≥ 1 is rejected — use \"all\".",
+		},
+		Example: "0.5",
+	}
+}
+
 func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType, resultNum numtype.NumType, resultStruct *crdt.ElemT) {
 	key := "/api/collections/" + collection + "/" + queryName
 	resultSchema := valTypeSchema(result, resultNum)
@@ -111,13 +131,15 @@ func addGetPath(paths map[string]pathItem, collection, queryName string, params 
 		resultSchema = structSchema(*resultStruct)
 	}
 	op := &operation{
-		Summary: queryName + " on " + collection,
+		Summary:    queryName + " on " + collection,
+		Parameters: []parameter{syncHeaderParam()},
 		Responses: map[string]response{
 			"200": {
 				Description: "Query result",
 				Content:     map[string]mediaType{"application/json": {Schema: resultSchema}},
 			},
 			"400": {Description: "Error"},
+			"503": {Description: "Sync quorum not reached"},
 		},
 	}
 	if len(params) > 0 {
@@ -129,13 +151,13 @@ func addGetPath(paths map[string]pathItem, collection, queryName string, params 
 		for i, ps := range params {
 			examples[i] = fmt.Sprintf("%v", paramExample(ps))
 		}
-		op.Parameters = []parameter{{
+		op.Parameters = append(op.Parameters, parameter{
 			Name:     "params",
 			In:       "query",
 			Required: true, // the runtime rejects a missing param (arity check), so it is not optional
 			Schema:   schema{Type: "string", Description: strings.Join(parts, ", ")},
 			Example:  strings.Join(examples, ","),
-		}}
+		})
 	}
 	paths[key] = pathItem{Get: op}
 }
@@ -143,10 +165,12 @@ func addGetPath(paths map[string]pathItem, collection, queryName string, params 
 func addPostPath(paths map[string]pathItem, collection, actionName string, params []parser.ParamSpec) {
 	key := "/api/collections/" + collection + "/" + actionName
 	op := &operation{
-		Summary: actionName + " on " + collection,
+		Summary:    actionName + " on " + collection,
+		Parameters: []parameter{syncHeaderParam()},
 		Responses: map[string]response{
 			"200": {Description: "Action applied"},
 			"400": {Description: "Error"},
+			"503": {Description: "Sync quorum not reached"},
 		},
 	}
 	var mt mediaType

@@ -39,14 +39,14 @@ func TestSandbox_linearizedUpdateUnderPartition503(t *testing.T) {
 	postJSON(t, srv.URL+"/api/sandbox/links",
 		map[string]any{"a": "node1", "b": "node3", "connected": false}, http.StatusOK, nil)
 
-	// A linearized Add with ratio 1.0 can never reach quorum ⇒ 503.
+	// A synchronous Add requiring "all" nodes can never reach quorum here (a peer
+	// is partitioned) ⇒ 503.
 	req, err := http.NewRequest(http.MethodPost,
 		srv.URL+"/api/sandbox/nodes/node1/collections/Counter/Add",
 		bytes.NewReader(mustJSON(t, map[string]any{"params": []any{"5"}})))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Gospr-Linearize", "true")
-	req.Header.Set("X-Gospr-Sync-Ratio", "1.0")
+	req.Header.Set("X-Gospr-Sync-Ratio", "all")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
