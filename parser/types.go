@@ -103,8 +103,9 @@ const (
 type Expr struct {
 	Kind ExprKind
 
-	// ExprNumLit — an exact rational (so e.g. 0.1 is exactly 1/10, with no
-	// float rounding that could desync runtime from the convergence proof).
+	// ExprNumLit — an exact finite decimal, held as an exact rational (so e.g.
+	// 0.1 is exactly 1/10, with no float rounding that could desync runtime from
+	// the convergence proof).
 	Num *big.Rat
 
 	// ExprStrLit

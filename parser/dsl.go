@@ -39,14 +39,17 @@ func digitsP() Parser[string] {
 	)
 }
 
-// numberP parses a decimal literal with an optional leading '-' sign. The syntax
-// is decimal-only (digits with an optional fractional part) — there is no '/'
-// rational literal form. A '-' must be immediately followed by digits, so `-5` is
-// the literal negative five while `- 5` (with a space) is the '-' operator applied;
-// the sole caller wraps numberP in Try, so consuming `-` and then failing on the
-// space cleanly backtracks to the operator. The value is an exact rational: a
-// decimal like 0.1 becomes exactly 1/10, with no float rounding (so the runtime and
-// the convergence proof reason over the same value).
+// numberP parses an exact finite decimal literal with an optional leading '-'
+// sign. The syntax is decimal-only (digits with an optional fractional part) —
+// there is no '/' rational literal form in source. This is a deliberate design
+// choice, not a loss of exactness: a decimal like 0.1 becomes *exactly* 1/10 with
+// no float rounding (so the runtime and the convergence proof reason over the same
+// value). The p/q rational form (e.g. "1/3") exists only as a wire-boundary
+// convenience — keeping '/' out of source keeps ℚ closed with no division operator.
+// A '-' must be immediately followed by digits, so `-5` is the literal negative
+// five while `- 5` (with a space) is the '-' operator applied; the sole caller wraps
+// numberP in Try, so consuming `-` and then failing on the space cleanly backtracks
+// to the operator.
 func numberP() Parser[*big.Rat] {
 	sign := Or(Try(Map(RuneP('-'), func(rune) string { return "-" })), Succeed(""))
 	frac := Or(
