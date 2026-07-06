@@ -75,6 +75,38 @@ func TestE2E_vectorModel(t *testing.T) {
 	assert.Equal(t, "18", got) // 13 (nodeA) + 5 (nodeB)
 }
 
+// End-to-end parameterized query: source -> parse -> build (type-checks the
+// param'd body) -> instance -> Query with a param that varies the result.
+func TestE2E_queryParam(t *testing.T) {
+	src := `type T = vector rat0+
+fn lub a::rat0+ b::rat0+ = max a b
+merge T = zip lub
+query T.Above m::rat0+ = > (reduce max 0) m
+update T.Add k::rat0+ = local (+ k)
+`
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	built, err := builder.Build(plan)
+	require.NoError(t, err)
+
+	a := built.Models["T"].New("nodeA")
+	require.NoError(t, a.Apply("Add", []any{"10"}))
+
+	got, err := a.Query("Above", []any{"5"})
+	require.NoError(t, err)
+	assert.Equal(t, true, got)
+
+	got, err = a.Query("Above", []any{"20"})
+	require.NoError(t, err)
+	assert.Equal(t, false, got)
+
+	// A missing / out-of-domain param is rejected before eval.
+	_, err = a.Query("Above", nil)
+	require.Error(t, err)
+	_, err = a.Query("Above", []any{"-1"}) // negative not a valid rat0+
+	require.Error(t, err)
+}
+
 // End-to-end struct vector: a PN-counter whose slot is a struct { Pos, Neg }.
 // Exercises struct types, struct-typed fn params, struct construction literals,
 // dot field access, a whole-struct `zip` merge (product lattice: per-field max),

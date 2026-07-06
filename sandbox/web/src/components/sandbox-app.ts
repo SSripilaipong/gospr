@@ -1,5 +1,6 @@
 import {
   getState,
+  liveLabelQueries,
   openEvents,
   queryAll,
   reset,
@@ -180,10 +181,10 @@ export class SandboxApp extends HTMLElement {
     if (this.collection && !colls.includes(this.collection)) this.collection = null;
     if (!this.collection && colls.length > 0) this.collection = colls[0];
 
-    if (this.collection) {
-      const queries = next.schema[this.collection]?.queries ?? {};
-      if (this.liveQuery && !(this.liveQuery in queries)) this.liveQuery = null;
-    } else {
+    // Drop liveQuery unless it is still a valid live label (zero-param). A
+    // redeploy that turns a same-named query parameterized must clear it, else
+    // refreshLiveResults keeps polling it with [] and every node 400s.
+    if (!liveLabelQueries(next.schema, this.collection).includes(this.liveQuery ?? "")) {
       this.liveQuery = null;
     }
   }

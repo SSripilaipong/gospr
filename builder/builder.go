@@ -405,17 +405,20 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if _, dup := m.Queries[qd.MethodName]; dup {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s defined twice", qd.TypeName, qd.MethodName)
 		}
-		if len(qd.Params) != 0 {
-			return BuiltPlan{}, fmt.Errorf("query %s.%s: query params are not yet supported", qd.TypeName, qd.MethodName)
+		// Query params cross the HTTP boundary (bindParams), which handles only
+		// scalar numeric values — so a struct-typed query param is rejected, same
+		// as an update param.
+		if err := validateScalarParams(qd.Params); err != nil {
+			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
 		// A query body is a general expression that may fold the vector via
-		// `reduce` (allowReduce=true). Its result type (rat/bool/string) is
-		// recorded for serialization/swagger.
-		body, err := env.resolve(qd.Body, nil, true)
+		// `reduce` (allowReduce=true) and may reference the query's params. Its
+		// result type (rat/bool/string) is recorded for serialization/swagger.
+		body, err := env.resolve(qd.Body, paramSet(qd.Params), true)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		result, err := chk.checkValue(body, m.Elem)
+		result, err := chk.checkValue(body, chk.paramScope(qd.Params), m.Elem)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
@@ -802,12 +805,13 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 }
 
 // checkValue type-checks a term that must yield a value (not a function) and
-// returns its type. Used for query bodies; elem is the vector element type, made
-// available to any `reduce` sub-expression in the body.
-func (c *checker) checkValue(e parser.Expr, elem crdt.ElemT) (vtype, error) {
+// returns its type. Used for query bodies; scope carries the query's params (the
+// body may reference them), and elem is the vector element type, made available
+// to any `reduce` sub-expression in the body.
+func (c *checker) checkValue(e parser.Expr, scope map[string]vtype, elem crdt.ElemT) (vtype, error) {
 	c.elem, c.hasElem = elem, true
 	defer func() { c.hasElem = false }()
-	s, err := c.typeOf(e, nil)
+	s, err := c.typeOf(e, scope)
 	if err != nil {
 		return vUnknown, err
 	}

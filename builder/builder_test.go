@@ -166,9 +166,36 @@ func TestBuild_badParamType(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestBuild_queryParamsRejected(t *testing.T) {
+func TestBuild_queryParamResolvedAndTyped(t *testing.T) {
+	// query T.Above m::rat = > (reduce max 0) m  -> a bool result; the param `m`
+	// must resolve to a Var and type-check against the > operator.
 	plan := canonicalPlan()
-	plan.Queries[0].Params = []parser.ParamSpec{{Name: "m", Type: "rat"}}
+	plan.Queries = append(plan.Queries, parser.QueryDef{
+		TypeName: "T", MethodName: "Above",
+		Params: []parser.ParamSpec{{Name: "m", Type: "rat"}},
+		Body:   app(name(">"), reduce(name("max"), num(0)), name("m")),
+	})
+	built, err := Build(plan)
+	require.NoError(t, err)
+
+	q := built.Models["T"].Queries["Above"]
+	require.Len(t, q.Params, 1)
+	assert.Equal(t, "m", q.Params[0].Name)
+	assert.Equal(t, parser.TypeBool, q.Result)
+}
+
+func TestBuild_queryStructParamRejected(t *testing.T) {
+	// A struct-typed query param can't cross the wire (bindParams is scalar-only).
+	plan := canonicalPlan()
+	plan.Queries[0].Params = []parser.ParamSpec{{Name: "s", Type: "SomeStruct"}}
+	_, err := Build(plan)
+	require.Error(t, err)
+}
+
+func TestBuild_queryUnknownParamRejected(t *testing.T) {
+	// A body referencing a name that is neither a param nor a known symbol fails.
+	plan := canonicalPlan()
+	plan.Queries[0].Body = app(name(">"), reduce(name("max"), num(0)), name("ghost"))
 	_, err := Build(plan)
 	require.Error(t, err)
 }

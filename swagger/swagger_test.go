@@ -118,3 +118,28 @@ func TestGenerate_getZeroParamQuery(t *testing.T) {
 	_, hasParams := get["parameters"]
 	assert.False(t, hasParams)
 }
+
+func TestGenerate_getParamQueryRequired(t *testing.T) {
+	// A parameterized query documents its `params` as required — the runtime
+	// rejects a missing param on the arity check.
+	plan := makeModelPlan()
+	model := plan.Collections[0].Spec.(*builder.Model)
+	model.Queries["Above"] = crdt.Method{
+		Params: []parser.ParamSpec{{Name: "m", Type: "rat"}},
+		Body:   parser.Expr{Kind: parser.ExprVar, Name: "m"},
+		Result: parser.TypeBool,
+	}
+
+	data, err := Generate(plan)
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	paths := doc["paths"].(map[string]any)
+	get := paths["/api/collections/MyVec/Above"].(map[string]any)["get"].(map[string]any)
+	params := get["parameters"].([]any)
+	require.Len(t, params, 1)
+	p := params[0].(map[string]any)
+	assert.Equal(t, "params", p["name"])
+	assert.Equal(t, true, p["required"])
+}

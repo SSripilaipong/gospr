@@ -10,6 +10,19 @@ export interface CollectionSchema {
   queries: Record<string, ParamSchema[]>;
 }
 
+// liveLabelQueries returns the names of a collection's zero-param queries — the
+// only ones a live label can poll, since the label calls each query with no
+// params across every node each tick. A parameterized query would 400 on the
+// arity check. Single source of truth so the picker and reconcile can't drift.
+export function liveLabelQueries(
+  schema: Record<string, CollectionSchema>,
+  collection: string | null,
+): string[] {
+  const cs = collection ? schema[collection] : undefined;
+  if (!cs) return [];
+  return Object.keys(cs.queries).filter((q) => cs.queries[q].length === 0);
+}
+
 // A slot value is a scalar (exact-rational string) or a struct (a nested object
 // of field -> SlotValue), matching the server's recursive wire encoding.
 export type SlotValue = string | { [field: string]: SlotValue };

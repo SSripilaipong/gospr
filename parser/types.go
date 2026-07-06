@@ -189,8 +189,8 @@ type MergeDef struct {
 type QueryDef struct {
 	TypeName   string
 	MethodName string
-	Params     []ParamSpec // empty now; AST allows future query params
-	Body       Expr        // a Reduce expr
+	Params     []ParamSpec // scalar-numeric params, bound into the body at query time
+	Body       Expr        // a general value expression (may wrap a `reduce`)
 }
 
 type UpdateDef struct {

@@ -1,4 +1,4 @@
-import { invoke, setSpeed, type ParamSchema, type SandboxState } from "../api";
+import { invoke, liveLabelQueries, setSpeed, type ParamSchema, type SandboxState } from "../api";
 import { toast } from "../toast";
 
 // <node-panel> is the right inspector rail. It has three regions:
@@ -76,10 +76,10 @@ export class NodePanel extends HTMLElement {
       el("p", "hint", "Show a query's result live on every node in the graph."),
     );
 
-    const cs = this.collection ? this.state!.schema[this.collection] : undefined;
-    const queries = cs ? Object.keys(cs.queries) : [];
+    // Only zero-param queries can be a live label (see liveLabelQueries).
+    const queries = liveLabelQueries(this.state!.schema, this.collection);
     if (queries.length === 0) {
-      card.appendChild(el("p", "empty", "This collection has no queries."));
+      card.appendChild(el("p", "empty", "This collection has no param-less queries."));
       return card;
     }
 

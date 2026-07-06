@@ -132,7 +132,7 @@ func addGetPath(paths map[string]pathItem, collection, queryName string, params 
 		op.Parameters = []parameter{{
 			Name:     "params",
 			In:       "query",
-			Required: false,
+			Required: true, // the runtime rejects a missing param (arity check), so it is not optional
 			Schema:   schema{Type: "string", Description: strings.Join(parts, ", ")},
 			Example:  strings.Join(examples, ","),
 		}}

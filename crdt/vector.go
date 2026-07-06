@@ -142,9 +142,16 @@ func (v *VectorCRDT) Query(name string, params []any) (any, error) {
 		return nil, err
 	}
 	m := v.queries[name]
+	// ValidateQuery already checked arity and each param's domain, so binding
+	// here cannot fail; the resulting env is threaded into the body so params
+	// are in scope during eval.
+	env, err := bindParams(m.Params, params)
+	if err != nil {
+		return nil, fmt.Errorf("query %s: %w", name, err)
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	val, err := v.eval(m.Body, nil, 0)
+	val, err := v.eval(m.Body, env, 0)
 	if err != nil {
 		return nil, fmt.Errorf("query %s: %w", name, err)
 	}

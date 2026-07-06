@@ -193,6 +193,38 @@ func TestVector_runtimeParamValidation(t *testing.T) {
 	require.Error(t, w.Apply("Add", []any{"2.5"}), "non-integer must be rejected for int")
 }
 
+// A parameterized query binds its params into the body before eval: the same
+// query returns different results for different param values, proving the env is
+// threaded (not ignored).
+func TestVector_queryParamThreadedIntoEval(t *testing.T) {
+	// query Above m::rat = > (reduce max 0) m
+	fn := prim("max")
+	init := lit(0)
+	red := parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}
+	above := Method{
+		Params: []parser.ParamSpec{{Name: "m", Type: "rat"}},
+		Body:   app(prim(">"), red, vr("m")),
+		Result: parser.TypeBool,
+	}
+	v := NewVector("nodeA", ratElem, zipMax(),
+		map[string]Method{"Above": above},
+		map[string]Method{"Add": localAddK()}, nil)
+
+	require.NoError(t, v.Apply("Add", []any{"10"})) // slot max is now 10
+
+	got, err := v.Query("Above", []any{"5"})
+	require.NoError(t, err)
+	assert.Equal(t, true, got) // 10 > 5
+
+	got, err = v.Query("Above", []any{"20"})
+	require.NoError(t, err)
+	assert.Equal(t, false, got) // 10 > 20 is false
+
+	// arity + domain validation still applies (via ValidateQuery).
+	_, err = v.Query("Above", nil)
+	require.Error(t, err)
+}
+
 // ---- evaluator unit tests ------------------------------------------
 
 func TestEval_application(t *testing.T) {
