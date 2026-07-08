@@ -150,6 +150,33 @@ func TestParse_singleLineFnStillWorks(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, plan.Functions, 1)
 	assert.Equal(t, ExprApp, plan.Functions[0].Body.Kind)
+	assert.Equal(t, "", plan.Functions[0].RetType) // un-annotated
+}
+
+func TestParse_singleLineFnReturnAnnotation(t *testing.T) {
+	plan, err := Parse("fn add a::rat b::rat -> rat = + a b\n")
+	require.NoError(t, err)
+	require.Len(t, plan.Functions, 1)
+	assert.Equal(t, "rat", plan.Functions[0].RetType)
+	assert.Equal(t, ExprApp, plan.Functions[0].Body.Kind)
+}
+
+func TestParse_guardedFnReturnAnnotation(t *testing.T) {
+	src := "fn grade x::rat -> string\n| (> x 90) = \"A\"\n| otherwise = \"F\"\n"
+	plan, err := Parse(src)
+	require.NoError(t, err)
+	require.Len(t, plan.Functions, 1)
+	assert.Equal(t, "string", plan.Functions[0].RetType)
+	assert.Equal(t, ExprGuards, plan.Functions[0].Body.Kind)
+}
+
+func TestParse_returnAnnotationTokens(t *testing.T) {
+	// A return annotation reuses typeNameP: numtype signs, struct names, V.Elem.
+	for _, ret := range []string{"rat0+", "int0-", "X", "V.Elem", "bool"} {
+		plan, err := Parse("fn f x::rat -> " + ret + " = x\n")
+		require.NoError(t, err, "ret %q", ret)
+		assert.Equal(t, ret, plan.Functions[0].RetType, "ret %q", ret)
+	}
 }
 
 func TestParse_stringLiteralEscapes(t *testing.T) {

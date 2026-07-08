@@ -529,6 +529,78 @@ func TestBuild_anchoredRecursionThroughOperator(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// ---- return-type annotations ---------------------------------------
+
+// A `-> type` annotation on a non-recursive fn builds when the body conforms.
+func TestBuild_returnAnnotationBuilds(t *testing.T) {
+	_, err := Build(mustParse(t, "fn add a::rat b::rat -> rat = + a b\n"))
+	require.NoError(t, err)
+}
+
+// A declared return type that the body's type is not assignable to is rejected.
+func TestBuild_returnAnnotationMismatchRejected(t *testing.T) {
+	// body has type rat, declared int — rat is not <: int.
+	_, err := Build(mustParse(t, "fn f x::rat -> int = x\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "declared return type")
+}
+
+// The annotation seeds inference, so otherwise-unanchored recursion builds — and
+// the same fn WITHOUT the annotation is rejected.
+func TestBuild_returnAnnotationEnablesUnanchoredRecursion(t *testing.T) {
+	_, err := Build(mustParse(t, "fn g x::rat -> rat = g x\n"))
+	require.NoError(t, err)
+
+	_, err = Build(mustParse(t, "fn g x::rat = g x\n"))
+	require.Error(t, err) // no annotation, unanchored
+}
+
+// Finding 1: an annotated fn whose body routes through an un-annotated,
+// non-anchoring fn must fail at BUILD time, not slip through via vUnknown.
+func TestBuild_annotatedThroughUnanchoredRejected(t *testing.T) {
+	src := `fn helper x::rat = helper x
+fn g x::rat -> rat = helper x
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+}
+
+// A vkUnknown buried inside a struct field must not slip past the strict check —
+// subVtype's unknown-defers rule would otherwise accept it structurally.
+func TestBuild_nestedUnknownInStructResultRejected(t *testing.T) {
+	src := `type X = { A rat }
+fn helper x::rat = { A: helper x }
+fn g x::rat -> X = helper x
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+}
+
+// bool and string return annotations resolve.
+func TestBuild_returnAnnotationBoolString(t *testing.T) {
+	_, err := Build(mustParse(t, "fn p x::rat -> bool = > x 0\n"))
+	require.NoError(t, err)
+
+	_, err = Build(mustParse(t, "fn s x::rat -> string = \"hi\"\n"))
+	require.NoError(t, err)
+}
+
+// An unresolvable return-annotation token is a build error.
+func TestBuild_unknownReturnAnnotationRejected(t *testing.T) {
+	_, err := Build(mustParse(t, "fn f x::rat -> nope = x\n"))
+	require.Error(t, err)
+}
+
+// Finding 2: `bool`/`string` are reserved type names (they are the builtin return
+// types), so a user `type bool`/`type string` is rejected.
+func TestBuild_reservedBoolStringTypeNames(t *testing.T) {
+	for _, name := range []string{"bool", "string"} {
+		_, err := Build(mustParse(t, "type "+name+" = { A rat0+ }\n"))
+		require.Error(t, err, "type %s", name)
+		assert.Contains(t, err.Error(), "reserved", "type %s", name)
+	}
+}
+
 // ---- struct vectors ------------------------------------------------
 
 // The canonical struct-vector PN-counter builds: struct type, vector of it,

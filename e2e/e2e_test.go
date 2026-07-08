@@ -107,6 +107,32 @@ update T.Add k::rat0+ = local (+ k)
 	require.Error(t, err)
 }
 
+// End-to-end return annotation: a recursive helper `sumdown` carries a `-> int0+`
+// return type (which resolves its recursive call's type at build time), is called
+// from a query, and evaluates correctly at runtime. Confirms the annotation is a
+// build-time contract that leaves the runtime path intact.
+func TestE2E_returnAnnotatedRecursiveQueryFn(t *testing.T) {
+	src := `type T = vector int0+
+fn sumdown n::int -> int
+| (> n 0) = + n (sumdown (- n 1))
+| otherwise = 0
+merge T = zip max
+query T.Triangle = sumdown (reduce max 0)
+update T.Set k::int0+ = local (max k)
+`
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	built, err := builder.Build(plan)
+	require.NoError(t, err)
+
+	a := built.Models["T"].New("nodeA")
+	require.NoError(t, a.Apply("Set", []any{"4"}))
+
+	got, err := a.Query("Triangle", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "10", got) // 4+3+2+1+0
+}
+
 // End-to-end struct vector: a PN-counter whose slot is a struct { Pos, Neg }.
 // Exercises struct types, struct-typed fn params, struct construction literals,
 // dot field access, a whole-struct `zip` merge (product lattice: per-field max),

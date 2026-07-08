@@ -174,6 +174,25 @@ func toResultNum(t vtype) numtype.NumType {
 	return numtype.NumType{}
 }
 
+// containsUnknown reports whether t is vkUnknown or (recursively) has a struct
+// field that is. The vUnknown sentinel must not survive into a built artifact, and
+// a top-level `kind == vkUnknown` test misses one buried inside a struct field —
+// where subVtype's unknown-defers rule would otherwise silently accept it. Used to
+// gate every point that finalizes a value type (inferReturn, checkValue).
+func containsUnknown(t vtype) bool {
+	if t.kind == vkUnknown {
+		return true
+	}
+	if t.kind == vkStruct {
+		for _, f := range t.fields {
+			if containsUnknown(f.typ) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // subVtype reports whether a is assignable where b is wanted. vkUnknown (a
 // recursive call mid-inference) defers — it is treated as assignable to/from
 // anything, so anchored recursion keeps type-checking.
@@ -365,7 +384,9 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if a := arityOf(body); a != 0 {
 			return BuiltPlan{}, fmt.Errorf("function %s: body must return a value, but is missing %d argument(s)", fd.Name, a)
 		}
-		chk.register(fd.Name, fd.Params, body)
+		if err := chk.register(fd.Name, fd.Params, body, fd.RetType); err != nil {
+			return BuiltPlan{}, fmt.Errorf("function %s: %w", fd.Name, err)
+		}
 		funcs[fd.Name] = crdt.Function{Name: fd.Name, Params: fd.Params, Body: body}
 	}
 
@@ -722,12 +743,13 @@ func describe(e parser.Expr) string {
 // type — so anchored recursion resolves, while wholly unanchored recursion
 // (Option A) leaves vUnknown and is rejected.
 type checker struct {
-	reg        typeReg
-	fnParams   map[string][]vtype
-	fnScope    map[string]map[string]vtype
-	fnBody     map[string]parser.Expr
-	result     map[string]vtype
-	inProgress map[string]bool
+	reg         typeReg
+	fnParams    map[string][]vtype
+	fnScope     map[string]map[string]vtype
+	fnBody      map[string]parser.Expr
+	annotations map[string]vtype // declared `-> type` return types (absent when un-annotated)
+	result      map[string]vtype
+	inProgress  map[string]bool
 
 	// elem/hasElem give the current query's vector element type to the reduce
 	// case of typeOf. They are set only for the duration of a checkValue call;
@@ -738,12 +760,13 @@ type checker struct {
 
 func newChecker(reg typeReg) *checker {
 	return &checker{
-		reg:        reg,
-		fnParams:   map[string][]vtype{},
-		fnScope:    map[string]map[string]vtype{},
-		fnBody:     map[string]parser.Expr{},
-		result:     map[string]vtype{},
-		inProgress: map[string]bool{},
+		reg:         reg,
+		fnParams:    map[string][]vtype{},
+		fnScope:     map[string]map[string]vtype{},
+		fnBody:      map[string]parser.Expr{},
+		annotations: map[string]vtype{},
+		result:      map[string]vtype{},
+		inProgress:  map[string]bool{},
 	}
 }
 
@@ -758,9 +781,29 @@ func (c *checker) paramVtype(tok string) vtype {
 	return vElem(et)
 }
 
-// register records a resolved function body and its param scope. Each param is
-// bound to its declared type (numeric or struct).
-func (c *checker) register(name string, params []parser.ParamSpec, body parser.Expr) {
+// resolveResultType resolves a `-> type` return-annotation token to a vtype.
+// Unlike paramVtype, it errors on an unknown token (a bad annotation is a build
+// error). bool/string are recognized here — a return type may be non-numeric —
+// whereas param types (numeric/struct only) never are; `type bool`/`type string`
+// are reserved (see resolveTypes) so these keywords are unambiguous.
+func (c *checker) resolveResultType(tok string) (vtype, error) {
+	switch tok {
+	case "bool":
+		return vBool, nil
+	case "string":
+		return vString, nil
+	}
+	et, err := c.reg.resolveToken(tok)
+	if err != nil {
+		return vUnknown, err
+	}
+	return vElem(et), nil
+}
+
+// register records a resolved function body, its param scope, and its optional
+// resolved return annotation. Each param is bound to its declared type (numeric
+// or struct).
+func (c *checker) register(name string, params []parser.ParamSpec, body parser.Expr, retType string) error {
 	pts := make([]vtype, len(params))
 	scope := make(map[string]vtype, len(params))
 	for i, p := range params {
@@ -771,6 +814,14 @@ func (c *checker) register(name string, params []parser.ParamSpec, body parser.E
 	c.fnParams[name] = pts
 	c.fnScope[name] = scope
 	c.fnBody[name] = body
+	if retType != "" {
+		rt, err := c.resolveResultType(retType)
+		if err != nil {
+			return fmt.Errorf("return type: %w", err)
+		}
+		c.annotations[name] = rt
+	}
+	return nil
 }
 
 // paramScope builds a type-checking scope binding each param to its declared type
@@ -784,10 +835,38 @@ func (c *checker) paramScope(ps []parser.ParamSpec) map[string]vtype {
 }
 
 // inferReturn returns a function's result type, type-checking its body on first
-// visit. A function caught mid-inference (recursion) reports vUnknown.
+// visit.
+//
+// With a declared `-> type` annotation, the declared type is SEEDED into the memo
+// before the body is visited, so a recursive call resolves to it rather than to
+// vUnknown — this is what lets otherwise-unanchored recursion build. The body is
+// then strictly validated: its type must be CONCRETE (never vUnknown) and a
+// subtype of the declared type, so subVtype's unknown-defers rule can't launder an
+// unresolved recursive body into a passing annotation.
+//
+// Without an annotation, a function caught mid-inference (recursion) reports
+// vUnknown, which unifies with any concrete type — so anchored recursion resolves,
+// while wholly-unanchored recursion (Option A) is rejected.
 func (c *checker) inferReturn(name string) (vtype, error) {
 	if r, ok := c.result[name]; ok {
 		return r, nil
+	}
+	if ann, ok := c.annotations[name]; ok {
+		c.result[name] = ann // seed before visiting body: recursive calls see `ann`
+		s, err := c.typeOf(c.fnBody[name], c.fnScope[name])
+		if err != nil {
+			return vUnknown, err
+		}
+		if len(s.params) != 0 {
+			return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(s.params))
+		}
+		if containsUnknown(s.result) {
+			return vUnknown, fmt.Errorf("cannot verify body against declared return type %s (unanchored recursion)", ann)
+		}
+		if !subVtype(s.result, ann) {
+			return vUnknown, fmt.Errorf("declared return type %s but body has type %s", ann, s.result)
+		}
+		return ann, nil
 	}
 	if c.inProgress[name] {
 		return vUnknown, nil
@@ -801,8 +880,8 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 	if len(s.params) != 0 {
 		return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(s.params))
 	}
-	if s.result.kind == vkUnknown {
-		return vUnknown, fmt.Errorf("cannot infer return type (unanchored recursion)")
+	if containsUnknown(s.result) {
+		return vUnknown, fmt.Errorf("cannot infer return type; add a -> annotation (unanchored recursion)")
 	}
 	c.result[name] = s.result
 	return s.result, nil
@@ -822,7 +901,7 @@ func (c *checker) checkValue(e parser.Expr, scope map[string]vtype, elem crdt.El
 	if len(s.params) != 0 {
 		return vUnknown, fmt.Errorf("expected a value, got a function missing %d argument(s)", len(s.params))
 	}
-	if s.result.kind == vkUnknown {
+	if containsUnknown(s.result) {
 		return vUnknown, fmt.Errorf("cannot determine result type")
 	}
 	return s.result, nil
@@ -1250,7 +1329,7 @@ func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
 		if seen[td.Name] {
 			return reg, fmt.Errorf("type %s declared twice", td.Name)
 		}
-		if _, isNum := numtype.Parse(td.Name); isNum || td.Name == "vector" {
+		if _, isNum := numtype.Parse(td.Name); isNum || td.Name == "vector" || td.Name == "bool" || td.Name == "string" {
 			return reg, fmt.Errorf("type name %q is reserved", td.Name)
 		}
 		seen[td.Name] = true

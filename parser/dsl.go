@@ -428,6 +428,13 @@ func guardLineP() Parser[GuardCase] {
 func fnLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("fn"), Spaces1P()))
 	header := Sequence2(IdentP(), paramsP1())
+	// Optional `-> type` return annotation, between the params and the body. A
+	// leading Spaces1P keeps a signed param type (`rat-`) from eating the arrow;
+	// absent, it yields "". typeNameP parses one type token (numtype/struct/V.Elem).
+	optRet := Or(
+		Try(Prefix(Sequence2(Spaces1P(), StringP("->")), Prefix(Spaces1P(), typeNameP()))),
+		Succeed(""),
+	)
 	singleBody := Prefix(eqP(), Suffix(endP(), exprP()))
 	// A guard case may be preceded by blank/comment-only lines. guardSep is
 	// Try-wrapped so an indented `| ...` line (whose leading spaces guardSep would
@@ -440,9 +447,9 @@ func fnLineP() Parser[lineResult] {
 		func(cases []GuardCase) Expr { return Expr{Kind: ExprGuards, Cases: cases} },
 	)
 	rest := Map(
-		Sequence2(header, Or(Try(singleBody), guardedBody)),
-		func(t Of2[Of2[string, []ParamSpec], Expr]) lineResult {
-			return lineResult{fnDef: &FnDef{Name: t.V1.V1, Params: t.V1.V2, Body: t.V2}}
+		Sequence3(header, optRet, Or(Try(singleBody), guardedBody)),
+		func(t Of3[Of2[string, []ParamSpec], string, Expr]) lineResult {
+			return lineResult{fnDef: &FnDef{Name: t.V1.V1, Params: t.V1.V2, RetType: t.V2, Body: t.V3}}
 		},
 	)
 	return Prefix(prefix, rest)

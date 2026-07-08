@@ -180,11 +180,14 @@ type TypeDef struct {
 
 // FnDef is a top-level user-defined function `fn name p1::rat .. = body`.
 // Functions are global (not attached to a type). Body is an unresolved
-// applicative term until Build resolves it.
+// applicative term until Build resolves it. RetType is the optional `-> type`
+// return annotation (a raw type token, "" when absent); the builder resolves and
+// enforces it.
 type FnDef struct {
-	Name   string
-	Params []ParamSpec
-	Body   Expr
+	Name    string
+	Params  []ParamSpec
+	Body    Expr
+	RetType string `json:",omitempty"`
 }
 
 type MergeDef struct {
