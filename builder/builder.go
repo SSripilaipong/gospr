@@ -66,18 +66,29 @@ const (
 	vkBool
 	vkString
 	vkStruct
+	vkFunc
 )
 
-// vtype is the builder's internal value type. For vkNum the carried NumType says
-// which numeric subtype; for vkStruct, fields lists the ordered field types (and
-// name is the nominal struct name, for diagnostics). Other fields are unused for
-// the scalar/bool/string kinds.
+// vtype is the builder's internal type: a value type OR (kind vkFunc) a function.
+// For vkNum the carried NumType says which numeric subtype; for vkStruct, fields
+// lists the ordered field types (and name is the nominal struct name, for
+// diagnostics); for vkFunc, fn carries the (possibly partially applied) signature.
+// Functions are first-class in the type model — typeOf returns one vtype for both
+// values and functions — but not as runtime values: a vkFunc in an argument /
+// struct-field / element position is a type error (see the isFunc guards).
 type vtype struct {
 	kind   vkind
 	num    numtype.NumType
 	name   string   // vkStruct nominal name (diagnostics only)
 	fields []vfield // vkStruct, in declaration order
+	fn     *fnType  // vkFunc signature (nil otherwise)
 }
+
+// isFunc reports whether t is a function type (a vkFunc carrying a signature).
+func isFunc(t vtype) bool { return t.kind == vkFunc }
+
+// mkFunc wraps a signature as a first-class function vtype.
+func mkFunc(f fnType) vtype { return vtype{kind: vkFunc, fn: &f} }
 
 // vfield is one field of a struct vtype.
 type vfield struct {
@@ -99,7 +110,9 @@ func vElem(t crdt.ElemT) vtype {
 }
 
 // elemTOf lowers a struct vtype back to a crdt.ElemT descriptor (used to capture
-// a struct-valued query result). Only meaningful for vkStruct / vkNum.
+// a struct-valued query result). Only meaningful for vkStruct / vkNum — callers
+// gate on isFunc first, so a vkFunc must never reach here (it would lower to a
+// garbage scalar ElemT).
 func elemTOf(t vtype) crdt.ElemT {
 	if t.kind == vkStruct {
 		fields := make([]crdt.FieldT, len(t.fields))
@@ -149,6 +162,15 @@ func (t vtype) String() string {
 			parts[i] = f.name + " " + f.typ.String()
 		}
 		return "{ " + strings.Join(parts, ", ") + " }"
+	case vkFunc:
+		if t.fn == nil {
+			return "function"
+		}
+		parts := make([]string, len(t.fn.params))
+		for i, p := range t.fn.params {
+			parts[i] = p.String()
+		}
+		return "(" + strings.Join(parts, ", ") + ") -> " + t.fn.result.String()
 	default:
 		return "unknown"
 	}
@@ -190,6 +212,14 @@ func containsUnknown(t vtype) bool {
 			}
 		}
 	}
+	if t.kind == vkFunc && t.fn != nil {
+		for _, p := range t.fn.params {
+			if containsUnknown(p) {
+				return true
+			}
+		}
+		return containsUnknown(t.fn.result)
+	}
 	return false
 }
 
@@ -216,15 +246,48 @@ func subVtype(a, b vtype) bool {
 		}
 		return true
 	}
+	if a.kind == vkFunc && b.kind == vkFunc {
+		return fnSubtype(a.fn, b.fn)
+	}
 	return a.kind == b.kind
 }
 
-// sig is a (possibly partially applied) function signature: the param types it
-// still expects plus the type it yields once saturated. For a primitive the
-// result depends on its operands, so op names the operator and bound records the
-// operand types already supplied; result is then computed when saturated. For a
-// user function / value, op == "" and result is fixed.
-type sig struct {
+// fnSubtype reports structural assignability of two function signatures (same
+// arity, params and result pairwise assignable). Defensive: functions never reach
+// a value-assignability check today, but the explicit case stops subVtype's
+// kind-equality fall-through from declaring any two functions mutually assignable.
+func fnSubtype(a, b *fnType) bool {
+	if a == nil || b == nil || len(a.params) != len(b.params) {
+		return false
+	}
+	for i := range a.params {
+		if !subVtype(a.params[i], b.params[i]) {
+			return false
+		}
+	}
+	return subVtype(a.result, b.result)
+}
+
+// fnEqual reports structural equality of two function signatures (arity + pairwise
+// vtypeEqual on params and result). Companion to fnSubtype for unify/vtypeEqual.
+func fnEqual(a, b *fnType) bool {
+	if a == nil || b == nil || len(a.params) != len(b.params) {
+		return false
+	}
+	for i := range a.params {
+		if !vtypeEqual(a.params[i], b.params[i]) {
+			return false
+		}
+	}
+	return vtypeEqual(a.result, b.result)
+}
+
+// fnType is a (possibly partially applied) function signature, nested inside a
+// vkFunc vtype: the param types it still expects plus the type it yields once
+// saturated. For a primitive the result depends on its operands, so op names the
+// operator and bound records the operand types already supplied; result is then
+// computed when saturated. For a user function, op == "" and result is fixed.
+type fnType struct {
 	params []vtype
 	result vtype
 	op     string  // primitive operator driving the result rule; "" otherwise
@@ -853,18 +916,18 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 	}
 	if ann, ok := c.annotations[name]; ok {
 		c.result[name] = ann // seed before visiting body: recursive calls see `ann`
-		s, err := c.typeOf(c.fnBody[name], c.fnScope[name])
+		bodyT, err := c.typeOf(c.fnBody[name], c.fnScope[name])
 		if err != nil {
 			return vUnknown, err
 		}
-		if len(s.params) != 0 {
-			return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(s.params))
+		if isFunc(bodyT) {
+			return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(bodyT.fn.params))
 		}
-		if containsUnknown(s.result) {
+		if containsUnknown(bodyT) {
 			return vUnknown, fmt.Errorf("cannot verify body against declared return type %s (unanchored recursion)", ann)
 		}
-		if !subVtype(s.result, ann) {
-			return vUnknown, fmt.Errorf("declared return type %s but body has type %s", ann, s.result)
+		if !subVtype(bodyT, ann) {
+			return vUnknown, fmt.Errorf("declared return type %s but body has type %s", ann, bodyT)
 		}
 		return ann, nil
 	}
@@ -872,19 +935,19 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 		return vUnknown, nil
 	}
 	c.inProgress[name] = true
-	s, err := c.typeOf(c.fnBody[name], c.fnScope[name])
+	bodyT, err := c.typeOf(c.fnBody[name], c.fnScope[name])
 	c.inProgress[name] = false
 	if err != nil {
 		return vUnknown, err
 	}
-	if len(s.params) != 0 {
-		return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(s.params))
+	if isFunc(bodyT) {
+		return vUnknown, fmt.Errorf("body must return a value, but is missing %d argument(s)", len(bodyT.fn.params))
 	}
-	if containsUnknown(s.result) {
+	if containsUnknown(bodyT) {
 		return vUnknown, fmt.Errorf("cannot infer return type; add a -> annotation (unanchored recursion)")
 	}
-	c.result[name] = s.result
-	return s.result, nil
+	c.result[name] = bodyT
+	return bodyT, nil
 }
 
 // checkValue type-checks a term that must yield a value (not a function) and
@@ -894,17 +957,17 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 func (c *checker) checkValue(e parser.Expr, scope map[string]vtype, elem crdt.ElemT) (vtype, error) {
 	c.elem, c.hasElem = elem, true
 	defer func() { c.hasElem = false }()
-	s, err := c.typeOf(e, scope)
+	t, err := c.typeOf(e, scope)
 	if err != nil {
 		return vUnknown, err
 	}
-	if len(s.params) != 0 {
-		return vUnknown, fmt.Errorf("expected a value, got a function missing %d argument(s)", len(s.params))
+	if isFunc(t) {
+		return vUnknown, fmt.Errorf("expected a value, got a function missing %d argument(s)", len(t.fn.params))
 	}
-	if containsUnknown(s.result) {
+	if containsUnknown(t) {
 		return vUnknown, fmt.Errorf("cannot determine result type")
 	}
-	return s.result, nil
+	return t, nil
 }
 
 // checkCombinatorFn type-checks the function carried by a resolved zip/local
@@ -918,84 +981,88 @@ func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, el
 		return fmt.Errorf("combinator has no function")
 	}
 	elemV := vElem(elem)
-	s, err := c.typeOf(*comb.Fn, scope)
+	t, err := c.typeOf(*comb.Fn, scope)
 	if err != nil {
 		return err
 	}
-	if len(s.params) == 0 {
+	if !isFunc(t) {
 		return fmt.Errorf("combinator function takes no arguments")
 	}
-	args := make([]vtype, len(s.params))
+	args := make([]vtype, len(t.fn.params))
 	for i := range args {
 		args[i] = elemV
 	}
-	sat, err := c.applyArgs(s, args)
+	sat, err := c.applyArgs(*t.fn, args)
 	if err != nil {
 		return err
 	}
-	if sat.result.kind == vkUnknown {
+	if containsUnknown(sat) {
 		return nil // unanchored recursion: result type can't be verified, allowed
 	}
-	if !subVtype(sat.result, elemV) {
-		return fmt.Errorf("combinator result %s is not assignable to element type %s", sat.result, elemV)
+	if !subVtype(sat, elemV) {
+		return fmt.Errorf("combinator result %s is not assignable to element type %s", sat, elemV)
 	}
 	return nil
 }
 
-// typeOf computes the (possibly partial) signature of a resolved term.
-func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
+// typeOf computes the type of a resolved term: a value vtype, or (for an
+// unsaturated reference/application) a vkFunc carrying the remaining signature.
+func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (vtype, error) {
 	switch e.Kind {
 	case parser.ExprNumLit:
-		return sig{result: literalType(e.Num)}, nil
+		return literalType(e.Num), nil
 	case parser.ExprStrLit:
-		return sig{result: vString}, nil
+		return vString, nil
 	case parser.ExprVar:
 		t, ok := scope[e.Name]
 		if !ok {
-			return sig{}, fmt.Errorf("unbound variable %q", e.Name)
+			return vtype{}, fmt.Errorf("unbound variable %q", e.Name)
 		}
-		return sig{result: t}, nil
+		return t, nil
 	case parser.ExprRef:
 		if e.Ref == parser.RefPrimitive {
 			ar, ok := primitiveArity[e.Name]
 			if !ok {
-				return sig{}, fmt.Errorf("unknown primitive %q", e.Name)
+				return vtype{}, fmt.Errorf("unknown primitive %q", e.Name)
 			}
 			params := make([]vtype, ar)
 			for i := range params {
 				params[i] = numTop // any numeric operand
 			}
-			return sig{params: params, op: e.Name}, nil
+			return mkFunc(fnType{params: params, op: e.Name}), nil
 		}
 		params, ok := c.fnParams[e.Name]
 		if !ok {
-			return sig{}, fmt.Errorf("unknown function %q", e.Name)
+			return vtype{}, fmt.Errorf("unknown function %q", e.Name)
 		}
 		res, err := c.inferReturn(e.Name)
 		if err != nil {
-			return sig{}, err
+			return vtype{}, err
 		}
-		return sig{params: append([]vtype(nil), params...), result: res}, nil
+		return mkFunc(fnType{params: append([]vtype(nil), params...), result: res}), nil
 	case parser.ExprApp:
 		if e.Head == nil {
-			return sig{}, fmt.Errorf("application has no head")
+			return vtype{}, fmt.Errorf("application has no head")
 		}
 		hs, err := c.typeOf(*e.Head, scope)
 		if err != nil {
-			return sig{}, err
+			return vtype{}, err
+		}
+		if !isFunc(hs) {
+			return vtype{}, fmt.Errorf("cannot apply arguments to a value of type %s", hs)
 		}
 		args := make([]vtype, len(e.Args))
 		for i, a := range e.Args {
 			as, err := c.typeOf(*a, scope)
 			if err != nil {
-				return sig{}, err
+				return vtype{}, err
 			}
-			if len(as.params) != 0 {
-				return sig{}, fmt.Errorf("cannot pass a function as an argument")
+			if isFunc(as) {
+				return vtype{}, fmt.Errorf("cannot pass a function as an argument")
 			}
-			args[i] = as.result
+			args[i] = as
 		}
-		return c.applyArgs(hs, args)
+		return c.applyArgs(*hs.fn, args)
 	case parser.ExprGuards:
 		return c.typeOfGuards(e, scope)
 	case parser.ExprStructLit:
@@ -1003,39 +1070,39 @@ func (c *checker) typeOf(e parser.Expr, scope map[string]vtype) (sig, error) {
 		seen := make(map[string]bool, len(e.StructFields))
 		for i, sf := range e.StructFields {
 			if seen[sf.Name] {
-				return sig{}, fmt.Errorf("duplicate struct field %q", sf.Name)
+				return vtype{}, fmt.Errorf("duplicate struct field %q", sf.Name)
 			}
 			seen[sf.Name] = true
 			fs, err := c.typeOf(*sf.Value, scope)
 			if err != nil {
-				return sig{}, err
+				return vtype{}, err
 			}
-			if len(fs.params) != 0 {
-				return sig{}, fmt.Errorf("struct field %q is not a value", sf.Name)
+			if isFunc(fs) {
+				return vtype{}, fmt.Errorf("struct field %q is not a value", sf.Name)
 			}
-			fields[i] = vfield{name: sf.Name, typ: fs.result}
+			fields[i] = vfield{name: sf.Name, typ: fs}
 		}
-		return sig{result: vtype{kind: vkStruct, fields: fields}}, nil
+		return vtype{kind: vkStruct, fields: fields}, nil
 	case parser.ExprField:
 		ts, err := c.typeOf(*e.Target, scope)
 		if err != nil {
-			return sig{}, err
+			return vtype{}, err
 		}
-		if len(ts.params) != 0 {
-			return sig{}, fmt.Errorf("cannot access a field of a function")
+		if isFunc(ts) {
+			return vtype{}, fmt.Errorf("cannot access a field of a function")
 		}
-		if ts.result.kind != vkStruct {
-			return sig{}, fmt.Errorf("cannot access field %q of non-struct type %s", e.Field, ts.result)
+		if ts.kind != vkStruct {
+			return vtype{}, fmt.Errorf("cannot access field %q of non-struct type %s", e.Field, ts)
 		}
-		ft, ok := ts.result.findField(e.Field)
+		ft, ok := ts.findField(e.Field)
 		if !ok {
-			return sig{}, fmt.Errorf("type %s has no field %q", ts.result, e.Field)
+			return vtype{}, fmt.Errorf("type %s has no field %q", ts, e.Field)
 		}
-		return sig{result: ft}, nil
+		return ft, nil
 	case parser.ExprReduce:
 		return c.typeOfReduce(e, scope)
 	default:
-		return sig{}, fmt.Errorf("cannot type-check expression of kind %d", e.Kind)
+		return vtype{}, fmt.Errorf("cannot type-check expression of kind %d", e.Kind)
 	}
 }
 
@@ -1063,21 +1130,21 @@ func literalType(n *big.Rat) vtype {
 // When the result saturates, the result type is computed via resultOf; otherwise
 // a new partial sig carrying the remaining params (and accumulated bound
 // operands) is returned.
-func (c *checker) applyArgs(s sig, args []vtype) (sig, error) {
-	if len(args) > len(s.params) {
-		return sig{}, fmt.Errorf("too many arguments: expected %d, got %d", len(s.params), len(args))
+func (c *checker) applyArgs(f fnType, args []vtype) (vtype, error) {
+	if len(args) > len(f.params) {
+		return vtype{}, fmt.Errorf("too many arguments: expected %d, got %d", len(f.params), len(args))
 	}
 	for i, a := range args {
-		if !subVtype(a, s.params[i]) {
-			return sig{}, fmt.Errorf("argument %d: expected %s, got %s", i+1, s.params[i], a)
+		if !subVtype(a, f.params[i]) {
+			return vtype{}, fmt.Errorf("argument %d: expected %s, got %s", i+1, f.params[i], a)
 		}
 	}
-	bound := append(append([]vtype(nil), s.bound...), args...)
-	remaining := s.params[len(args):]
+	bound := append(append([]vtype(nil), f.bound...), args...)
+	remaining := f.params[len(args):]
 	if len(remaining) == 0 {
-		return sig{result: resultOf(s.op, s.result, bound)}, nil
+		return resultOf(f.op, f.result, bound), nil
 	}
-	return sig{params: remaining, result: s.result, op: s.op, bound: bound}, nil
+	return mkFunc(fnType{params: remaining, result: f.result, op: f.op, bound: bound}), nil
 }
 
 // resultOf computes a saturated application's result type. For a non-primitive
@@ -1103,48 +1170,48 @@ func resultOf(op string, fallback vtype, operands []vtype) vtype {
 // element type. The result type is the least fixpoint of folding the function
 // over (accumulator, element), starting from the init literal's type — bounded
 // because the lattice has finite height.
-func (c *checker) typeOfReduce(e parser.Expr, scope map[string]vtype) (sig, error) {
+func (c *checker) typeOfReduce(e parser.Expr, scope map[string]vtype) (vtype, error) {
 	if e.Fn == nil || e.Init == nil {
-		return sig{}, fmt.Errorf("malformed reduce")
+		return vtype{}, fmt.Errorf("malformed reduce")
 	}
 	if !c.hasElem {
-		return sig{}, fmt.Errorf("reduce may only appear in a query body")
+		return vtype{}, fmt.Errorf("reduce may only appear in a query body")
 	}
 	fs, err := c.typeOf(*e.Fn, scope)
 	if err != nil {
-		return sig{}, err
+		return vtype{}, err
 	}
-	if len(fs.params) != 2 {
-		return sig{}, fmt.Errorf("reduce needs a binary function")
+	if !isFunc(fs) || len(fs.fn.params) != 2 {
+		return vtype{}, fmt.Errorf("reduce needs a binary function")
 	}
-	initS, err := c.typeOf(*e.Init, scope)
+	initT, err := c.typeOf(*e.Init, scope)
 	if err != nil {
-		return sig{}, err
+		return vtype{}, err
 	}
-	if len(initS.params) != 0 {
-		return sig{}, fmt.Errorf("reduce init must be a value")
+	if isFunc(initT) {
+		return vtype{}, fmt.Errorf("reduce init must be a value")
 	}
 	elemV := vElem(c.elem) // fold element type: scalar or struct
-	acc := initS.result
+	acc := initT
 	// Iterate to a fixpoint; the lattice has finite height, so this terminates.
 	for i := 0; i < 16; i++ {
-		sat, err := c.applyArgs(fs, []vtype{acc, elemV})
+		sat, err := c.applyArgs(*fs.fn, []vtype{acc, elemV})
 		if err != nil {
-			return sig{}, err
+			return vtype{}, err
 		}
-		if sat.result.kind == vkUnknown {
+		if sat.kind == vkUnknown {
 			break // recursive reduce fn mid-inference: settle on the accumulator so far
 		}
-		next, err := unify(acc, sat.result)
+		next, err := unify(acc, sat)
 		if err != nil {
-			return sig{}, fmt.Errorf("reduce function result type is inconsistent: %w", err)
+			return vtype{}, fmt.Errorf("reduce function result type is inconsistent: %w", err)
 		}
 		if vtypeEqual(next, acc) {
 			break
 		}
 		acc = next
 	}
-	return sig{result: acc}, nil
+	return acc, nil
 }
 
 // vtypeEqual reports structural equality of two value types (used to detect the
@@ -1168,57 +1235,59 @@ func vtypeEqual(a, b vtype) bool {
 			}
 		}
 		return true
+	case vkFunc:
+		return fnEqual(a.fn, b.fn)
 	default:
 		return true
 	}
 }
 
-func (c *checker) typeOfGuards(e parser.Expr, scope map[string]vtype) (sig, error) {
+func (c *checker) typeOfGuards(e parser.Expr, scope map[string]vtype) (vtype, error) {
 	n := len(e.Cases)
 	if n == 0 {
-		return sig{}, fmt.Errorf("guarded body has no cases")
+		return vtype{}, fmt.Errorf("guarded body has no cases")
 	}
 	result := vUnknown
 	for i, gc := range e.Cases {
 		isLast := i == n-1
 		if gc.Otherwise && !isLast {
-			return sig{}, fmt.Errorf("`otherwise` must be the last guard case")
+			return vtype{}, fmt.Errorf("`otherwise` must be the last guard case")
 		}
 		if !gc.Otherwise && isLast {
-			return sig{}, fmt.Errorf("a guarded function must end with an `otherwise` case")
+			return vtype{}, fmt.Errorf("a guarded function must end with an `otherwise` case")
 		}
 		if !gc.Otherwise {
 			if gc.Cond == nil {
-				return sig{}, fmt.Errorf("guard case has no condition")
+				return vtype{}, fmt.Errorf("guard case has no condition")
 			}
 			cs, err := c.typeOf(*gc.Cond, scope)
 			if err != nil {
-				return sig{}, err
+				return vtype{}, err
 			}
-			if len(cs.params) != 0 {
-				return sig{}, fmt.Errorf("guard condition must be a value, not a function")
+			if isFunc(cs) {
+				return vtype{}, fmt.Errorf("guard condition must be a value, not a function")
 			}
-			if cs.result.kind != vkBool && cs.result.kind != vkUnknown {
-				return sig{}, fmt.Errorf("guard condition must be bool, got %s", cs.result)
+			if cs.kind != vkBool && cs.kind != vkUnknown {
+				return vtype{}, fmt.Errorf("guard condition must be bool, got %s", cs)
 			}
 		}
 		if gc.Result == nil {
-			return sig{}, fmt.Errorf("guard case has no result")
+			return vtype{}, fmt.Errorf("guard case has no result")
 		}
 		rs, err := c.typeOf(*gc.Result, scope)
 		if err != nil {
-			return sig{}, err
+			return vtype{}, err
 		}
-		if len(rs.params) != 0 {
-			return sig{}, fmt.Errorf("guard result must be a value, not a function")
+		if isFunc(rs) {
+			return vtype{}, fmt.Errorf("guard result must be a value, not a function")
 		}
-		unified, err := unify(result, rs.result)
+		unified, err := unify(result, rs)
 		if err != nil {
-			return sig{}, fmt.Errorf("guard results must all have the same type: %w", err)
+			return vtype{}, fmt.Errorf("guard results must all have the same type: %w", err)
 		}
 		result = unified
 	}
-	return sig{result: result}, nil
+	return result, nil
 }
 
 // unify widens two guard-result types to a common type: vUnknown defers, two
@@ -1249,6 +1318,11 @@ func unify(a, b vtype) (vtype, error) {
 			fields[i] = vfield{name: af.name, typ: u}
 		}
 		return vtype{kind: vkStruct, name: a.name, fields: fields}, nil
+	case a.kind == vkFunc && b.kind == vkFunc:
+		if fnEqual(a.fn, b.fn) {
+			return a, nil
+		}
+		return vUnknown, fmt.Errorf("cannot unify functions %s vs %s", a, b)
 	case a.kind != b.kind:
 		return vUnknown, fmt.Errorf("%s vs %s", a, b)
 	default:

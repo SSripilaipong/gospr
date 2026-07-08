@@ -846,3 +846,33 @@ collection C = V
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "recursive")
 }
+
+// ---- functions are first-class in the type model, not runtime values -------
+
+// Functions are typed (vkFunc), but they are not values: passing a bare function
+// where a value is expected — here the primitive `max` as an argument to `+` — is
+// a type error caught via the isFunc check, not an arity miscount.
+func TestBuild_functionAsArgumentRejected(t *testing.T) {
+	const src = `type T = vector rat
+fn bad a::rat = + a max
+merge T = zip max
+query T.V = reduce max 0
+update T.Add k::rat = local (+ k)
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot pass a function as an argument")
+}
+
+// A function in a struct-literal field position is likewise not a value.
+func TestBuild_functionAsStructFieldRejected(t *testing.T) {
+	const src = `type X = { Pos rat  Neg rat }
+type VX = vector X
+fn bad a::X = { Pos: max, Neg: 0 }
+merge VX = zip max
+collection C = VX
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a value")
+}
