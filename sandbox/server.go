@@ -131,8 +131,9 @@ func wireToState(snap map[string]crdt.WireSnapshot) map[string]map[string]any {
 	return out
 }
 
-// slotWireToAny renders a SlotWire as a JSON value: scalar -> its rational string,
-// struct -> an object of field -> value (recursing).
+// slotWireToAny renders a SlotWire as a JSON value: a numeric scalar -> its
+// rational string, a string leaf -> the string, a struct -> an object of field ->
+// value (recursing). Dispatch matches the SlotWire 3-way tag (exactly one set).
 func slotWireToAny(sw crdt.SlotWire) any {
 	if sw.Struct != nil {
 		obj := make(map[string]any, len(sw.Struct))
@@ -140,6 +141,9 @@ func slotWireToAny(sw crdt.SlotWire) any {
 			obj[k] = slotWireToAny(f)
 		}
 		return obj
+	}
+	if sw.Str != nil {
+		return *sw.Str
 	}
 	return sw.Num
 }

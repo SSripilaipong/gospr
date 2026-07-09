@@ -239,19 +239,25 @@ func structLitP() Parser[Expr] {
 	)
 }
 
-// reduceFormP parses `reduce <atom> <init-atom>`, e.g. `reduce max 0` or
-// `reduce M { Pos: 0, Neg: 0 }`. It is a value-producing primary (it folds the
-// vector), so it may appear anywhere an atom may — but the builder restricts it
-// to query bodies. The init is a literal atom (numeric or struct literal); the
-// builder type-checks it against the fold type. The trailing reference to atomP
-// is deferred to parse time (atomP itself lists reduceFormP).
+// reduceFormP parses `reduce <fn-atom> <init-atom> <vec-atom>`, e.g.
+// `reduce max 0 v` or `reduce M { Pos: 0, Neg: 0 } v`. It is a pure fold: the
+// vector to fold is passed explicitly as the third atom (no implicit state read),
+// so it may appear anywhere its vector argument is in scope. The init is a literal
+// atom (numeric or struct literal); the vec is any atom (typically a vector-typed
+// param). The trailing reference to atomP is deferred to parse time (atomP itself
+// lists reduceFormP).
 func reduceFormP() Parser[Expr] {
 	return Map(
-		Sequence3(Prefix(Sequence2(StringP("reduce"), Spaces1P()), atomP()), Spaces1P(), atomP()),
-		func(t Of3[Expr, struct{}, Expr]) Expr {
+		Sequence5(
+			Prefix(Sequence2(StringP("reduce"), Spaces1P()), atomP()),
+			Spaces1P(), atomP(),
+			Spaces1P(), atomP(),
+		),
+		func(t Of5[Expr, struct{}, Expr, struct{}, Expr]) Expr {
 			fn := t.V1
 			init := t.V3
-			return Expr{Kind: ExprReduce, Fn: &fn, Init: &init}
+			vec := t.V5
+			return Expr{Kind: ExprReduce, Fn: &fn, Init: &init, Vec: &vec}
 		},
 	)
 }
@@ -493,16 +499,22 @@ func queryLineP() Parser[lineResult] {
 func updateLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("update"), Spaces1P()))
 	lhs := Sequence4(IdentP(), RuneP('.'), IdentP(), paramsP())
-	// `local <atom>`: e.g. `local (+ k)` (a parenthesised partial application).
-	localExpr := Map(
-		Prefix(Sequence2(StringP("local"), Spaces1P()), atomP()),
-		func(fn Expr) Expr {
-			f := fn
-			return Expr{Kind: ExprLocal, Fn: &f}
-		},
-	)
+	// `local <atom>`: e.g. `local (+ k)` — a unary fn applied to the calling node's
+	// own slot. `write <atom>`: a unary fn applied to the WHOLE vector (its result
+	// becomes the new local slot), for updates that must read all slots (e.g. a
+	// Lamport clock). Both take a single atom (a name or a parenthesised term).
+	combExpr := func(kw string, kind ExprKind) Parser[Expr] {
+		return Map(
+			Prefix(Sequence2(StringP(kw), Spaces1P()), atomP()),
+			func(fn Expr) Expr {
+				f := fn
+				return Expr{Kind: kind, Fn: &f}
+			},
+		)
+	}
+	body := Or(Try(combExpr("local", ExprLocal)), combExpr("write", ExprWrite))
 	rest := Map(
-		Sequence2(lhs, Prefix(eqP(), Suffix(endP(), localExpr))),
+		Sequence2(lhs, Prefix(eqP(), Suffix(endP(), body))),
 		func(t Of2[Of4[string, rune, string, []ParamSpec], Expr]) lineResult {
 			return lineResult{updateDef: &UpdateDef{TypeName: t.V1.V1, MethodName: t.V1.V3, Params: t.V1.V4, Body: t.V2}}
 		},

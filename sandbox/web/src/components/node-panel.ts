@@ -147,7 +147,7 @@ export class NodePanel extends HTMLElement {
         const w = el("div");
         w.appendChild(labelEl(`${p.name} (${p.type})`));
         const input = document.createElement("input");
-        input.placeholder = `e.g. 5 or 1/2`;
+        input.placeholder = p.type === "string" ? `e.g. hello` : `e.g. 5 or 1/2`;
         w.appendChild(input);
         inputs.push(input);
         grid.appendChild(w);

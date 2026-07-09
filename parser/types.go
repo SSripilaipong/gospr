@@ -58,9 +58,10 @@ const (
 	ExprGuards                    // guarded body: | cond = result ... | otherwise = result
 	ExprStructLit                 // struct construction: { Name: expr, ... }
 	ExprField                     // field access: target.Field
-	ExprReduce                    // reduce <fn> <init>
+	ExprReduce                    // reduce <fn> <init> <vec>
 	ExprZip                       // zip <fn>
 	ExprLocal                     // local <fn>
+	ExprWrite                     // write <fn> — whole-vector update (fn: vector -> element)
 )
 
 // ValType is a value's type. The language has three: a rational number, a boolean
@@ -129,11 +130,12 @@ type Expr struct {
 	Head *Expr
 	Args []*Expr
 
-	// ExprReduce / ExprZip / ExprLocal: Fn is the function-valued term
-	// (a Ref or a partial App). Reduce additionally uses Init (a literal —
-	// a NumLit or a StructLit).
+	// ExprReduce / ExprZip / ExprLocal / ExprWrite: Fn is the function-valued
+	// term (a Ref or a partial App). Reduce additionally uses Init (a literal —
+	// a NumLit or a StructLit) and Vec (the vector value being folded).
 	Fn   *Expr
 	Init *Expr
+	Vec  *Expr
 
 	// ExprGuards: ordered guard cases, the last of which must be `otherwise`.
 	Cases []GuardCase

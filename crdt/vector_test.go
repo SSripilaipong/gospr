@@ -46,11 +46,22 @@ func zipMax() parser.Expr {
 	return parser.Expr{Kind: parser.ExprZip, Fn: &fn}
 }
 
-func reducePlus0() Method {
-	fn := prim("+")
-	init := lit(0)
-	return Method{Body: parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}}
+// reduceV builds `reduce fn init v` folding the vector variable "v" — the vector
+// param of the fn-of-vector a query body now wraps.
+func reduceV(fn, init parser.Expr) parser.Expr {
+	f, i, vc := fn, init, vr("v")
+	return parser.Expr{Kind: parser.ExprReduce, Fn: &f, Init: &i, Vec: &vc}
 }
+
+// reducePlus0Funcs registers `total v::T = reduce + 0 v`, the fn-of-vector the
+// Value query applies.
+func reducePlus0Funcs() map[string]Function {
+	return map[string]Function{
+		"total": {Name: "total", Params: []parser.ParamSpec{{Name: "v", Type: "T"}}, Body: reduceV(prim("+"), lit(0))},
+	}
+}
+
+func reducePlus0() Method { return Method{Body: fnRef("total", 1)} }
 
 func localAddK() Method {
 	sec := app(prim("+"), vr("k")) // (+ k) == partial application
@@ -64,7 +75,7 @@ func newT(nodeID string) *VectorCRDT {
 	return NewVector(nodeID, ratElem, zipMax(),
 		map[string]Method{"Value": reducePlus0()},
 		map[string]Method{"Add": localAddK()},
-		nil)
+		reducePlus0Funcs())
 }
 
 func TestVector_addAndValue(t *testing.T) {
@@ -197,18 +208,21 @@ func TestVector_runtimeParamValidation(t *testing.T) {
 // query returns different results for different param values, proving the env is
 // threaded (not ignored).
 func TestVector_queryParamThreadedIntoEval(t *testing.T) {
-	// query Above m::rat = > (reduce max 0) m
-	fn := prim("max")
-	init := lit(0)
-	red := parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}
+	// query Above m::rat = aboveFn m ; fn aboveFn m::rat v::T = > (reduce max 0 v) m
+	aboveFn := Function{
+		Name:   "aboveFn",
+		Params: []parser.ParamSpec{{Name: "m", Type: "rat"}, {Name: "v", Type: "T"}},
+		Body:   app(prim(">"), reduceV(prim("max"), lit(0)), vr("m")),
+	}
 	above := Method{
 		Params: []parser.ParamSpec{{Name: "m", Type: "rat"}},
-		Body:   app(prim(">"), red, vr("m")),
+		Body:   app(fnRef("aboveFn", 2), vr("m")),
 		Result: parser.TypeBool,
 	}
 	v := NewVector("nodeA", ratElem, zipMax(),
 		map[string]Method{"Above": above},
-		map[string]Method{"Add": localAddK()}, nil)
+		map[string]Method{"Add": localAddK()},
+		map[string]Function{"aboveFn": aboveFn})
 
 	require.NoError(t, v.Apply("Add", []any{"10"})) // slot max is now 10
 
@@ -318,12 +332,12 @@ func TestEval_guardsSelectFirstTrueElseOtherwise(t *testing.T) {
 }
 
 func TestEval_reduceInExpression(t *testing.T) {
-	// query body `+ 1 (reduce + 0)` folds the vector then adds 1.
-	fn := prim("+")
-	init := lit(0)
-	reduceBody := parser.Expr{Kind: parser.ExprReduce, Fn: &fn, Init: &init}
-	body := app(prim("+"), lit(1), reduceBody)
-	v := NewVector("n", ratElem, zipMax(), map[string]Method{"Q": {Body: body, Result: parser.TypeReal}}, nil, nil)
+	// query Q = qfn ; fn qfn v::T = + 1 (reduce + 0 v) — folds the vector then adds 1.
+	qfn := Function{Name: "qfn", Params: []parser.ParamSpec{{Name: "v", Type: "T"}},
+		Body: app(prim("+"), lit(1), reduceV(prim("+"), lit(0)))}
+	v := NewVector("n", ratElem, zipMax(),
+		map[string]Method{"Q": {Body: fnRef("qfn", 1), Result: parser.TypeReal}}, nil,
+		map[string]Function{"qfn": qfn})
 	v.state["a"] = numVal(big.NewRat(2, 1))
 	v.state["b"] = numVal(big.NewRat(3, 1))
 	got, err := v.Query("Q", nil)
@@ -346,4 +360,80 @@ func TestVector_recursionGuardAndMergeAtomicity(t *testing.T) {
 	err := v.Merge(map[string]rtVal{"nodeA": numVal(big.NewRat(2, 1))}) // overlapping slot triggers loop
 	require.Error(t, err)
 	assert.Equal(t, big.NewRat(1, 1), v.state["nodeA"].num, "state must be unchanged after a failing merge")
+}
+
+// ---- string slot leaves + wire validation --------------------------
+
+// lwwElem is the { version int0+, value string } struct element of the LWW register.
+var lwwElem = ElemT{Struct: true, Name: "X", Fields: []FieldT{
+	{Name: "version", Type: ElemT{Num: numtype.NumType{Domain: numtype.DInt, Sign: numtype.SNonNeg}}},
+	{Name: "value", Type: ElemT{Str: true}},
+}}
+
+// A string leaf survives zero/clone/wire round-tripping (including non-ASCII).
+func TestSlot_stringLeafRoundTrip(t *testing.T) {
+	z := zeroSlot(lwwElem)
+	require.Equal(t, kStruct, z.kind)
+	assert.Equal(t, "", z.fields["value"].str) // absent string slot defaults to ""
+
+	slot := structVal(map[string]rtVal{
+		"version": numVal(big.NewRat(3, 1)),
+		"value":   strVal("héllo"),
+	})
+	assert.Equal(t, "héllo", cloneSlot(slot).fields["value"].str)
+
+	w := slotToWire(slot)
+	require.NotNil(t, w.Struct["value"].Str)
+	assert.Equal(t, "héllo", *w.Struct["value"].Str)
+
+	back, err := wireToSlot(w, lwwElem)
+	require.NoError(t, err)
+	assert.Equal(t, "héllo", back.fields["value"].str)
+}
+
+// An empty string round-trips (the Str pointer disambiguates "" from an absent tag).
+func TestSlot_emptyStringWireRoundTrips(t *testing.T) {
+	empty := ""
+	w := SlotWire{Struct: map[string]SlotWire{"version": {Num: "0"}, "value": {Str: &empty}}}
+	back, err := wireToSlot(w, lwwElem)
+	require.NoError(t, err)
+	assert.Equal(t, "", back.fields["value"].str)
+}
+
+// A wire string leaf carrying invalid UTF-8 is rejected — both at top level and
+// nested in a struct field — so a malformed remote value can't diverge from the
+// prover's code-point (str.<) ordering.
+func TestSlot_invalidUTF8StringLeafRejected(t *testing.T) {
+	bad := string([]byte{0xff, 0xfe})
+	_, err := wireToSlot(SlotWire{Str: &bad}, ElemT{Str: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UTF-8")
+
+	w := SlotWire{Struct: map[string]SlotWire{"version": {Num: "1"}, "value": {Str: &bad}}}
+	_, err = wireToSlot(w, lwwElem)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UTF-8")
+}
+
+// A SlotWire with more than one populated tag, or none, is malformed and rejected.
+func TestSlot_malformedSlotWireRejected(t *testing.T) {
+	s := "x"
+	_, err := wireToSlot(SlotWire{Num: "1", Str: &s}, ElemT{Str: true}) // two tags
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exactly one")
+
+	_, err = wireToSlot(SlotWire{}, ratElem) // no tag
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exactly one")
+}
+
+// A string update param binds from its wire value; invalid UTF-8 is rejected.
+func TestBindParams_stringParam(t *testing.T) {
+	m, err := bindParams([]parser.ParamSpec{{Name: "s", Type: "string"}}, []any{"hi"})
+	require.NoError(t, err)
+	assert.Equal(t, "hi", m["s"].str)
+
+	_, err = bindParams([]parser.ParamSpec{{Name: "s", Type: "string"}}, []any{string([]byte{0xff})})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "UTF-8")
 }

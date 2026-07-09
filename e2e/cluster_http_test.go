@@ -22,7 +22,8 @@ import (
 // cluster has something to instantiate and so HTTP can address it by name.
 const counterDSL = `type T = vector rat0+
 merge T = zip max
-query T.Value = reduce + 0
+fn total v::T = reduce + 0 v
+query T.Value = total
 update T.Add k::rat0+ = local (+ k)
 collection Counter = T
 `

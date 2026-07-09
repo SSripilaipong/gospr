@@ -60,6 +60,14 @@ func buildScript(g goal) string {
 	var b strings.Builder
 	b.WriteString("(set-logic ALL)\n")
 	for _, d := range g.vars {
+		if d.str {
+			// A string leaf is declared as an SMT String; comparisons over it use
+			// str.< / str.<= (lexicographic over code points), which matches the
+			// runtime's bytewise-UTF-8 order for the valid-UTF-8 values the ingress
+			// boundaries admit. No domain/sign constraints apply.
+			fmt.Fprintf(&b, "(declare-const %s String)\n", d.name)
+			continue
+		}
 		fmt.Fprintf(&b, "(declare-const %s Real)\n", d.name)
 		if d.typ.Domain == numtype.DInt {
 			fmt.Fprintf(&b, "(assert (is_int %s))\n", d.name)
@@ -73,11 +81,24 @@ func buildScript(g goal) string {
 			fmt.Fprintf(&b, "(assert (= %s 0.0))\n", d.name)
 		}
 	}
-	// A struct obligation lhs == rhs decomposes to the conjunction of its leaf
-	// scalar equalities; assert the negation of that conjunction (unsat ⇒ every
-	// leaf equal ⇒ proven). A scalar obligation is the degenerate single-leaf case.
-	eqs := leafEqs(g.lhs, g.rhs)
-	fmt.Fprintf(&b, "(assert (not %s))\n", conjunction(eqs))
+	// Hypotheses (the sound reduce-domination bounds a `write` obligation carries)
+	// are asserted positively; the conclusion's negation is asserted below, so a
+	// model must satisfy the hypotheses yet violate the conclusion — unsat ⇒ the
+	// conclusion holds under the hypotheses.
+	for _, a := range g.assume {
+		fmt.Fprintf(&b, "(assert %s)\n", serialize(a))
+	}
+	if g.claim != nil {
+		// A boolean-claim goal (the fold lemmas): prove the claim valid by refuting
+		// its negation.
+		fmt.Fprintf(&b, "(assert (not %s))\n", serialize(*g.claim))
+	} else {
+		// A struct obligation lhs == rhs decomposes to the conjunction of its leaf
+		// scalar equalities; assert the negation of that conjunction (unsat ⇒ every
+		// leaf equal ⇒ proven). A scalar obligation is the degenerate single-leaf case.
+		eqs := leafEqs(g.lhs, g.rhs)
+		fmt.Fprintf(&b, "(assert (not %s))\n", conjunction(eqs))
+	}
 	b.WriteString("(check-sat)\n")
 	return b.String()
 }
@@ -118,6 +139,9 @@ func sortedFields(m map[string]sym) []string {
 func serialize(s sym) string {
 	switch s.kind {
 	case symConst:
+		if s.sort == sortStr {
+			return smtStrLit(s.str)
+		}
 		return fmtRat(s.num)
 	case symVar:
 		return s.name
@@ -139,6 +163,21 @@ func serialize(s sym) string {
 		case "/=":
 			return fmt.Sprintf("(distinct %s %s)", a, bb)
 		default: // > < >= <=
+			// String operands compare lexicographically via str.< / str.<=; > and >=
+			// are the swapped-operand forms (SMT-LIB has no str.> ). Real operands use
+			// the arithmetic relations directly.
+			if s.a.sort == sortStr || s.b.sort == sortStr {
+				switch s.op {
+				case "<":
+					return fmt.Sprintf("(str.< %s %s)", a, bb)
+				case "<=":
+					return fmt.Sprintf("(str.<= %s %s)", a, bb)
+				case ">":
+					return fmt.Sprintf("(str.< %s %s)", bb, a)
+				case ">=":
+					return fmt.Sprintf("(str.<= %s %s)", bb, a)
+				}
+			}
 			return fmt.Sprintf("(%s %s %s)", s.op, a, bb)
 		}
 	case symIte:
@@ -166,6 +205,28 @@ func fmtRat(r *big.Rat) string {
 		return num
 	}
 	return "(/ " + num + " " + r.Denom().String() + ".0)"
+}
+
+// smtStrLit renders a Go string as an SMT-LIB 2.6 String literal. Printable ASCII
+// passes through (a `"` is doubled per the standard); every other byte-sequence
+// rune is emitted as a `\u{hex}` code-point escape, so the literal is unambiguous
+// regardless of the runes involved. Inputs are valid UTF-8 (ingress guards), so
+// ranging yields real code points.
+func smtStrLit(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '"':
+			b.WriteString(`""`)
+		case r >= 0x20 && r <= 0x7e && r != '\\':
+			b.WriteRune(r)
+		default:
+			fmt.Fprintf(&b, `\u{%x}`, r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // runZ3 feeds the script to `z3 -smt2 -in` and returns its first result token

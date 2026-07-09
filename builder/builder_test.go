@@ -30,9 +30,16 @@ func zip(fn parser.Expr) parser.Expr {
 	f := fn
 	return parser.Expr{Kind: parser.ExprZip, Fn: &f}
 }
+
+// reduce builds a `reduce fn init v` node folding the vector variable named "v"
+// (the conventional vector param of the fn-of-vector a query/write body wraps).
 func reduce(fn, init parser.Expr) parser.Expr {
-	f, i := fn, init
-	return parser.Expr{Kind: parser.ExprReduce, Fn: &f, Init: &i}
+	f, i, v := fn, init, name("v")
+	return parser.Expr{Kind: parser.ExprReduce, Fn: &f, Init: &i, Vec: &v}
+}
+func vfn(fnName, typeName string, params []parser.ParamSpec, body parser.Expr) parser.FnDef {
+	ps := append(append([]parser.ParamSpec{}, params...), parser.ParamSpec{Name: "v", Type: typeName})
+	return parser.FnDef{Name: fnName, Params: ps, Body: body}
 }
 func local(fn parser.Expr) parser.Expr {
 	f := fn
@@ -67,12 +74,14 @@ func canonicalPlan() parser.Plan {
 		Functions: []parser.FnDef{
 			{Name: "lub", Params: []parser.ParamSpec{{Name: "a", Type: "rat"}, {Name: "b", Type: "rat"}},
 				Body: app(name("max"), name("a"), name("b"))},
+			// total v::T = reduce + 0 v — the fn-of-vector the Value query applies.
+			vfn("total", "T", nil, reduce(name("+"), num(0))),
 		},
 		Merges: []parser.MergeDef{
 			{TypeName: "T", Body: zip(name("lub"))},
 		},
 		Queries: []parser.QueryDef{
-			{TypeName: "T", MethodName: "Value", Body: reduce(name("+"), num(0))},
+			{TypeName: "T", MethodName: "Value", Body: name("total")},
 		},
 		Updates: []parser.UpdateDef{
 			{TypeName: "T", MethodName: "Add",
@@ -167,13 +176,16 @@ func TestBuild_badParamType(t *testing.T) {
 }
 
 func TestBuild_queryParamResolvedAndTyped(t *testing.T) {
-	// query T.Above m::rat = > (reduce max 0) m  -> a bool result; the param `m`
-	// must resolve to a Var and type-check against the > operator.
+	// query T.Above m::rat = above m ; fn above m::rat v::T = > (reduce max 0 v) m
+	// -> a bool result; the param `m` resolves to a Var and type-checks against >.
 	plan := canonicalPlan()
+	plan.Functions = append(plan.Functions,
+		vfn("above", "T", []parser.ParamSpec{{Name: "m", Type: "rat"}},
+			app(name(">"), reduce(name("max"), num(0)), name("m"))))
 	plan.Queries = append(plan.Queries, parser.QueryDef{
 		TypeName: "T", MethodName: "Above",
 		Params: []parser.ParamSpec{{Name: "m", Type: "rat"}},
-		Body:   app(name(">"), reduce(name("max"), num(0)), name("m")),
+		Body:   app(name("above"), name("m")),
 	})
 	built, err := Build(plan)
 	require.NoError(t, err)
@@ -231,7 +243,7 @@ func TestBuild_duplicateCollection(t *testing.T) {
 func TestBuild_sameQueryAndUpdateNameAllowed(t *testing.T) {
 	// query and update live in separate namespaces (GET vs POST).
 	plan := canonicalPlan()
-	plan.Queries = append(plan.Queries, parser.QueryDef{TypeName: "T", MethodName: "Add", Body: reduce(name("+"), num(0))})
+	plan.Queries = append(plan.Queries, parser.QueryDef{TypeName: "T", MethodName: "Add", Body: name("total")})
 	_, err := Build(plan)
 	require.NoError(t, err)
 }
@@ -342,7 +354,8 @@ fn myScore x::rat
 | (>= x 80) = "You got a B"
 | otherwise = "You got a F"
 merge T = zip max
-query T.Grade = myScore (reduce max 0)
+fn grade v::T = myScore (reduce max 0 v)
+query T.Grade = grade
 update T.Add k::rat0+ = local (+ k)
 collection Scores = T
 `
@@ -380,7 +393,7 @@ func TestBuild_guardTypeErrors(t *testing.T) {
 | (> x 1) = "b"
 `,
 		"bool passed to arithmetic": "fn bad x::rat = + (> x 1) 2\n",
-		"reduce in fn body":         "fn bad x::rat = reduce + 0\n",
+		"reduce over non-vector":    "fn bad x::rat = reduce + 0 x\n",
 	}
 	for nameStr, src := range cases {
 		t.Run(nameStr, func(t *testing.T) {
@@ -448,7 +461,7 @@ func TestBuild_reduceInfersElementType(t *testing.T) {
 	}
 	for elem, want := range cases {
 		t.Run(elem, func(t *testing.T) {
-			src := "type T = vector " + elem + "\nmerge T = zip max\nquery T.Value = reduce + 0\ncollection C = T\n"
+			src := "type T = vector " + elem + "\nmerge T = zip max\nfn total v::T = reduce + 0 v\nquery T.Value = total\ncollection C = T\n"
 			built, err := Build(mustParse(t, src))
 			require.NoError(t, err)
 			q := built.Models["T"].Queries["Value"]
@@ -616,7 +629,8 @@ fn J a::X b::X = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }
 fn incPos k::rat0+ s::X = { Pos: + s.Pos k, Neg: s.Neg }
 merge VX = zip J
 update VX.AddPos k::rat0+ = local (incPos k)
-query VX.Net = (reduce J { Pos: 0, Neg: 0 }).Pos
+fn net v::VX = (reduce J { Pos: 0, Neg: 0 } v).Pos
+query VX.Net = net
 collection C = VX
 `
 	built, err := Build(mustParse(t, src))
@@ -690,7 +704,8 @@ collection C = X
 func TestBuild_fieldOfScalarRejected(t *testing.T) {
 	const src = `type T = vector rat0+
 merge T = zip max
-query T.Bad = (reduce max 0).Pos
+fn bad v::T = (reduce max 0 v).Pos
+query T.Bad = bad
 collection C = T
 `
 	_, err := Build(mustParse(t, src))
@@ -736,7 +751,8 @@ fn J a::V.Elem b::V.Elem = { Pos: max a.Pos b.Pos, Neg: max a.Neg b.Neg }
 fn incPos k::rat0+ s::V.Elem = { Pos: + s.Pos k, Neg: s.Neg }
 merge V = zip J
 update V.AddPos k::rat0+ = local (incPos k)
-query V.Totals = reduce J { Pos: 0, Neg: 0 }
+fn totals v::V = reduce J { Pos: 0, Neg: 0 } v
+query V.Totals = totals
 collection C = V
 `
 	built, err := Build(mustParse(t, src))
@@ -760,7 +776,8 @@ type Amount = V.Elem
 fn add a::rat0+ b::rat0+ = + a b
 merge V = zip max
 update V.Add k::Amount = local (add k)
-query V.AtLeast k::Amount = reduce max 0
+fn atleast k::Amount v::V = reduce max 0 v
+query V.AtLeast k::Amount = atleast k
 collection C = V
 `
 	built, err := Build(mustParse(t, src))
@@ -847,6 +864,125 @@ collection C = V
 	assert.Contains(t, err.Error(), "recursive")
 }
 
+// ---- LWW register: string leaves, write, vector-value reduce -------
+
+// lwwSrc is the target LWW register: a { version, value } slot, per-slot
+// argmax-by-version merge (string tiebreak), and a Lamport `write` update.
+const lwwSrc = `type X = vector {
+  version int0+
+  value   string
+}
+merge X = zip Merge
+fn Merge a::X.Elem b::X.Elem -> X.Elem
+| (> a.version b.version) = a
+| (< a.version b.version) = b
+| (> a.value b.value)     = a
+| otherwise               = b
+fn maxVer acc::int0+ e::X.Elem -> int0+ = max acc e.version
+fn NextX s::string v::X -> X.Elem = { version: + 1 (reduce maxVer 0 v), value: s }
+update X.Set s::string = write (NextX s)
+fn LatestValue v::X -> string = (reduce Merge { version: 0, value: "" } v).value
+query  X.Value = LatestValue
+collection Reg = X
+`
+
+// The full LWW register builds: string slot leaf, string tiebreak comparison,
+// the `write` combinator, and the reduce-domination convergence proof all pass.
+func TestBuild_lwwStringRegister(t *testing.T) {
+	built, err := Build(mustParse(t, lwwSrc))
+	require.NoError(t, err)
+	m := built.Models["X"]
+	require.NotNil(t, m)
+	require.True(t, m.Elem.Struct)
+	require.Len(t, m.Elem.Fields, 2)
+	assert.True(t, m.Elem.Fields[1].Type.Str) // value is a string leaf
+	assert.Equal(t, parser.ExprWrite, m.Updates["Set"].Body.Kind)
+	assert.Equal(t, "string", m.Updates["Set"].Params[0].Type)
+	assert.Equal(t, parser.TypeString, m.Queries["Value"].Result)
+}
+
+// Dropping the string tiebreak leaves a non-commutative merge (two equal-version
+// slots pick differently by argument order), which the prover rejects.
+func TestBuild_lwwNoTiebreakRejected(t *testing.T) {
+	src := `type X = vector { version int0+  value string }
+merge X = zip Merge
+fn Merge a::X.Elem b::X.Elem -> X.Elem
+| (> a.version b.version) = a
+| otherwise               = b
+fn maxVer acc::int0+ e::X.Elem -> int0+ = max acc e.version
+fn NextX s::string v::X -> X.Elem = { version: + 1 (reduce maxVer 0 v), value: s }
+update X.Set s::string = write (NextX s)
+collection Reg = X
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "convergence")
+}
+
+// A `write` whose version bump folds with `+` (a sum, not a max) is not a Lamport
+// clock: the reduce-domination shape recognizer rejects the fold.
+func TestBuild_writeNonMaxFoldRejected(t *testing.T) {
+	src := `type X = vector { version int0+  value string }
+merge X = zip Merge
+fn Merge a::X.Elem b::X.Elem -> X.Elem
+| (> a.version b.version) = a
+| (< a.version b.version) = b
+| (> a.value b.value)     = a
+| otherwise               = b
+fn sumVer acc::int0+ e::X.Elem -> int0+ = + acc e.version
+fn NextX s::string v::X -> X.Elem = { version: + 1 (reduce sumVer 0 v), value: s }
+update X.Set s::string = write (NextX s)
+collection Reg = X
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max/min")
+}
+
+// A query may not return a whole vector (it is not serializable).
+func TestBuild_vectorEscapingQueryRejected(t *testing.T) {
+	src := `type X = vector { version int0+  value string }
+merge X = zip Merge
+fn Merge a::X.Elem b::X.Elem -> X.Elem
+| (> a.version b.version) = a
+| (< a.version b.version) = b
+| (> a.value b.value)     = a
+| otherwise               = b
+fn Id v::X -> X = v
+query X.Bad = Id
+collection Reg = X
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vector")
+}
+
+// A string query param is rejected: the GET `?params=` wire contract can't carry
+// arbitrary strings (only update params may be strings).
+func TestBuild_stringQueryParamRejected(t *testing.T) {
+	src := `type T = vector rat0+
+merge T = zip max
+fn total v::T = reduce + 0 v
+query T.Q s::string = total
+collection C = T
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "string")
+}
+
+// A comparison over mismatched operand kinds (numeric vs string) is a type error.
+func TestBuild_mixedComparisonRejected(t *testing.T) {
+	src := `type X = vector { version int0+  value string }
+fn bad a::X.Elem = > a.value a.version
+merge X = zip max
+collection Reg = X
+`
+	_, err := Build(mustParse(t, src))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "same type")
+}
+
 // ---- functions are first-class in the type model, not runtime values -------
 
 // Functions are typed (vkFunc), but they are not values: passing a bare function
@@ -856,7 +992,6 @@ func TestBuild_functionAsArgumentRejected(t *testing.T) {
 	const src = `type T = vector rat
 fn bad a::rat = + a max
 merge T = zip max
-query T.V = reduce max 0
 update T.Add k::rat = local (+ k)
 `
 	_, err := Build(mustParse(t, src))

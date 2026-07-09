@@ -2,12 +2,16 @@ package crdt
 
 import "gospr/numtype"
 
-// SlotWire is the transport-safe form of a single node slot: either a scalar
-// (Num, an exact-rational string) or a struct (Struct, field -> nested SlotWire),
-// nestable. Exactly one of Num/Struct is populated. A scalar slot's Num is always
-// a non-empty RatString (even 0 -> "0"), so Num=="" unambiguously marks a struct.
+// SlotWire is the transport-safe form of a single node slot: a scalar numeric
+// (Num, an exact-rational string), a string (Str, a pointer so a present empty ""
+// is distinguishable from an absent tag), or a struct (Struct, field -> nested
+// SlotWire), nestable. Exactly one of Num/Str/Struct is populated — an explicit
+// three-way tag. A scalar slot's Num is always a non-empty RatString (even 0 ->
+// "0"); a string slot sets Str (possibly &""); a struct sets Struct. wireToSlot
+// validates this exactly-one-tag invariant against the resolved leaf kind.
 type SlotWire struct {
 	Num    string              `json:"num,omitempty"`    // scalar: exact-rational string
+	Str    *string             `json:"str,omitempty"`    // string: raw value (pointer disambiguates "")
 	Struct map[string]SlotWire `json:"struct,omitempty"` // struct: field -> nested slot
 }
 
@@ -23,12 +27,13 @@ type WireSnapshot struct {
 
 // ElemT is a resolved element-type descriptor produced by the builder and
 // consumed by the runtime (zero-struct defaults, wire decoding/validation), the
-// prover (leaf flattening), and swagger (object schemas). A slot holds either a
-// scalar numeric value (Num, when !Struct) or an ordered struct of named fields
-// (Fields, when Struct), and structs nest.
+// prover (leaf flattening), and swagger (object schemas). A slot holds a scalar
+// numeric value (Num, when !Struct && !Str), a string (when Str), or an ordered
+// struct of named fields (Fields, when Struct), and structs nest.
 type ElemT struct {
 	Struct bool
-	Num    numtype.NumType // when !Struct
+	Str    bool            // when !Struct: a string leaf (else numeric, typed by Num)
+	Num    numtype.NumType // when !Struct && !Str
 	Name   string          // struct nominal type name (when Struct)
 	Fields []FieldT        // when Struct, in declaration order
 }

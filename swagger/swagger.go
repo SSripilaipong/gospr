@@ -73,7 +73,7 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 					Content: map[string]mediaType{
 						"text/plain": {
 							Schema:  schema{Type: "string"},
-							Example: "type T = vector rat0+\nmerge T = zip max\nquery T.Value = reduce + 0\nupdate T.Add k::rat0+ = local (+ k)\ncollection MyVec = T",
+							Example: "type T = vector rat0+\nmerge T = zip max\nfn total v::T = reduce + 0 v\nquery T.Value = total\nupdate T.Add k::rat0+ = local (+ k)\ncollection MyVec = T",
 						},
 					},
 				},
@@ -228,9 +228,12 @@ func valTypeSchema(t parser.ValType, nt numtype.NumType) schema {
 func structSchema(t crdt.ElemT) schema {
 	props := make(map[string]schema, len(t.Fields))
 	for _, f := range t.Fields {
-		if f.Type.Struct {
+		switch {
+		case f.Type.Struct:
 			props[f.Name] = structSchema(f.Type)
-		} else {
+		case f.Type.Str:
+			props[f.Name] = schema{Type: "string"}
+		default:
 			props[f.Name] = numSchema(f.Type.Num)
 		}
 	}
@@ -246,6 +249,9 @@ func numSchema(nt numtype.NumType) schema {
 }
 
 func paramToSchema(p parser.ParamSpec) schema {
+	if p.Type == "string" {
+		return schema{Type: "string"}
+	}
 	nt, ok := numtype.Parse(p.Type)
 	if !ok {
 		return schema{}
@@ -256,6 +262,9 @@ func paramToSchema(p parser.ParamSpec) schema {
 // paramExample returns a representative wire value: an exact-rational string,
 // since numbers cross the boundary as strings.
 func paramExample(p parser.ParamSpec) any {
+	if p.Type == "string" {
+		return "hello"
+	}
 	nt, ok := numtype.Parse(p.Type)
 	if !ok {
 		return nil

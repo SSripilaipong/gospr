@@ -17,7 +17,8 @@ fn lub a::rat0+ b::rat0+ = max a b
 
 merge T = zip lub
 
-query T.Value = reduce + 0
+fn total v::T = reduce + 0 v
+query T.Value = total
 
 update T.Add k::rat0+ = local (+ k)
 `
@@ -81,7 +82,8 @@ func TestE2E_queryParam(t *testing.T) {
 	src := `type T = vector rat0+
 fn lub a::rat0+ b::rat0+ = max a b
 merge T = zip lub
-query T.Above m::rat0+ = > (reduce max 0) m
+fn above m::rat0+ v::T = > (reduce max 0 v) m
+query T.Above m::rat0+ = above m
 update T.Add k::rat0+ = local (+ k)
 `
 	plan, err := parser.Parse(src)
@@ -117,7 +119,8 @@ fn sumdown n::int -> int
 | (> n 0) = + n (sumdown (- n 1))
 | otherwise = 0
 merge T = zip max
-query T.Triangle = sumdown (reduce max 0)
+fn triangle v::T = sumdown (reduce max 0 v)
+query T.Triangle = triangle
 update T.Set k::int0+ = local (max k)
 `
 	plan, err := parser.Parse(src)
@@ -152,8 +155,10 @@ fn incNeg k::rat0+ s::X = { Pos: s.Pos, Neg: + s.Neg k }
 merge VX = zip J
 update VX.AddPos k::rat0+ = local (incPos k)
 update VX.AddNeg k::rat0+ = local (incNeg k)
-query VX.Net = - (reduce S { Pos: 0, Neg: 0 }).Pos (reduce S { Pos: 0, Neg: 0 }).Neg
-query VX.Totals = reduce S { Pos: 0, Neg: 0 }
+fn net v::VX = - (reduce S { Pos: 0, Neg: 0 } v).Pos (reduce S { Pos: 0, Neg: 0 } v).Neg
+query VX.Net = net
+fn totalsFn v::VX = reduce S { Pos: 0, Neg: 0 } v
+query VX.Totals = totalsFn
 collection C = VX
 `
 	plan, err := parser.Parse(src)
@@ -213,7 +218,8 @@ fn myScore x::rat
 | (> x 70) = "You got a C"
 | otherwise = "You got a F"
 merge Scores = zip max
-query Scores.Grade = myScore (reduce max 0)
+fn gradeOf v::Scores = myScore (reduce max 0 v)
+query Scores.Grade = gradeOf
 update Scores.Add k::rat0+ = local (+ k)
 collection Scores = Scores
 `
@@ -242,6 +248,67 @@ collection Scores = Scores
 	assert.Equal(t, "You got a C", got)
 }
 
+// End-to-end LWW register: a `{ version, value }` slot whose merge is per-slot
+// argmax-by-version (string-value tiebreak) and whose update is a `write` that
+// stamps version = 1 + max(version over the WHOLE vector) — a Lamport clock. This
+// exercises string slot leaves, the `write` combinator, the vector-value `reduce`,
+// and (at build time) the reduce-domination convergence proof. It asserts real LWW
+// convergence: concurrent writes on two nodes converge to the same value, and a
+// causally-later write (higher version) wins regardless of merge order.
+func TestE2E_lwwRegister(t *testing.T) {
+	const src = `type X = vector {
+  version int0+
+  value   string
+}
+merge X = zip Merge
+fn Merge a::X.Elem b::X.Elem -> X.Elem
+| (> a.version b.version) = a
+| (< a.version b.version) = b
+| (> a.value b.value)     = a
+| otherwise               = b
+fn maxVer acc::int0+ e::X.Elem -> int0+ = max acc e.version
+fn NextX s::string v::X -> X.Elem = { version: + 1 (reduce maxVer 0 v), value: s }
+update X.Set s::string = write (NextX s)
+fn LatestValue v::X -> string = (reduce Merge { version: 0, value: "" } v).value
+query  X.Value = LatestValue
+collection Reg = X
+`
+	plan, err := parser.Parse(src)
+	require.NoError(t, err)
+	built, err := builder.Build(plan)
+	require.NoError(t, err)
+	m := built.Models["X"]
+	require.NotNil(t, m)
+
+	a := m.New("nodeA")
+	b := m.New("nodeB")
+
+	// Concurrent writes: each node reads its own (empty) vector, so both stamp
+	// version 1 — the tie is broken deterministically by the larger string value.
+	require.NoError(t, a.Apply("Set", []any{"hello"}))
+	require.NoError(t, b.Apply("Set", []any{"world"}))
+
+	require.NoError(t, a.Merge(b.Snapshot()))
+	require.NoError(t, b.Merge(a.Snapshot()))
+
+	for _, c := range []struct {
+		name string
+		crdt crdt.CRDT
+	}{{"a", a}, {"b", b}} {
+		got, err := c.crdt.Query("Value", nil)
+		require.NoError(t, err, c.name)
+		assert.Equal(t, "world", got, c.name) // tie on version 1 -> "world" > "hello"
+	}
+
+	// A causally-later write on nodeA (which has seen version 1) stamps version 2,
+	// so it dominates regardless of the string ordering — real last-writer-wins.
+	require.NoError(t, a.Apply("Set", []any{"abc"}))
+	require.NoError(t, b.Merge(a.Snapshot()))
+	got, err := b.Query("Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "abc", got) // version 2 beats version 1, though "abc" < "world"
+}
+
 // `local (- k)` under a max merge is NOT inflationary — partial application
 // binds the LEFT operand first, so it means \x -> k - x (k minus the current
 // slot), which can shrink the slot. The convergence prover rejects it at build
@@ -251,7 +318,8 @@ collection Scores = Scores
 func TestE2E_nonInflationaryUpdateRejected(t *testing.T) {
 	src := `type C = vector rat
 merge C = zip max
-query C.Value = reduce + 0
+fn total v::C = reduce + 0 v
+query C.Value = total
 update C.Sub k::rat = local (- k)
 `
 	plan, err := parser.Parse(src)

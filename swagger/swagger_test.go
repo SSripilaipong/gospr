@@ -106,6 +106,39 @@ func TestGenerate_queryResponseType(t *testing.T) {
 	assert.Equal(t, "string", mtValue["schema"].(map[string]any)["type"])
 }
 
+// A struct-result query with a mix of numeric and string leaves documents each
+// field with the right OpenAPI schema: a string leaf is a plain `string`, a
+// numeric leaf a string-typed exact-rational (with its numtype in the description).
+func TestGenerate_structResultWithStringField(t *testing.T) {
+	plan := makeModelPlan()
+	model := plan.Collections[0].Spec.(*builder.Model)
+	elem := crdt.ElemT{Struct: true, Name: "R", Fields: []crdt.FieldT{
+		{Name: "version", Type: crdt.ElemT{Num: numtype.NumType{Domain: numtype.DInt, Sign: numtype.SNonNeg}}},
+		{Name: "value", Type: crdt.ElemT{Str: true}},
+	}}
+	model.Queries["Latest"] = crdt.Method{Body: parser.Expr{Kind: parser.ExprStrLit, Str: "x"}, ResultStruct: &elem}
+
+	data, err := Generate(plan)
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	paths := doc["paths"].(map[string]any)
+	get := paths["/api/collections/MyVec/Latest"].(map[string]any)["get"].(map[string]any)
+	resp := get["responses"].(map[string]any)["200"].(map[string]any)
+	sch := resp["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	assert.Equal(t, "object", sch["type"])
+	props := sch["properties"].(map[string]any)
+
+	valueSch := props["value"].(map[string]any) // string leaf -> plain string, no numeric description
+	assert.Equal(t, "string", valueSch["type"])
+	assert.Nil(t, valueSch["description"])
+
+	versionSch := props["version"].(map[string]any) // numeric leaf -> exact-rational string
+	assert.Equal(t, "string", versionSch["type"])
+	assert.Contains(t, versionSch["description"], "exact rational")
+}
+
 func TestGenerate_getZeroParamQuery(t *testing.T) {
 	data, err := Generate(makeModelPlan())
 	require.NoError(t, err)

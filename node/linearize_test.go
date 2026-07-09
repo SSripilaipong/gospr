@@ -20,7 +20,8 @@ import (
 // the query sums every slot. The canonical convergent counter.
 const counterDSL = `type T = vector rat0+
 merge T = zip max
-query T.Value = reduce + 0
+fn total v::T = reduce + 0 v
+query T.Value = total
 update T.Add k::rat0+ = local (+ k)
 collection Counter = T
 `
@@ -31,7 +32,8 @@ collection Counter = T
 const counterDSLVariant = `type T = vector rat0+
 fn noop x::rat = x
 merge T = zip max
-query T.Value = reduce + 0
+fn total v::T = reduce + 0 v
+query T.Value = total
 update T.Add k::rat0+ = local (+ k)
 collection Counter = T
 `

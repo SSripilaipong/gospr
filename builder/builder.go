@@ -67,6 +67,7 @@ const (
 	vkString
 	vkStruct
 	vkFunc
+	vkVector // a whole-vector value (folded by `reduce`, supplied by `write`/query)
 )
 
 // vtype is the builder's internal type: a value type OR (kind vkFunc) a function.
@@ -82,7 +83,13 @@ type vtype struct {
 	name   string   // vkStruct nominal name (diagnostics only)
 	fields []vfield // vkStruct, in declaration order
 	fn     *fnType  // vkFunc signature (nil otherwise)
+	elem   *vtype   // vkVector element type (nil otherwise)
 }
+
+// vVector wraps an element type as a whole-vector value type. A vector is never a
+// storable leaf (not a struct field / slot value) — it exists only as a value
+// folded by `reduce` and supplied by `write`/query at a combinator boundary.
+func vVector(elem vtype) vtype { return vtype{kind: vkVector, elem: &elem} }
 
 // isFunc reports whether t is a function type (a vkFunc carrying a signature).
 func isFunc(t vtype) bool { return t.kind == vkFunc }
@@ -106,6 +113,9 @@ func vElem(t crdt.ElemT) vtype {
 		}
 		return vtype{kind: vkStruct, name: t.Name, fields: fields}
 	}
+	if t.Str {
+		return vString
+	}
 	return vNum(t.Num)
 }
 
@@ -120,6 +130,9 @@ func elemTOf(t vtype) crdt.ElemT {
 			fields[i] = crdt.FieldT{Name: f.name, Type: elemTOf(f.typ)}
 		}
 		return crdt.ElemT{Struct: true, Name: t.name, Fields: fields}
+	}
+	if t.kind == vkString {
+		return crdt.ElemT{Str: true}
 	}
 	return crdt.ElemT{Num: t.num}
 }
@@ -171,6 +184,11 @@ func (t vtype) String() string {
 			parts[i] = p.String()
 		}
 		return "(" + strings.Join(parts, ", ") + ") -> " + t.fn.result.String()
+	case vkVector:
+		if t.elem == nil {
+			return "vector"
+		}
+		return "vector " + t.elem.String()
 	default:
 		return "unknown"
 	}
@@ -220,6 +238,9 @@ func containsUnknown(t vtype) bool {
 		}
 		return containsUnknown(t.fn.result)
 	}
+	if t.kind == vkVector && t.elem != nil {
+		return containsUnknown(*t.elem)
+	}
 	return false
 }
 
@@ -248,6 +269,12 @@ func subVtype(a, b vtype) bool {
 	}
 	if a.kind == vkFunc && b.kind == vkFunc {
 		return fnSubtype(a.fn, b.fn)
+	}
+	if a.kind == vkVector && b.kind == vkVector {
+		if a.elem == nil || b.elem == nil {
+			return false
+		}
+		return subVtype(*a.elem, *b.elem)
 	}
 	return a.kind == b.kind
 }
@@ -433,14 +460,14 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 
 	env := newEnv(fnArity)
 
-	// Resolve each function body against its parameter scope. `reduce` is
-	// rejected here (allowReduce=false) so global functions stay pure — only
-	// query bodies may fold the vector.
+	// Resolve each function body against its parameter scope. `reduce` is a pure
+	// fold that takes its vector explicitly, so it may appear in a fn body that has
+	// a vector-typed param; the type checker rejects it where no vector is in scope.
 	funcs := make(map[string]crdt.Function, len(plan.Functions))
 	chk := newChecker(types)
 	for _, fd := range plan.Functions {
 		scope := paramSet(fd.Params)
-		body, err := env.resolve(fd.Body, scope, false)
+		body, err := env.resolve(fd.Body, scope)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("function %s: %w", fd.Name, err)
 		}
@@ -493,18 +520,20 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		// scalar numeric values — so a struct-typed query param is rejected, same
 		// as an update param. Tokens (incl. `V.Elem`/aliases) are normalized to
 		// concrete numtype names for the downstream wire/prover/swagger consumers.
-		qparams, err := resolveScalarParams(qd.Params, types)
+		qparams, err := resolveScalarParams(qd.Params, types, false)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		// A query body is a general expression that may fold the vector via
-		// `reduce` (allowReduce=true) and may reference the query's params. Its
-		// result type (rat/bool/string) is recorded for serialization/swagger.
-		body, err := env.resolve(qd.Body, paramSet(qparams), true)
+		// A query body is a function of the whole vector: after its declared params
+		// are bound (leftmost), it must still expect exactly one vector-typed arg
+		// (X -> result), which the runtime supplies. `reduce` folds that vector
+		// inside a helper fn. The result type (rat/bool/string/struct) is recorded
+		// for serialization/swagger; a vector result is rejected (not serializable).
+		body, err := env.resolve(qd.Body, paramSet(qparams))
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
-		result, err := chk.checkValue(body, chk.paramScope(qparams), m.Elem)
+		result, err := chk.checkQueryFn(body, chk.paramScope(qparams), m.Elem)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("query %s.%s: %w", qd.TypeName, qd.MethodName, err)
 		}
@@ -531,7 +560,7 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		// Update params cross the HTTP boundary (bindParams), which handles only
 		// scalar numeric values — so a struct-typed update param is rejected;
 		// tokens (incl. `V.Elem`/aliases) are normalized to concrete numtype names.
-		uparams, err := resolveScalarParams(ud.Params, types)
+		uparams, err := resolveScalarParams(ud.Params, types, true)
 		if err != nil {
 			return BuiltPlan{}, fmt.Errorf("update %s.%s: %w", ud.TypeName, ud.MethodName, err)
 		}
@@ -616,9 +645,10 @@ type env struct {
 func newEnv(fnArity map[string]int) env { return env{fnArity: fnArity} }
 
 // resolve turns a parser term (with ExprName leaves) into a built term where
-// every leaf is an ExprVar or ExprRef. allowReduce gates the `reduce` form: it
-// is permitted only in query bodies, keeping global functions pure.
-func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) (parser.Expr, error) {
+// every leaf is an ExprVar or ExprRef. `reduce` is now a pure fold that carries its
+// vector explicitly (reduce fn init vec), so it may appear anywhere — the type
+// checker rejects it where no vector value is in scope (e.g. a merge/local fn).
+func (e env) resolve(expr parser.Expr, scope map[string]bool) (parser.Expr, error) {
 	switch expr.Kind {
 	case parser.ExprNumLit, parser.ExprStrLit:
 		return expr, nil
@@ -637,7 +667,7 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		if expr.Head == nil {
 			return parser.Expr{}, fmt.Errorf("application has no head")
 		}
-		head, err := e.resolve(*expr.Head, scope, allowReduce)
+		head, err := e.resolve(*expr.Head, scope)
 		if err != nil {
 			return parser.Expr{}, err
 		}
@@ -647,7 +677,7 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		}
 		args := make([]*parser.Expr, len(expr.Args))
 		for i, a := range expr.Args {
-			ra, err := e.resolve(*a, scope, allowReduce)
+			ra, err := e.resolve(*a, scope)
 			if err != nil {
 				return parser.Expr{}, err
 			}
@@ -665,7 +695,7 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		for i, c := range expr.Cases {
 			nc := parser.GuardCase{Otherwise: c.Otherwise}
 			if c.Cond != nil {
-				rc, err := e.resolve(*c.Cond, scope, allowReduce)
+				rc, err := e.resolve(*c.Cond, scope)
 				if err != nil {
 					return parser.Expr{}, err
 				}
@@ -674,7 +704,7 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 			if c.Result == nil {
 				return parser.Expr{}, fmt.Errorf("guard case has no result")
 			}
-			rr, err := e.resolve(*c.Result, scope, allowReduce)
+			rr, err := e.resolve(*c.Result, scope)
 			if err != nil {
 				return parser.Expr{}, err
 			}
@@ -688,7 +718,7 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 			if sf.Value == nil {
 				return parser.Expr{}, fmt.Errorf("struct field %q has no value", sf.Name)
 			}
-			rv, err := e.resolve(*sf.Value, scope, allowReduce)
+			rv, err := e.resolve(*sf.Value, scope)
 			if err != nil {
 				return parser.Expr{}, err
 			}
@@ -702,7 +732,7 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		if expr.Target == nil {
 			return parser.Expr{}, fmt.Errorf("field access has no target")
 		}
-		target, err := e.resolve(*expr.Target, scope, allowReduce)
+		target, err := e.resolve(*expr.Target, scope)
 		if err != nil {
 			return parser.Expr{}, err
 		}
@@ -711,25 +741,32 @@ func (e env) resolve(expr parser.Expr, scope map[string]bool, allowReduce bool) 
 		}
 		return parser.Expr{Kind: parser.ExprField, Target: &target, Field: expr.Field}, nil
 	case parser.ExprReduce:
-		if !allowReduce {
-			return parser.Expr{}, fmt.Errorf("`reduce` may only appear in a query body")
-		}
 		fn, err := e.resolveFn(expr.Fn, scope, 2)
 		if err != nil {
-			return parser.Expr{}, fmt.Errorf("reduce must be `reduce <binary fn> <init>`: %w", err)
+			return parser.Expr{}, fmt.Errorf("reduce must be `reduce <binary fn> <init> <vec>`: %w", err)
 		}
 		if expr.Init == nil {
 			return parser.Expr{}, fmt.Errorf("reduce init is missing")
 		}
 		// The init is a literal (numeric or struct); resolve it as a pure value.
-		init, err := e.resolve(*expr.Init, scope, false)
+		init, err := e.resolve(*expr.Init, scope)
 		if err != nil {
 			return parser.Expr{}, fmt.Errorf("reduce init: %w", err)
 		}
 		if arityOf(init) != 0 {
 			return parser.Expr{}, fmt.Errorf("reduce init must be a value")
 		}
-		return parser.Expr{Kind: parser.ExprReduce, Fn: fn, Init: &init}, nil
+		if expr.Vec == nil {
+			return parser.Expr{}, fmt.Errorf("reduce vector argument is missing")
+		}
+		vec, err := e.resolve(*expr.Vec, scope)
+		if err != nil {
+			return parser.Expr{}, fmt.Errorf("reduce vector: %w", err)
+		}
+		if arityOf(vec) != 0 {
+			return parser.Expr{}, fmt.Errorf("reduce vector must be a value")
+		}
+		return parser.Expr{Kind: parser.ExprReduce, Fn: fn, Init: &init, Vec: &vec}, nil
 	default:
 		return parser.Expr{}, fmt.Errorf("unexpected expression in this position")
 	}
@@ -753,8 +790,14 @@ func (e env) resolveCombinator(expr parser.Expr, scope map[string]bool) (parser.
 			return parser.Expr{}, fmt.Errorf("update must be `local <unary fn>`: %w", err)
 		}
 		return parser.Expr{Kind: parser.ExprLocal, Fn: fn}, nil
+	case parser.ExprWrite:
+		fn, err := e.resolveFn(expr.Fn, scope, 1)
+		if err != nil {
+			return parser.Expr{}, fmt.Errorf("update must be `write <unary fn>`: %w", err)
+		}
+		return parser.Expr{Kind: parser.ExprWrite, Fn: fn}, nil
 	default:
-		return parser.Expr{}, fmt.Errorf("expected a zip/local combinator")
+		return parser.Expr{}, fmt.Errorf("expected a zip/local/write combinator")
 	}
 }
 
@@ -764,7 +807,7 @@ func (e env) resolveFn(fn *parser.Expr, scope map[string]bool, want int) (*parse
 	if fn == nil {
 		return nil, fmt.Errorf("missing function")
 	}
-	resolved, err := e.resolve(*fn, scope, false)
+	resolved, err := e.resolve(*fn, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -813,12 +856,6 @@ type checker struct {
 	annotations map[string]vtype // declared `-> type` return types (absent when un-annotated)
 	result      map[string]vtype
 	inProgress  map[string]bool
-
-	// elem/hasElem give the current query's vector element type to the reduce
-	// case of typeOf. They are set only for the duration of a checkValue call;
-	// reduce is forbidden outside queries (so this is unset everywhere else).
-	elem    crdt.ElemT
-	hasElem bool
 }
 
 func newChecker(reg typeReg) *checker {
@@ -833,22 +870,41 @@ func newChecker(reg typeReg) *checker {
 	}
 }
 
-// paramVtype resolves a param's declared type token to a checker vtype (scalar or
-// struct). The token was validated at registration, so a failure defaults to the
-// top numeric type rather than erroring here.
-func (c *checker) paramVtype(tok string) vtype {
+// resolveTokenVtype resolves a param/return type token to a checker vtype. Unlike
+// the leaf-only reg.resolveToken (which rejects vector names, since a vector is not
+// a storable slot leaf), this recognizes a bare vector type name and yields a
+// vkVector value type — so a fn param or `-> type` may be the whole vector `X`
+// (folded by `reduce`, supplied by `write`/query). A dotted `V.Elem` still resolves
+// to the element via resolveToken. Leaf positions (struct fields, vector elements,
+// wire params) keep calling reg.resolveToken directly and stay vector-rejecting.
+func (c *checker) resolveTokenVtype(tok string) (vtype, error) {
+	if c.reg.isVector(tok) {
+		return vVector(vElem(c.reg.models[tok].Elem)), nil
+	}
 	et, err := c.reg.resolveToken(tok)
+	if err != nil {
+		return vUnknown, err
+	}
+	return vElem(et), nil
+}
+
+// paramVtype resolves a param's declared type token to a checker vtype (scalar,
+// struct, or whole-vector). The token was validated at registration, so a failure
+// defaults to the top numeric type rather than erroring here.
+func (c *checker) paramVtype(tok string) vtype {
+	t, err := c.resolveTokenVtype(tok)
 	if err != nil {
 		return numTop
 	}
-	return vElem(et)
+	return t
 }
 
 // resolveResultType resolves a `-> type` return-annotation token to a vtype.
 // Unlike paramVtype, it errors on an unknown token (a bad annotation is a build
 // error). bool/string are recognized here — a return type may be non-numeric —
-// whereas param types (numeric/struct only) never are; `type bool`/`type string`
-// are reserved (see resolveTypes) so these keywords are unambiguous.
+// whereas param types never are; `type bool`/`type string` are reserved (see
+// resolveTypes) so these keywords are unambiguous. A vector type name yields a
+// vkVector (a fn may return the whole vector).
 func (c *checker) resolveResultType(tok string) (vtype, error) {
 	switch tok {
 	case "bool":
@@ -856,11 +912,7 @@ func (c *checker) resolveResultType(tok string) (vtype, error) {
 	case "string":
 		return vString, nil
 	}
-	et, err := c.reg.resolveToken(tok)
-	if err != nil {
-		return vUnknown, err
-	}
-	return vElem(et), nil
+	return c.resolveTokenVtype(tok)
 }
 
 // register records a resolved function body, its param scope, and its optional
@@ -950,24 +1002,63 @@ func (c *checker) inferReturn(name string) (vtype, error) {
 	return bodyT, nil
 }
 
-// checkValue type-checks a term that must yield a value (not a function) and
-// returns its type. Used for query bodies; scope carries the query's params (the
-// body may reference them), and elem is the vector element type, made available
-// to any `reduce` sub-expression in the body.
-func (c *checker) checkValue(e parser.Expr, scope map[string]vtype, elem crdt.ElemT) (vtype, error) {
-	c.elem, c.hasElem = elem, true
-	defer func() { c.hasElem = false }()
+// checkQueryFn type-checks a query body, which is a function of the whole vector.
+// After the declared params are bound (in scope), the body must resolve to a
+// function still expecting exactly one vector-typed argument (X -> result) — the
+// runtime supplies the vector. It returns the applied result type, which must be a
+// concrete, serializable value (not a function, not a vector, no unresolved leaf).
+func (c *checker) checkQueryFn(e parser.Expr, scope map[string]vtype, elem crdt.ElemT) (vtype, error) {
 	t, err := c.typeOf(e, scope)
 	if err != nil {
 		return vUnknown, err
 	}
-	if isFunc(t) {
-		return vUnknown, fmt.Errorf("expected a value, got a function missing %d argument(s)", len(t.fn.params))
+	if !isFunc(t) {
+		return vUnknown, fmt.Errorf("a query body must be a function of the vector (X -> result); got a bare value %s", t)
 	}
-	if containsUnknown(t) {
-		return vUnknown, fmt.Errorf("cannot determine result type")
+	if len(t.fn.params) != 1 {
+		return vUnknown, fmt.Errorf("a query body must expect exactly one (vector) argument, but expects %d", len(t.fn.params))
 	}
-	return t, nil
+	vecArg := vVector(vElem(elem))
+	if t.fn.params[0].kind != vkVector {
+		return vUnknown, fmt.Errorf("a query body's remaining argument must be the vector %s, got %s", vecArg, t.fn.params[0])
+	}
+	if !subVtype(vecArg, t.fn.params[0]) {
+		return vUnknown, fmt.Errorf("query vector argument mismatch: fold expects %s, vector is %s", t.fn.params[0], vecArg)
+	}
+	res, err := c.applyArgs(*t.fn, []vtype{vecArg})
+	if err != nil {
+		return vUnknown, err
+	}
+	if isFunc(res) {
+		return vUnknown, fmt.Errorf("query result is still a function missing %d argument(s)", len(res.fn.params))
+	}
+	if res.kind == vkVector {
+		return vUnknown, fmt.Errorf("a query may not return a whole vector (it is not serializable)")
+	}
+	if containsVector(res) {
+		return vUnknown, fmt.Errorf("a query result may not contain a vector (it is not serializable)")
+	}
+	if containsUnknown(res) {
+		return vUnknown, fmt.Errorf("cannot determine query result type")
+	}
+	return res, nil
+}
+
+// containsVector reports whether t is a vector or (recursively) a struct with a
+// vector-typed field — the serialization gate for query results (result lowering
+// knows only num/string/bool/struct).
+func containsVector(t vtype) bool {
+	if t.kind == vkVector {
+		return true
+	}
+	if t.kind == vkStruct {
+		for _, f := range t.fields {
+			if containsVector(f.typ) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // checkCombinatorFn type-checks the function carried by a resolved zip/local
@@ -988,9 +1079,17 @@ func (c *checker) checkCombinatorFn(comb parser.Expr, scope map[string]vtype, el
 	if !isFunc(t) {
 		return fmt.Errorf("combinator function takes no arguments")
 	}
+	// zip/local apply the fn to element-typed slot(s); write applies it to the WHOLE
+	// vector (X -> element). Either way the result must be assignable to E — this is
+	// where non-negativity is enforced (an element type is never a vector, so a
+	// write result stays a storable leaf).
 	args := make([]vtype, len(t.fn.params))
 	for i := range args {
-		args[i] = elemV
+		if comb.Kind == parser.ExprWrite {
+			args[i] = vVector(elemV)
+		} else {
+			args[i] = elemV
+		}
 	}
 	sat, err := c.applyArgs(*t.fn, args)
 	if err != nil {
@@ -1135,16 +1234,47 @@ func (c *checker) applyArgs(f fnType, args []vtype) (vtype, error) {
 		return vtype{}, fmt.Errorf("too many arguments: expected %d, got %d", len(f.params), len(args))
 	}
 	for i, a := range args {
-		if !subVtype(a, f.params[i]) {
+		// A comparison operand may be numeric OR string (its param is typed numTop
+		// only as a placeholder); the operand-kind and no-mixed rules live here, not
+		// in the fixed signature — resultOf then yields bool. Arithmetic stays
+		// strictly numeric via subVtype.
+		if cmpOps[f.op] {
+			if a.kind != vkNum && a.kind != vkString && a.kind != vkUnknown {
+				return vtype{}, fmt.Errorf("comparison operand %d must be numeric or string, got %s", i+1, a)
+			}
+		} else if !subVtype(a, f.params[i]) {
 			return vtype{}, fmt.Errorf("argument %d: expected %s, got %s", i+1, f.params[i], a)
 		}
 	}
 	bound := append(append([]vtype(nil), f.bound...), args...)
 	remaining := f.params[len(args):]
 	if len(remaining) == 0 {
+		if cmpOps[f.op] {
+			if err := checkCmpOperands(bound); err != nil {
+				return vtype{}, err
+			}
+		}
 		return resultOf(f.op, f.result, bound), nil
 	}
 	return mkFunc(fnType{params: remaining, result: f.result, op: f.op, bound: bound}), nil
+}
+
+// checkCmpOperands rejects a comparison over mismatched operand kinds (numeric vs
+// string). Both operands must be the same value kind; an unknown operand (mid-
+// inference recursion) defers. This runs only once a comparison saturates, so a
+// partial `(> a.value)` is checked when its second operand arrives.
+func checkCmpOperands(operands []vtype) error {
+	if len(operands) != 2 {
+		return nil
+	}
+	l, r := operands[0], operands[1]
+	if l.kind == vkUnknown || r.kind == vkUnknown {
+		return nil
+	}
+	if l.kind != r.kind {
+		return fmt.Errorf("comparison operands must have the same type, got %s and %s", l, r)
+	}
+	return nil
 }
 
 // resultOf computes a saturated application's result type. For a non-primitive
@@ -1166,16 +1296,13 @@ func resultOf(op string, fallback vtype, operands []vtype) vtype {
 	return vNum(numBin(op, operands[0].num, operands[1].num))
 }
 
-// typeOfReduce types a `reduce <binary fn> <init>` over the current query's
-// element type. The result type is the least fixpoint of folding the function
-// over (accumulator, element), starting from the init literal's type — bounded
-// because the lattice has finite height.
+// typeOfReduce types a `reduce <binary fn> <init> <vec>`. The fold element type
+// comes from the explicit vector argument (not implicit state), and the result is
+// the least fixpoint of folding the function over (accumulator, element) from the
+// init literal's type — bounded because the lattice has finite height.
 func (c *checker) typeOfReduce(e parser.Expr, scope map[string]vtype) (vtype, error) {
-	if e.Fn == nil || e.Init == nil {
+	if e.Fn == nil || e.Init == nil || e.Vec == nil {
 		return vtype{}, fmt.Errorf("malformed reduce")
-	}
-	if !c.hasElem {
-		return vtype{}, fmt.Errorf("reduce may only appear in a query body")
 	}
 	fs, err := c.typeOf(*e.Fn, scope)
 	if err != nil {
@@ -1191,7 +1318,14 @@ func (c *checker) typeOfReduce(e parser.Expr, scope map[string]vtype) (vtype, er
 	if isFunc(initT) {
 		return vtype{}, fmt.Errorf("reduce init must be a value")
 	}
-	elemV := vElem(c.elem) // fold element type: scalar or struct
+	vt, err := c.typeOf(*e.Vec, scope)
+	if err != nil {
+		return vtype{}, err
+	}
+	if vt.kind != vkVector || vt.elem == nil {
+		return vtype{}, fmt.Errorf("reduce needs a vector to fold, got %s", vt)
+	}
+	elemV := *vt.elem // fold element type comes from the vector argument
 	acc := initT
 	// Iterate to a fixpoint; the lattice has finite height, so this terminates.
 	for i := 0; i < 16; i++ {
@@ -1237,6 +1371,11 @@ func vtypeEqual(a, b vtype) bool {
 		return true
 	case vkFunc:
 		return fnEqual(a.fn, b.fn)
+	case vkVector:
+		if a.elem == nil || b.elem == nil {
+			return a.elem == b.elem
+		}
+		return vtypeEqual(*a.elem, *b.elem)
 	default:
 		return true
 	}
@@ -1342,6 +1481,17 @@ type typeReg struct {
 	aliases map[string]crdt.ElemT
 }
 
+// isVector reports whether a bare (non-dotted) type token names a resolved vector
+// type. A dotted `V.Elem` is not a vector — it is that vector's element — so it is
+// excluded here.
+func (r typeReg) isVector(tok string) bool {
+	if _, _, ok := splitDotted(tok); ok {
+		return false
+	}
+	_, ok := r.models[tok]
+	return ok
+}
+
 // splitDotted splits a `Base.Member` type token at its first `.`; ok is false for a
 // non-dotted token. typeNameP admits at most one `.Member`, so a malformed member
 // (a further dot) simply fails the `Elem` check downstream.
@@ -1369,6 +1519,9 @@ func (r typeReg) resolveToken(tok string) (crdt.ElemT, error) {
 			return crdt.ElemT{}, fmt.Errorf("type %q is not a vector; cannot take `.Elem`", base)
 		}
 		return m.Elem, nil
+	}
+	if tok == "string" {
+		return crdt.ElemT{Str: true}, nil
 	}
 	if nt, ok := numtype.Parse(tok); ok {
 		return crdt.ElemT{Num: nt}, nil
@@ -1437,6 +1590,9 @@ func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
 				return crdt.ElemT{}, fmt.Errorf("unknown type member %q in %q (only .Elem is supported)", member, tok)
 			}
 			return resolveVectorElem(base)
+		}
+		if tok == "string" {
+			return crdt.ElemT{Str: true}, nil
 		}
 		if nt, ok := numtype.Parse(tok); ok {
 			return crdt.ElemT{Num: nt}, nil
@@ -1578,12 +1734,17 @@ func resolveTypes(tds []parser.TypeDef) (typeReg, error) {
 // ---- validators ----------------------------------------------------
 
 // validateFnParams validates a function's params: names unique and each type a
-// known type (numeric or struct). A `fn` may take struct-typed params.
+// known type. A `fn` may take numeric, string, or struct params (it receives slots
+// from combinators) AND a whole-vector param (`v::X`, folded by `reduce` / supplied
+// by `write`/query) — the latter names a vector type, which reg.resolveToken rejects
+// as a leaf, so vectors are admitted here explicitly.
 func validateFnParams(ps []parser.ParamSpec, reg typeReg) error {
 	seen := make(map[string]bool, len(ps))
 	for _, p := range ps {
-		if _, err := reg.resolveToken(p.Type); err != nil {
-			return fmt.Errorf("param %s: %w", p.Name, err)
+		if !reg.isVector(p.Type) {
+			if _, err := reg.resolveToken(p.Type); err != nil {
+				return fmt.Errorf("param %s: %w", p.Name, err)
+			}
 		}
 		if seen[p.Name] {
 			return fmt.Errorf("duplicate param %s", p.Name)
@@ -1599,7 +1760,7 @@ func validateFnParams(ps []parser.ParamSpec, reg typeReg) error {
 // swagger) parses the stored token via numtype.Parse — so a `V.Elem`/alias token
 // must be rewritten to its concrete numtype name here. The returned slice preserves
 // order and names with Type set to the resolved numtype's canonical name.
-func resolveScalarParams(ps []parser.ParamSpec, reg typeReg) ([]parser.ParamSpec, error) {
+func resolveScalarParams(ps []parser.ParamSpec, reg typeReg, allowString bool) ([]parser.ParamSpec, error) {
 	seen := make(map[string]bool, len(ps))
 	out := make([]parser.ParamSpec, len(ps))
 	for i, p := range ps {
@@ -1614,6 +1775,16 @@ func resolveScalarParams(ps []parser.ParamSpec, reg typeReg) ([]parser.ParamSpec
 			return nil, fmt.Errorf("duplicate param %s", p.Name)
 		}
 		seen[p.Name] = true
+		if et.Str {
+			// A string param is faithful only through the POST update wire (a JSON
+			// string array); the GET query `?params=` contract is comma-split, so
+			// string query params stay rejected (allowString=false there).
+			if !allowString {
+				return nil, fmt.Errorf("param %s: string params are not supported here (only update params may be strings)", p.Name)
+			}
+			out[i] = parser.ParamSpec{Name: p.Name, Type: "string"}
+			continue
+		}
 		out[i] = parser.ParamSpec{Name: p.Name, Type: et.Num.String()}
 	}
 	return out, nil

@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"gospr/numtype"
 	"gospr/parser"
@@ -77,30 +78,41 @@ func cloneRat(r *big.Rat) *big.Rat { return new(big.Rat).Set(r) }
 // at the Snapshot/Merge/Apply boundaries so no mutable *big.Rat is aliased across
 // CRDTs.
 func cloneSlot(val rtVal) rtVal {
-	if val.kind == kStruct {
+	switch val.kind {
+	case kStruct:
 		fields := make(map[string]rtVal, len(val.fields))
 		for k, f := range val.fields {
 			fields[k] = cloneSlot(f)
 		}
 		return structVal(fields)
+	case kStr:
+		return strVal(val.str) // strings are immutable — a copy of the value suffices
+	default:
+		return numVal(cloneRat(val.num))
 	}
-	return numVal(cloneRat(val.num))
 }
 
 // zeroSlot builds the default value for an absent slot: 0 for a scalar element,
 // or a struct with every (nested) leaf set to 0.
 func zeroSlot(t ElemT) rtVal {
-	if t.Struct {
+	switch {
+	case t.Struct:
 		fields := make(map[string]rtVal, len(t.Fields))
 		for _, f := range t.Fields {
 			fields[f.Name] = zeroSlot(f.Type)
 		}
 		return structVal(fields)
+	case t.Str:
+		return strVal("") // absent string slot defaults to the empty string
+	default:
+		return numVal(new(big.Rat))
 	}
-	return numVal(new(big.Rat))
 }
 
-// Apply runs an update's `local <unary fn>` against the local node's slot.
+// Apply runs an update against the local node's slot. A `local <unary fn>` applies
+// the fn to the calling node's own slot; a `write <unary fn>` applies the fn to the
+// WHOLE vector (its result becomes the new local slot), for updates that must read
+// all slots — e.g. a Lamport clock version = 1 + max(version over all slots).
 func (v *VectorCRDT) Apply(action string, payload []any) error {
 	m, ok := v.updates[action]
 	if !ok {
@@ -113,8 +125,8 @@ func (v *VectorCRDT) Apply(action string, payload []any) error {
 	if err != nil {
 		return fmt.Errorf("action %s: %w", action, err)
 	}
-	if m.Body.Kind != parser.ExprLocal || m.Body.Fn == nil {
-		return fmt.Errorf("action %s: body is not a local expr", action)
+	if m.Body.Fn == nil || (m.Body.Kind != parser.ExprLocal && m.Body.Kind != parser.ExprWrite) {
+		return fmt.Errorf("action %s: body is not a local/write expr", action)
 	}
 	f, err := v.evalFuncVal(*m.Body.Fn, env, 1, 0)
 	if err != nil {
@@ -122,11 +134,27 @@ func (v *VectorCRDT) Apply(action string, payload []any) error {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	cur, ok := v.state[v.nodeID]
-	if !ok {
-		cur = zeroSlot(v.elem) // absent slot defaults to 0 (scalar) or a zero struct
+	// Compute the next slot before mutating state, so a failing user fn leaves
+	// state untouched (atomicity). `write` folds over a working snapshot that
+	// includes the self default, without mutating v.state until success.
+	var arg rtVal
+	if m.Body.Kind == parser.ExprWrite {
+		snap := make(map[string]rtVal, len(v.state)+1)
+		for k, val := range v.state {
+			snap[k] = cloneSlot(val)
+		}
+		if _, ok := snap[v.nodeID]; !ok {
+			snap[v.nodeID] = zeroSlot(v.elem) // self slot present so the fold sees this node's own version
+		}
+		arg = vectorVal(snap)
+	} else {
+		cur, ok := v.state[v.nodeID]
+		if !ok {
+			cur = zeroSlot(v.elem) // absent slot defaults to 0 (scalar) or a zero struct
+		}
+		arg = cur
 	}
-	next, err := apply(f, []rtVal{cur})
+	next, err := apply(f, []rtVal{arg})
 	if err != nil {
 		return fmt.Errorf("action %s: %w", action, err)
 	}
@@ -134,9 +162,11 @@ func (v *VectorCRDT) Apply(action string, payload []any) error {
 	return nil
 }
 
-// Query evaluates a query's body — a general value expression that may fold the
-// vector via `reduce` — and returns the result (rat, bool, or string). The
-// lock is held across eval because a `reduce` sub-expression reads v.state.
+// Query evaluates a query. The body is a function of the whole vector (X ->
+// result): after binding the query's params, the body evaluates to a unary
+// function to which the runtime applies a snapshot of the current vector. The
+// result (rat, bool, string, or struct) is returned. The lock is held while the
+// vector snapshot is built and the fold runs.
 func (v *VectorCRDT) Query(name string, params []any) (any, error) {
 	if err := v.ValidateQuery(name, params); err != nil {
 		return nil, err
@@ -151,7 +181,18 @@ func (v *VectorCRDT) Query(name string, params []any) (any, error) {
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	val, err := v.eval(m.Body, env, 0)
+	f, err := v.eval(m.Body, env, 0)
+	if err != nil {
+		return nil, fmt.Errorf("query %s: %w", name, err)
+	}
+	if f.kind != kFunc || f.arity != 1 {
+		return nil, fmt.Errorf("query %s: body is not a unary vector function", name)
+	}
+	snap := make(map[string]rtVal, len(v.state))
+	for k, val := range v.state {
+		snap[k] = cloneSlot(val)
+	}
+	val, err := apply(f, []rtVal{vectorVal(snap)})
 	if err != nil {
 		return nil, fmt.Errorf("query %s: %w", name, err)
 	}
@@ -252,14 +293,19 @@ func (v *VectorCRDT) SnapshotWire() WireSnapshot {
 // slotToWire recursively encodes a runtime slot value as a transport SlotWire:
 // scalars become exact-rational strings, structs become nested objects.
 func slotToWire(val rtVal) SlotWire {
-	if val.kind == kStruct {
+	switch val.kind {
+	case kStruct:
 		m := make(map[string]SlotWire, len(val.fields))
 		for k, f := range val.fields {
 			m[k] = slotToWire(f)
 		}
 		return SlotWire{Struct: m}
+	case kStr:
+		s := val.str
+		return SlotWire{Str: &s}
+	default:
+		return SlotWire{Num: val.num.RatString()}
 	}
-	return SlotWire{Num: val.num.RatString()}
 }
 
 // MergeWire decodes each WireSnapshot slot against the element descriptor
@@ -278,10 +324,28 @@ func (v *VectorCRDT) MergeWire(snap WireSnapshot) error {
 }
 
 // wireToSlot decodes a SlotWire into a runtime value against the expected element
-// descriptor: exact field-set match for structs, numeric leaves parsed and
-// validated against their leaf NumType. A shape or domain mismatch is rejected.
+// descriptor. It dispatches on the resolved leaf kind (struct / string / numeric)
+// and asserts the incoming SlotWire carries exactly the one matching tag — a slot
+// with multiple populated branches, or none, is a malformed wire and rejected. A
+// string leaf is additionally guarded by utf8.ValidString: this is a second
+// string ingress (every gossip/sync merge, not just update params), so a malformed
+// byte sequence can never diverge from the prover's code-point (str.<) ordering.
 func wireToSlot(s SlotWire, t ElemT) (rtVal, error) {
-	if t.Struct {
+	populated := 0
+	if s.Num != "" {
+		populated++
+	}
+	if s.Str != nil {
+		populated++
+	}
+	if s.Struct != nil {
+		populated++
+	}
+	if populated != 1 {
+		return rtVal{}, fmt.Errorf("malformed wire slot: expected exactly one of num/str/struct, got %d", populated)
+	}
+	switch {
+	case t.Struct:
 		if s.Struct == nil {
 			return rtVal{}, fmt.Errorf("expected a struct value")
 		}
@@ -301,18 +365,27 @@ func wireToSlot(s SlotWire, t ElemT) (rtVal, error) {
 			fields[f.Name] = fv
 		}
 		return structVal(fields), nil
+	case t.Str:
+		if s.Str == nil {
+			return rtVal{}, fmt.Errorf("expected a string value")
+		}
+		if !utf8.ValidString(*s.Str) {
+			return rtVal{}, fmt.Errorf("string value is not valid UTF-8")
+		}
+		return strVal(*s.Str), nil
+	default:
+		if s.Num == "" {
+			return rtVal{}, fmt.Errorf("expected a scalar value")
+		}
+		q, ok := new(big.Rat).SetString(s.Num)
+		if !ok {
+			return rtVal{}, fmt.Errorf("invalid number %q", s.Num)
+		}
+		if !numtype.Allows(t.Num, q) {
+			return rtVal{}, fmt.Errorf("value %s is not a valid %s", q.RatString(), t.Num)
+		}
+		return numVal(q), nil
 	}
-	if s.Num == "" {
-		return rtVal{}, fmt.Errorf("expected a scalar value")
-	}
-	q, ok := new(big.Rat).SetString(s.Num)
-	if !ok {
-		return rtVal{}, fmt.Errorf("invalid number %q", s.Num)
-	}
-	if !numtype.Allows(t.Num, q) {
-		return rtVal{}, fmt.Errorf("value %s is not a valid %s", q.RatString(), t.Num)
-	}
-	return numVal(q), nil
 }
 
 // ---- expression evaluation -----------------------------------------
@@ -327,6 +400,7 @@ const (
 	kBool
 	kStruct
 	kFunc
+	kVector // a whole-vector value (nodeID -> slot); folded by reduce, supplied by write/query
 )
 
 // rtVal is a runtime value. Only the field(s) relevant to kind are set.
@@ -336,6 +410,7 @@ type rtVal struct {
 	str    string
 	b      bool
 	fields map[string]rtVal // kStruct
+	vec    map[string]rtVal // kVector: nodeID -> slot value
 	arity  int
 	call   func(args []rtVal) (rtVal, error)
 }
@@ -344,6 +419,7 @@ func numVal(f *big.Rat) rtVal            { return rtVal{kind: kNum, num: f} }
 func strVal(s string) rtVal              { return rtVal{kind: kStr, str: s} }
 func boolVal(x bool) rtVal               { return rtVal{kind: kBool, b: x} }
 func structVal(f map[string]rtVal) rtVal { return rtVal{kind: kStruct, fields: f} }
+func vectorVal(v map[string]rtVal) rtVal { return rtVal{kind: kVector, vec: v} }
 
 func (r rtVal) asNum() (*big.Rat, error) {
 	if r.kind != kNum {
@@ -487,7 +563,7 @@ func (v *VectorCRDT) eval(e parser.Expr, env map[string]rtVal, depth int) (rtVal
 		}
 		return fv, nil
 	case parser.ExprReduce:
-		if e.Fn == nil || e.Init == nil {
+		if e.Fn == nil || e.Init == nil || e.Vec == nil {
 			return rtVal{}, fmt.Errorf("malformed reduce")
 		}
 		fn, err := v.evalFuncVal(*e.Fn, env, 2, depth)
@@ -498,7 +574,16 @@ func (v *VectorCRDT) eval(e parser.Expr, env map[string]rtVal, depth int) (rtVal
 		if err != nil {
 			return rtVal{}, err
 		}
-		for _, val := range v.state {
+		vecv, err := v.eval(*e.Vec, env, depth)
+		if err != nil {
+			return rtVal{}, err
+		}
+		if vecv.kind != kVector {
+			return rtVal{}, fmt.Errorf("reduce expects a vector value")
+		}
+		// Fold the passed vector's slots. The fold fn is a proven join
+		// (commutative/associative/idempotent), so map iteration order is immaterial.
+		for _, val := range vecv.vec {
 			acc, err = apply(fn, []rtVal{acc, cloneSlot(val)})
 			if err != nil {
 				return rtVal{}, err
@@ -585,17 +670,17 @@ func primOp(op string) (func(a, b rtVal) (rtVal, error), error) {
 			return cloneRat(b)
 		}), nil
 	case ">":
-		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) > 0 }), nil
+		return cmpOp(func(c int) bool { return c > 0 }), nil
 	case "<":
-		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) < 0 }), nil
+		return cmpOp(func(c int) bool { return c < 0 }), nil
 	case ">=":
-		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) >= 0 }), nil
+		return cmpOp(func(c int) bool { return c >= 0 }), nil
 	case "<=":
-		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) <= 0 }), nil
+		return cmpOp(func(c int) bool { return c <= 0 }), nil
 	case "==":
-		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) == 0 }), nil
+		return cmpOp(func(c int) bool { return c == 0 }), nil
 	case "/=":
-		return cmp(func(a, b *big.Rat) bool { return a.Cmp(b) != 0 }), nil
+		return cmpOp(func(c int) bool { return c != 0 }), nil
 	default:
 		return nil, fmt.Errorf("unknown primitive %q", op)
 	}
@@ -615,17 +700,33 @@ func arith(f func(a, b *big.Rat) *big.Rat) func(a, b rtVal) (rtVal, error) {
 	}
 }
 
-func cmp(f func(a, b *big.Rat) bool) func(a, b rtVal) (rtVal, error) {
+// cmpOp builds a comparison primitive from a predicate over the sign of a
+// three-way comparison. Operands may both be numeric or both be strings; a
+// mismatched pair is a type error (the builder rejects mixed comparisons, so this
+// is a runtime backstop).
+func cmpOp(pred func(c int) bool) func(a, b rtVal) (rtVal, error) {
 	return func(a, b rtVal) (rtVal, error) {
-		x, err := a.asNum()
+		c, err := compareVals(a, b)
 		if err != nil {
 			return rtVal{}, err
 		}
-		y, err := b.asNum()
-		if err != nil {
-			return rtVal{}, err
-		}
-		return boolVal(f(x, y)), nil
+		return boolVal(pred(c)), nil
+	}
+}
+
+// compareVals returns -1/0/+1 comparing two values of the same kind. Strings use
+// Go's bytewise order over UTF-8, which coincides with code-point (Unicode scalar)
+// lexicographic order for valid UTF-8 — the same order the prover reasons about
+// via SMT `str.<` (ingress boundaries reject invalid UTF-8, so the two never
+// diverge).
+func compareVals(a, b rtVal) (int, error) {
+	switch {
+	case a.kind == kNum && b.kind == kNum:
+		return a.num.Cmp(b.num), nil
+	case a.kind == kStr && b.kind == kStr:
+		return strings.Compare(a.str, b.str), nil
+	default:
+		return 0, fmt.Errorf("cannot compare values of differing types")
 	}
 }
 
@@ -636,6 +737,19 @@ func cmp(f func(a, b *big.Rat) bool) func(a, b rtVal) (rtVal, error) {
 func bindParams(specs []parser.ParamSpec, vals []any) (map[string]rtVal, error) {
 	m := make(map[string]rtVal, len(specs))
 	for i, p := range specs {
+		// A string param binds straight from its wire value (validated UTF-8), so
+		// a malformed byte sequence cannot diverge from the prover's str.< order.
+		if p.Type == "string" {
+			s, ok := vals[i].(string)
+			if !ok {
+				return nil, fmt.Errorf("param %s: expected a string, got %T", p.Name, vals[i])
+			}
+			if !utf8.ValidString(s) {
+				return nil, fmt.Errorf("param %s: value is not valid UTF-8", p.Name)
+			}
+			m[p.Name] = strVal(s)
+			continue
+		}
 		f, err := toRat(vals[i])
 		if err != nil {
 			return nil, fmt.Errorf("param %s: %w", p.Name, err)

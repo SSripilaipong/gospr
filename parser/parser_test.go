@@ -17,7 +17,7 @@ fn lub a::rat b::rat = max a b
 
 merge T = zip lub
 
-query T.Value = reduce + 0
+query T.Value = reduce + 0 v
 
 update T.Add k::rat = local (+ k)
 `
@@ -71,6 +71,9 @@ update T.Add k::rat = local (+ k)
 	require.NotNil(t, qd.Body.Init)
 	assert.Equal(t, ExprNumLit, qd.Body.Init.Kind)
 	assert.Equal(t, big.NewRat(0, 1), qd.Body.Init.Num)
+	require.NotNil(t, qd.Body.Vec)
+	assert.Equal(t, ExprName, qd.Body.Vec.Kind)
+	assert.Equal(t, "v", qd.Body.Vec.Name)
 
 	// --- update: local (+ k) == local applied to a partial application ---
 	require.Len(t, plan.Updates, 1)
@@ -101,7 +104,7 @@ fn myScore x::rat
 | (>= x 80) = "You got a B"
 | otherwise = "You got a F"
 merge T = zip max
-query T.Grade = myScore (reduce max 0)
+query T.Grade = myScore (reduce max 0 v)
 update T.Add k::rat = local (+ k)
 collection Scores = T
 `
@@ -203,7 +206,7 @@ func TestParse_comparisonOperators(t *testing.T) {
 }
 
 func TestParse_queryWrapsReduceAtom(t *testing.T) {
-	plan, err := Parse("query T.Grade = f (reduce max 0)\n")
+	plan, err := Parse("query T.Grade = f (reduce max 0 v)\n")
 	require.NoError(t, err)
 	qb := plan.Queries[0].Body
 	require.Equal(t, ExprApp, qb.Kind)
@@ -262,7 +265,7 @@ merge VX = zip J
 
 update VX.AddPos k::rat0+ = local (incPos k)
 
-query VX.Net = - (reduce J { Pos: 0, Neg: 0 }).Pos (reduce J { Pos: 0, Neg: 0 }).Neg
+query VX.Net = - (reduce J { Pos: 0, Neg: 0 } v).Pos (reduce J { Pos: 0, Neg: 0 } v).Neg
 
 collection C = VX
 `
@@ -323,7 +326,7 @@ func TestParse_sectionNumberLiteral(t *testing.T) {
 }
 
 func TestParse_decimalLiteral(t *testing.T) {
-	plan, err := Parse("query T.V = reduce + 2.5\n")
+	plan, err := Parse("query T.V = reduce + 2.5 v\n")
 	require.NoError(t, err)
 	assert.Equal(t, big.NewRat(5, 2), plan.Queries[0].Body.Init.Num)
 }
@@ -377,7 +380,7 @@ func TestParse_primitivePrefixedIdentifier(t *testing.T) {
 // `reduce + 0`: the fn slot is a single atom, so the init number is not
 // swallowed as an argument to `+`.
 func TestParse_reduceFnIsAtomNotApplication(t *testing.T) {
-	plan, err := Parse("query T.V = reduce + 0\n")
+	plan, err := Parse("query T.V = reduce + 0 v\n")
 	require.NoError(t, err)
 	body := plan.Queries[0].Body
 	require.Equal(t, ExprReduce, body.Kind)
