@@ -49,9 +49,9 @@ from <https://github.com/Z3Prover/z3> or `pip install z3-solver`.
 
 ## Purpose & scope
 
-A toy distributed CRDT engine driven by a small functional DSL. A type is a
+A distributed CRDT engine driven by a small functional DSL. A type is a
 **vector** (distributed-systems vector clock: `nodeID -> value`). Merge, query,
-and update behaviors are written as Haskell-style functional expressions. MVP
+and update behaviors are written as functional expressions. MVP
 Slots hold **exact rational** numbers (`math/big.Rat`) typed by a small **numeric
 subtype lattice** (six types: `rat, rat0+, rat0-, int, int0+, int0-` — domain
 {rat,int} × sign {any,≥0,≤0}; see the `numtype` package). A slot may instead hold
@@ -203,6 +203,7 @@ parser/
 e2e/
   e2e_test.go         model-level: string → Parse → Build → Model.New → Add/Value/merge behaviors
   cluster_http_test.go blackbox: real 3-node cluster (nodes+gossip+httptest gateways), driven ONLY via HTTP; deploy→Add on one node→poll until value gossips to another (node.WithGossipInterval for speed, require.Eventually for convergence); also linearized write(node1)→linearized read(node2) with gossip OFF (1h) proving the sync quorum carried it
+  examples_doc_test.go data-driven: reads ../docs/examples.md, Parse→Build each ```gos block (no hard-coded source). docs/examples.md is the AUTHORITATIVE, test-covered example set — fence complete programs ```gos + keep buildable; the counter/PN/LWW copies in README.md & docs/dsl.md are untested, keep them consistent by hand
 ```
 
 ## DSL syntax

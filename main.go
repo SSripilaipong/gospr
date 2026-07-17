@@ -19,7 +19,7 @@ import (
 func main() {
 	cmd := &cli.Command{
 		Name:  "gospr",
-		Usage: "a toy distributed CRDT engine driven by a small functional DSL",
+		Usage: "a distributed CRDT engine driven by a small functional DSL",
 		Commands: []*cli.Command{
 			serverCmd(),
 			sandboxCmd(),
