@@ -1,13 +1,14 @@
 # gospr
 
-A distributed **CRDT engine** driven by a small **functional DSL**,
-with convergence **proven at deploy time** by the Z3 SMT solver.
+**Build fast, conflict-free distributed systems with convergence proven at deploy time.**
 
-You declare a CRDT type as a *vector* (a distributed-systems vector clock:
-`nodeID -> value`, one slot per node) and write its **merge**, **query**, and
-**update** behaviors as functional expressions. Before anything deploys, the
-builder type-checks your program *and* proves it is a well-formed CvRDT (strong
-eventual consistency) — an unprovable merge/update is rejected, not shipped.
+gospr is a CRDT engine driven by a small functional DSL. You define the distributed state, its updates and queries, and how replicas merge concurrent changes. Before deployment, gospr type-checks the program and uses Z3 to prove that the merge rules satisfy the required convergence laws and that every update preserves them. Definitions that cannot be proven to converge are rejected instead of shipped.
+
+## What is a CRDT?
+
+A CRDT is a data structure designed for systems where multiple nodes may update the same state concurrently. Instead of locking or coordinating every write, each node can update independently. Once those updates have been exchanged, replicas merge them in a way that guarantees they reach the same result.
+
+gospr lets you define those merge and update rules yourself, then proves that they satisfy that guarantee.
 
 ```
 type T = vector rat0+
