@@ -38,6 +38,26 @@ collection Counter = T                 # instantiate the type
 - `merge` merges slots with `max`, and `reduce + 0 v` sums them; two concurrent `Add`s on different nodes both survive.
 - `rat0+` is a non-negative rational: `Add -1` is rejected at build time. → [numeric types](dsl.md#numeric-types)
 
+## 1a. A keyed collection
+
+One declaration can expose an independent counter for every user ID. Documents
+need no create step; querying an untouched ID reads the type's zero state.
+
+```gos
+type T = vector rat0+
+merge T = zip max
+
+fn total v::T = reduce + 0 v
+query T.Value = total
+update T.Add k::rat0+ = local (+ k)
+
+collection Counters[userId::string] = T
+```
+
+- Update one document with `POST /api/collections/Counters/alice/Add`.
+- Query it with `GET /api/collections/Counters/alice/Value`.
+- The key names the URL parameter only; it is not visible inside DSL functions.
+
 ## 2. High-water gauge
 
 A different lattice: the update isn't accumulation, and the query returns an extremum.

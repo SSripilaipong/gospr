@@ -31,7 +31,9 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("POST /api/sandbox/links", s.handleLinks)
 	mux.HandleFunc("POST /api/sandbox/speed", s.handleSpeed)
 	mux.HandleFunc("POST /api/sandbox/nodes/{id}/collections/{collection}/{action}", s.handleApply)
+	mux.HandleFunc("POST /api/sandbox/nodes/{id}/collections/{collection}/{document}/{action}", s.handleApply)
 	mux.HandleFunc("GET /api/sandbox/nodes/{id}/collections/{collection}/{query}", s.handleQuery)
+	mux.HandleFunc("GET /api/sandbox/nodes/{id}/collections/{collection}/{document}/{query}", s.handleQuery)
 
 	// Serve the embedded SPA, falling back to a friendly message if the frontend
 	// hasn't been built yet (npm run build populates web/dist).
@@ -71,12 +73,14 @@ type stateResponse struct {
 }
 
 type nodeState struct {
-	ID          string                    `json:"id"`
-	Initialized bool                      `json:"initialized"`
-	Collections map[string]map[string]any `json:"collections"` // collection -> slot -> (ratString | struct object)
+	ID          string                               `json:"id"`
+	Initialized bool                                 `json:"initialized"`
+	Collections map[string]map[string]any            `json:"collections"` // singleton collection -> slot -> value
+	Documents   map[string]map[string]map[string]any `json:"documents"`   // keyed collection -> document -> slot -> value
 }
 
 type collectionSchema struct {
+	Key     *paramSchema             `json:"key,omitempty"`
 	Updates map[string][]paramSchema `json:"updates"`
 	Queries map[string][]paramSchema `json:"queries"`
 }
@@ -93,10 +97,12 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		resp.Nodes = make([]nodeState, 0, len(ids))
 		for _, id := range ids {
 			n, _ := c.node(id)
+			collections, documents := wireToState(n.SnapshotWireAll())
 			ns := nodeState{
 				ID:          id,
 				Initialized: n.Initialized(),
-				Collections: wireToState(n.SnapshotWireAll()),
+				Collections: collections,
+				Documents:   documents,
 			}
 			resp.Nodes = append(resp.Nodes, ns)
 		}
@@ -116,19 +122,29 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
-// wireToState converts each collection's WireSnapshot into collection -> slot ->
-// JSON value for the SPA: a scalar slot is an exact-rational string, a struct slot
-// is a (possibly nested) object of field -> value.
-func wireToState(snap map[string]crdt.WireSnapshot) map[string]map[string]any {
-	out := map[string]map[string]any{}
-	for name, ws := range snap {
-		slots := make(map[string]any, len(ws.Slots))
-		for slot, sw := range ws.Slots {
-			slots[slot] = slotWireToAny(sw)
+// wireToState projects singleton document "" into the legacy collection -> slot
+// shape and keyed documents into collection -> document -> slot. Slot values are
+// exact-rational strings or possibly nested struct objects.
+func wireToState(snap map[string]map[string]crdt.WireSnapshot) (map[string]map[string]any, map[string]map[string]map[string]any) {
+	singletons := map[string]map[string]any{}
+	documents := map[string]map[string]map[string]any{}
+	for name, docs := range snap {
+		for document, ws := range docs {
+			slots := make(map[string]any, len(ws.Slots))
+			for slot, sw := range ws.Slots {
+				slots[slot] = slotWireToAny(sw)
+			}
+			if document == "" {
+				singletons[name] = slots
+				continue
+			}
+			if documents[name] == nil {
+				documents[name] = map[string]map[string]any{}
+			}
+			documents[name][document] = slots
 		}
-		out[name] = slots
 	}
-	return out
+	return singletons, documents
 }
 
 // slotWireToAny renders a SlotWire as a JSON value: a numeric scalar -> its
@@ -163,6 +179,9 @@ func planSchema(plan *builder.BuiltPlan) map[string]collectionSchema {
 		cs := collectionSchema{
 			Updates: map[string][]paramSchema{},
 			Queries: map[string][]paramSchema{},
+		}
+		if bc.Key != nil {
+			cs.Key = &paramSchema{Name: bc.Key.Name, Type: bc.Key.Type}
 		}
 		for name, method := range m.Updates {
 			cs.Updates[name] = paramsOf(method.Params)
@@ -327,6 +346,7 @@ func writeOpError(w http.ResponseWriter, err error) {
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	collection := r.PathValue("collection")
+	document := r.PathValue("document")
 	action := r.PathValue("action")
 
 	syncOn, ratio, lerr := parseSync(r)
@@ -356,9 +376,15 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			return fmt.Errorf("unknown node %q", id)
 		}
 		if syncOn {
-			return n.ApplySync(r.Context(), collection, action, params, ratio)
+			if document == "" {
+				return n.ApplySync(r.Context(), collection, action, params, ratio)
+			}
+			return n.ApplyDocumentSync(r.Context(), collection, document, action, params, ratio)
 		}
-		return n.Apply(collection, action, params)
+		if document == "" {
+			return n.Apply(collection, action, params)
+		}
+		return n.ApplyDocument(collection, document, action, params)
 	})
 	if err != nil {
 		writeOpError(w, err)
@@ -370,6 +396,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	collection := r.PathValue("collection")
+	document := r.PathValue("document")
 	query := r.PathValue("query")
 
 	syncOn, ratio, lerr := parseSync(r)
@@ -394,9 +421,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		var v any
 		var err error
 		if syncOn {
-			v, err = n.QuerySync(r.Context(), collection, query, params, ratio)
+			if document == "" {
+				v, err = n.QuerySync(r.Context(), collection, query, params, ratio)
+			} else {
+				v, err = n.QueryDocumentSync(r.Context(), collection, document, query, params, ratio)
+			}
 		} else {
-			v, err = n.Query(collection, query, params)
+			if document == "" {
+				v, err = n.Query(collection, query, params)
+			} else {
+				v, err = n.QueryDocument(collection, document, query, params)
+			}
 		}
 		result = v
 		return err

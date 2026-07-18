@@ -148,6 +148,30 @@ func TestBuild_collectionReferencesType(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestBuild_keyedCollectionNormalizesScalarKey(t *testing.T) {
+	plan := canonicalPlan()
+	key := parser.ParamSpec{Name: "id", Type: "T.Elem"}
+	plan.Collections = []parser.CollectionSpec{{Name: "Users", Key: &key, Type: "T"}}
+	built, err := Build(plan)
+	require.NoError(t, err)
+	require.Len(t, built.Collections, 1)
+	require.NotNil(t, built.Collections[0].Key)
+	assert.Equal(t, parser.ParamSpec{Name: "id", Type: "rat"}, *built.Collections[0].Key)
+}
+
+func TestBuild_keyedCollectionRejectsStructKey(t *testing.T) {
+	plan := canonicalPlan()
+	plan.Types = append(plan.Types, parser.TypeDef{Name: "X", Elem: parser.ElemType{
+		Kind: parser.KindStruct, Fields: []parser.FieldSpec{{Name: "Value", Type: "rat"}},
+	}})
+	key := parser.ParamSpec{Name: "id", Type: "X"}
+	plan.Collections = []parser.CollectionSpec{{Name: "Users", Key: &key, Type: "T"}}
+	_, err := Build(plan)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "collection Users key")
+	assert.Contains(t, err.Error(), "struct-typed")
+}
+
 func TestBuild_unknownTypeForMerge(t *testing.T) {
 	plan := canonicalPlan()
 	plan.Merges = append(plan.Merges, parser.MergeDef{TypeName: "Ghost", Body: zip(name("max"))})

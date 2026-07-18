@@ -38,7 +38,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/cluster/deploy", g.handleDeploy)
 	mux.HandleFunc("POST /api/collections/{collection}/{action}", g.handleApply)
+	mux.HandleFunc("POST /api/collections/{collection}/{document}/{action}", g.handleApply)
 	mux.HandleFunc("GET /api/collections/{collection}/{query}", g.handleQuery)
+	mux.HandleFunc("GET /api/collections/{collection}/{document}/{query}", g.handleQuery)
 	mux.HandleFunc("GET /api/swagger.json", g.handleSwagger)
 	mux.HandleFunc("GET /api/docs", g.handleDocs)
 	return mux
@@ -133,6 +135,7 @@ func writeOpError(w http.ResponseWriter, err error) {
 
 func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
+	document := r.PathValue("document")
 	action := r.PathValue("action")
 	syncOn, ratio, lerr := parseSync(r)
 	if lerr != nil {
@@ -149,14 +152,26 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 		params[i] = s
 	}
 	if syncOn {
-		if err := g.node.ApplySync(r.Context(), collection, action, params, ratio); err != nil {
+		var err error
+		if document == "" {
+			err = g.node.ApplySync(r.Context(), collection, action, params, ratio)
+		} else {
+			err = g.node.ApplyDocumentSync(r.Context(), collection, document, action, params, ratio)
+		}
+		if err != nil {
 			writeOpError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if err := g.node.Apply(collection, action, params); err != nil {
+	var err error
+	if document == "" {
+		err = g.node.Apply(collection, action, params)
+	} else {
+		err = g.node.ApplyDocument(collection, document, action, params)
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -165,6 +180,7 @@ func (g *Gateway) handleApply(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
+	document := r.PathValue("document")
 	query := r.PathValue("query")
 	syncOn, ratio, lerr := parseSync(r)
 	if lerr != nil {
@@ -182,9 +198,17 @@ func (g *Gateway) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var val any
 	var err error
 	if syncOn {
-		val, err = g.node.QuerySync(r.Context(), collection, query, params, ratio)
+		if document == "" {
+			val, err = g.node.QuerySync(r.Context(), collection, query, params, ratio)
+		} else {
+			val, err = g.node.QueryDocumentSync(r.Context(), collection, document, query, params, ratio)
+		}
 	} else {
-		val, err = g.node.Query(collection, query, params)
+		if document == "" {
+			val, err = g.node.Query(collection, query, params)
+		} else {
+			val, err = g.node.QueryDocument(collection, document, query, params)
+		}
 	}
 	if err != nil {
 		writeOpError(w, err)

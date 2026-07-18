@@ -88,10 +88,10 @@ func Generate(plan builder.BuiltPlan) ([]byte, error) {
 	for _, bc := range plan.Collections {
 		if m, ok := bc.Spec.(*builder.Model); ok {
 			for queryName, qs := range m.Queries {
-				addGetPath(paths, bc.Name, queryName, qs.Params, qs.Result, qs.ResultNum, qs.ResultStruct)
+				addGetPath(paths, bc.Name, bc.Key, queryName, qs.Params, qs.Result, qs.ResultNum, qs.ResultStruct)
 			}
 			for actionName, us := range m.Updates {
-				addPostPath(paths, bc.Name, actionName, us.Params)
+				addPostPath(paths, bc.Name, bc.Key, actionName, us.Params)
 			}
 		}
 	}
@@ -124,8 +124,8 @@ func syncHeaderParam() parameter {
 	}
 }
 
-func addGetPath(paths map[string]pathItem, collection, queryName string, params []parser.ParamSpec, result parser.ValType, resultNum numtype.NumType, resultStruct *crdt.ElemT) {
-	key := "/api/collections/" + collection + "/" + queryName
+func addGetPath(paths map[string]pathItem, collection string, documentKey *parser.ParamSpec, queryName string, params []parser.ParamSpec, result parser.ValType, resultNum numtype.NumType, resultStruct *crdt.ElemT) {
+	key := collectionPath(collection, documentKey, queryName)
 	resultSchema := valTypeSchema(result, resultNum)
 	if resultStruct != nil {
 		resultSchema = structSchema(*resultStruct)
@@ -141,6 +141,9 @@ func addGetPath(paths map[string]pathItem, collection, queryName string, params 
 			"400": {Description: "Error"},
 			"503": {Description: "Sync quorum not reached"},
 		},
+	}
+	if documentKey != nil {
+		op.Parameters = append(op.Parameters, documentKeyParam(*documentKey))
 	}
 	if len(params) > 0 {
 		parts := make([]string, len(params))
@@ -162,8 +165,8 @@ func addGetPath(paths map[string]pathItem, collection, queryName string, params 
 	paths[key] = pathItem{Get: op}
 }
 
-func addPostPath(paths map[string]pathItem, collection, actionName string, params []parser.ParamSpec) {
-	key := "/api/collections/" + collection + "/" + actionName
+func addPostPath(paths map[string]pathItem, collection string, documentKey *parser.ParamSpec, actionName string, params []parser.ParamSpec) {
+	key := collectionPath(collection, documentKey, actionName)
 	op := &operation{
 		Summary:    actionName + " on " + collection,
 		Parameters: []parameter{syncHeaderParam()},
@@ -172,6 +175,9 @@ func addPostPath(paths map[string]pathItem, collection, actionName string, param
 			"400": {Description: "Error"},
 			"503": {Description: "Sync quorum not reached"},
 		},
+	}
+	if documentKey != nil {
+		op.Parameters = append(op.Parameters, documentKeyParam(*documentKey))
 	}
 	var mt mediaType
 	if len(params) == 0 {
@@ -205,6 +211,28 @@ func addPostPath(paths map[string]pathItem, collection, actionName string, param
 	}
 	paths[key] = pathItem{
 		Post: op,
+	}
+}
+
+func collectionPath(collection string, key *parser.ParamSpec, method string) string {
+	path := "/api/collections/" + collection
+	if key != nil {
+		path += "/{" + key.Name + "}"
+	}
+	return path + "/" + method
+}
+
+func documentKeyParam(key parser.ParamSpec) parameter {
+	desc := "Document key (" + key.Type + ")."
+	if key.Type != "string" {
+		desc += " Use decimal syntax such as 0, -2, or 0.5; fractions and exponents are rejected."
+	}
+	return parameter{
+		Name:     key.Name,
+		In:       "path",
+		Required: true,
+		Schema:   schema{Type: "string", Description: desc},
+		Example:  paramExample(key),
 	}
 }
 

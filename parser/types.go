@@ -167,7 +167,8 @@ type GuardCase struct {
 
 // ---- Method params -------------------------------------------------
 
-// ParamSpec is `name::type`. Type is one of the six numeric names (e.g. "rat").
+// ParamSpec is `name::type`. The builder validates which scalar/compound types
+// are legal at each use site (function, method, or collection key).
 type ParamSpec struct {
 	Name string
 	Type string
@@ -213,7 +214,8 @@ type UpdateDef struct {
 
 type CollectionSpec struct {
 	Name string
-	Type string // user-defined type name, no args
+	Key  *ParamSpec // optional document path key; nil means a singleton collection
+	Type string     // user-defined type name
 }
 
 type Plan struct {

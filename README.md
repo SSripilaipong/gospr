@@ -34,6 +34,7 @@ elementwise `max`, and `Value` sums the slots.
 - **Structs & LWW registers** — struct-valued slots (product lattice) and a Lamport-clock last-writer-wins register.
 - **Deploy-time convergence proof** — merge join-laws + inflationary updates discharged to Z3; faithful to the exact-rational runtime (ℚ ⊆ ℝ).
 - **Gossip + optional sync quorum** — eventually-consistent gossip by default; opt into a synchronous quorum (linearizable at ≥ 0.5) per request via a header.
+- **Sparse keyed collections** — declare `collection Users[id::string] = User`; every path key addresses an independent, zero-default document without initialization.
 - **Auto-generated Swagger** and an **observable web sandbox** for watching gossip and partitioning links live.
 
 ## Prerequisites
@@ -67,6 +68,8 @@ them. The **server** exposes each node's HTTP gateway with Swagger UI at `/api/d
 | Deploy a program | `POST /api/cluster/deploy` (body = DSL source) |
 | Invoke an update | `POST /api/collections/{collection}/{action}` |
 | Run a query | `GET /api/collections/{collection}/{query}?params=...` |
+| Update a keyed document | `POST /api/collections/{collection}/{document}/{action}` |
+| Query a keyed document | `GET /api/collections/{collection}/{document}/{query}?params=...` |
 | API docs | `GET /api/docs` · `GET /api/swagger.json` |
 
 Numbers cross the wire as **exact-rational strings** (`"5"`, `"1/2"`) — never JSON

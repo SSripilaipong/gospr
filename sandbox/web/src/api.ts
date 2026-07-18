@@ -6,6 +6,7 @@ export interface ParamSchema {
 }
 
 export interface CollectionSchema {
+  key?: ParamSchema;
   updates: Record<string, ParamSchema[]>;
   queries: Record<string, ParamSchema[]>;
 }
@@ -19,7 +20,7 @@ export function liveLabelQueries(
   collection: string | null,
 ): string[] {
   const cs = collection ? schema[collection] : undefined;
-  if (!cs) return [];
+  if (!cs || cs.key) return []; // keyed collections need a document ID; SPA support is API-only
   return Object.keys(cs.queries).filter((q) => cs.queries[q].length === 0);
 }
 
@@ -31,6 +32,7 @@ export interface NodeState {
   id: string;
   initialized: boolean;
   collections: Record<string, Record<string, SlotValue>>; // collection -> slot -> value
+  documents: Record<string, Record<string, Record<string, SlotValue>>>; // collection -> document -> slot -> value
 }
 
 export interface SandboxState {

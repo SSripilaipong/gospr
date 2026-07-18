@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,14 @@ fn total v::T = reduce + 0 v
 query T.Value = total
 update T.Add k::rat0+ = local (+ k)
 collection Counter = T
+`
+
+const keyedCounterDSL = `type T = vector rat0+
+merge T = zip max
+fn total v::T = reduce + 0 v
+query T.Value = total
+update T.Add k::rat0+ = local (+ k)
+collection Counters[id::rat0+] = T
 `
 
 // counterDSLVariant is value-shape-identical to counterDSL but carries an extra
@@ -108,6 +117,125 @@ func TestApplySync_syncWrite(t *testing.T) {
 	v, err := ns[1].Query("Counter", "Value", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "5", v, "node2 sees the write via the synchronous push")
+}
+
+func TestKeyedCollection_sparseCanonicalDocuments(t *testing.T) {
+	n := New("node1")
+	require.NoError(t, n.Initialize(buildPlan(t, keyedCounterDSL)))
+
+	v, err := n.QueryDocument("Counters", "0.5", "Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "0", v)
+	assert.Empty(t, n.SnapshotWireAll()["Counters"], "untouched query stays unmaterialized")
+
+	require.NoError(t, n.ApplyDocument("Counters", "0.50", "Add", []any{"2"}))
+	v, err = n.QueryDocument("Counters", "0.5", "Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "2", v, "equivalent decimal spellings share one document")
+	v, err = n.QueryDocument("Counters", "0.6", "Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "0", v, "documents are isolated")
+	assert.Contains(t, n.SnapshotWireAll()["Counters"], "0.5")
+	assert.NotContains(t, n.SnapshotWireAll()["Counters"], "0.6")
+
+	for _, bad := range []string{"", "1/2", "1e2", "-1"} {
+		_, err := n.QueryDocument("Counters", bad, "Value", nil)
+		require.Error(t, err, bad)
+	}
+	require.Error(t, n.Apply("Counters", "Add", []any{"1"}), "keyed collection requires document route")
+}
+
+func TestKeyedCollection_failedApplyDoesNotMaterialize(t *testing.T) {
+	n := New("node1")
+	require.NoError(t, n.Initialize(buildPlan(t, keyedCounterDSL)))
+	require.Error(t, n.ApplyDocument("Counters", "3", "NoSuchAction", []any{"1"}))
+	assert.Empty(t, n.SnapshotWireAll()["Counters"])
+	require.Error(t, n.ApplyDocument("Counters", "3", "Add", []any{"-1"}))
+	assert.Empty(t, n.SnapshotWireAll()["Counters"])
+
+	b := New("b")
+	require.NoError(t, b.Initialize(buildPlan(t, keyedCounterDSL)))
+	b.MergeSnapshot(n.Snapshot())
+	assert.Empty(t, b.SnapshotWireAll()["Counters"])
+}
+
+func TestKeyedCollection_failedAndEmptyMergesDoNotMaterialize(t *testing.T) {
+	n := New("node1")
+	require.NoError(t, n.Initialize(buildPlan(t, keyedCounterDSL)))
+	ref, err := n.resolveDocument("Counters", "3")
+	require.NoError(t, err)
+	err = n.mergeCollection(ref, crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{
+		"peer": {Num: "not-a-rational"},
+	}})
+	require.Error(t, err)
+	assert.Empty(t, n.SnapshotWireAll()["Counters"])
+
+	n.MergeSnapshot(map[string]map[string]any{"Counters": {
+		"4": "invalid snapshot type",
+		"5": map[string]any{},
+	}})
+	assert.Empty(t, n.SnapshotWireAll()["Counters"])
+}
+
+func TestKeyedCollection_concurrentFirstAccess(t *testing.T) {
+	n := New("node1")
+	require.NoError(t, n.Initialize(buildPlan(t, keyedCounterDSL)))
+	const writes = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, writes)
+	for range writes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- n.ApplyDocument("Counters", "7", "Add", []any{"1"})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	v, err := n.QueryDocument("Counters", "7", "Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "20", v)
+	assert.Len(t, n.SnapshotWireAll()["Counters"], 1)
+}
+
+func TestKeyedCollection_syncUntouchedAndReplication(t *testing.T) {
+	built := buildPlan(t, keyedCounterDSL)
+	ns := newSyncNodes("node1", "node2", "node3")
+	wireMesh(ns)
+	startAll(t, ns)
+	deployAll(t, built, ns...)
+
+	v, err := ns[0].QueryDocumentSync(context.Background(), "Counters", "9", "Value", nil, AllRatio)
+	require.NoError(t, err)
+	assert.Equal(t, "0", v)
+	for _, n := range ns {
+		assert.Empty(t, n.SnapshotWireAll()["Counters"], "empty pull/push acks without materializing")
+	}
+
+	require.NoError(t, ns[0].ApplyDocumentSync(context.Background(), "Counters", "9", "Add", []any{"3"}, AllRatio))
+	v, err = ns[2].QueryDocument("Counters", "9", "Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "3", v)
+}
+
+func TestKeyedCollection_gossipSnapshotKeepsDocumentScope(t *testing.T) {
+	built := buildPlan(t, keyedCounterDSL)
+	a, b := New("a"), New("b")
+	require.NoError(t, a.Initialize(built))
+	require.NoError(t, b.Initialize(built))
+	require.NoError(t, a.ApplyDocument("Counters", "1", "Add", []any{"2"}))
+	require.NoError(t, a.ApplyDocument("Counters", "2", "Add", []any{"5"}))
+	b.MergeSnapshot(a.Snapshot())
+
+	one, err := b.QueryDocument("Counters", "1", "Value", nil)
+	require.NoError(t, err)
+	two, err := b.QueryDocument("Counters", "2", "Value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "2", one)
+	assert.Equal(t, "5", two)
 }
 
 // Test 2: a linearized read is two-phase. Gather pulls+merges a peer's slot (so
@@ -325,12 +453,23 @@ func assertGobJSON[T any](t *testing.T, orig T, out *T) {
 // suppressed at the demux so it neither inflates the count nor crowds a valid
 // distinct ack out of the buffer.
 func TestSyncAck_distinctPeerCounting(t *testing.T) {
+	t.Run("wrong document scope is dropped", func(t *testing.T) {
+		n := New("node1", WithSyncTimeout(testSyncTimeout))
+		n.AddPeer("node2", blackholePeer{})
+		rid := n.nextReqID()
+		pr, cancel := n.register(rid, "wanted")
+		defer cancel()
+		n.handleSyncAck(SyncAckMsg{FromID: "node2", ReqID: rid, Document: "other"})
+		n.handleSyncAck(SyncAckMsg{FromID: "node2", ReqID: rid, Document: "wanted"})
+		require.NoError(t, n.collectAcks(context.Background(), pr, AllRatio, nil))
+	})
+
 	t.Run("no inflation from duplicates/unknowns", func(t *testing.T) {
 		n := New("node1", WithSyncTimeout(testSyncTimeout))
 		n.AddPeer("node2", blackholePeer{})
 		n.AddPeer("node3", blackholePeer{}) // present in peerByID but never acks
 		rid := n.nextReqID()
-		pr, cancel := n.register(rid)
+		pr, cancel := n.register(rid, "")
 		defer cancel()
 
 		n.handleSyncAck(SyncAckMsg{FromID: "node2", ReqID: rid})
@@ -349,7 +488,7 @@ func TestSyncAck_distinctPeerCounting(t *testing.T) {
 		n.AddPeer("node2", blackholePeer{})
 		n.AddPeer("node3", blackholePeer{})
 		rid := n.nextReqID()
-		pr, cancel := n.register(rid)
+		pr, cancel := n.register(rid, "")
 		defer cancel()
 
 		// A known peer returns a corrupt wire snapshot (invalid rational); another
@@ -359,7 +498,9 @@ func TestSyncAck_distinctPeerCounting(t *testing.T) {
 		n.handleSyncAck(SyncAckMsg{FromID: "node3", ReqID: rid,
 			Snapshot: crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{"node3": {Num: "4"}}}})
 
-		onAck := func(ack SyncAckMsg) error { return n.mergeCollection("Counter", ack.Snapshot) }
+		onAck := func(ack SyncAckMsg) error {
+			return n.mergeCollection(documentRef{collection: "Counter"}, ack.Snapshot)
+		}
 		// ratio 1.0 needs both peers as holders, but node2's merge fails ⇒ only 1
 		// distinct holder counts ⇒ quorum unreached (a corrupt response can't
 		// satisfy a read without contributing state).
@@ -376,7 +517,7 @@ func TestSyncAck_distinctPeerCounting(t *testing.T) {
 		n.AddPeer("node2", blackholePeer{})
 		n.AddPeer("node3", blackholePeer{})
 		rid := n.nextReqID()
-		pr, cancel := n.register(rid)
+		pr, cancel := n.register(rid, "")
 		defer cancel()
 
 		for i := 0; i < 10; i++ { // burst of duplicates from node2

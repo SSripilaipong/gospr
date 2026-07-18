@@ -67,6 +67,31 @@ func TestGenerate_paramSchemas(t *testing.T) {
 	assert.Equal(t, "string", items["type"]) // numbers cross the boundary as strings
 }
 
+func TestGenerate_keyedCollectionPath(t *testing.T) {
+	plan := makeModelPlan()
+	key := parser.ParamSpec{Name: "userId", Type: "rat0+"}
+	plan.Collections[0].Key = &key
+	data, err := Generate(plan)
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(data, &doc))
+
+	paths := doc["paths"].(map[string]any)
+	post := paths["/api/collections/MyVec/{userId}/Add"].(map[string]any)["post"].(map[string]any)
+	params := post["parameters"].([]any)
+	var pathParam map[string]any
+	for _, raw := range params {
+		p := raw.(map[string]any)
+		if p["in"] == "path" {
+			pathParam = p
+		}
+	}
+	require.NotNil(t, pathParam)
+	assert.Equal(t, "userId", pathParam["name"])
+	assert.Equal(t, true, pathParam["required"])
+	assert.Contains(t, pathParam["schema"].(map[string]any)["description"], "decimal syntax")
+}
+
 func TestGenerate_zeroParamPost(t *testing.T) {
 	data, err := Generate(makeModelPlan())
 	require.NoError(t, err)

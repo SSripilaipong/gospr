@@ -120,6 +120,12 @@ export class NodePanel extends HTMLElement {
     card.appendChild(el("h2", "", `Node ${node}`));
 
     const cs = this.collection ? this.state!.schema[this.collection] : undefined;
+    if (cs?.key) {
+      card.appendChild(
+        el("p", "empty", `Keyed by ${cs.key.name} (${cs.key.type}); use the sandbox HTTP API.`),
+      );
+      return card;
+    }
     const updates = cs ? Object.entries(cs.updates) : [];
     if (updates.length === 0) {
       card.appendChild(el("p", "empty", "This collection has no updates."));

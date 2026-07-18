@@ -6,11 +6,18 @@ import (
 	"fmt"
 	"gospr/builder"
 	"gospr/crdt"
+	"gospr/numtype"
+	"gospr/parser"
 	"log"
+	"math/big"
 	"math/rand"
+	"reflect"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 type State int
@@ -22,7 +29,7 @@ const (
 
 type gossipMsg struct {
 	senderID string
-	snapshot map[string]any
+	snapshot map[string]map[string]any // collection -> canonical document -> CRDT snapshot
 }
 
 type deployMsg struct {
@@ -42,6 +49,7 @@ type SyncPushMsg struct {
 	FromID      string
 	ReqID       string
 	Collection  string
+	Document    string
 	Fingerprint string
 	Snapshot    crdt.WireSnapshot
 }
@@ -51,6 +59,7 @@ type SyncPullMsg struct {
 	FromID      string
 	ReqID       string
 	Collection  string
+	Document    string
 	Fingerprint string
 }
 
@@ -59,6 +68,7 @@ type SyncPullMsg struct {
 type SyncAckMsg struct {
 	FromID   string
 	ReqID    string
+	Document string
 	Snapshot crdt.WireSnapshot
 }
 
@@ -121,7 +131,7 @@ type Node struct {
 	inbox          chan any
 	peers          []Peer          // for gossip's random pick
 	peerByID       map[string]Peer // for routing a sync ack back to its coordinator
-	collections    map[string]crdt.CRDT
+	collections    map[string]*colState
 	gossipInterval time.Duration
 	syncTimeout    time.Duration
 	quit           chan struct{}
@@ -138,9 +148,26 @@ type Node struct {
 // message-loop goroutine (the demux), so it needs no extra lock. ch carries
 // already-validated, already-distinct acks to the waiting collectAcks.
 type pendingReq struct {
-	ch   chan SyncAckMsg
-	seen map[string]struct{}
+	ch       chan SyncAckMsg
+	seen     map[string]struct{}
+	document string
 }
+
+// colState is one deployed collection family. The node mutex guards docs.
+// Singleton collections reserve the empty document key and create it eagerly;
+// keyed collections start sparse.
+type colState struct {
+	spec builder.CollectionSpec
+	key  *parser.ParamSpec
+	docs map[string]crdt.CRDT
+}
+
+type documentRef struct {
+	collection string
+	document   string // canonical; empty only for singleton collections
+}
+
+var decimalDocumentKey = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?$`)
 
 // Option configures a Node at construction.
 type Option func(*Node)
@@ -163,7 +190,7 @@ func New(id string, opts ...Option) *Node {
 		id:             id,
 		inbox:          make(chan any, 64),
 		peerByID:       make(map[string]Peer),
-		collections:    make(map[string]crdt.CRDT),
+		collections:    make(map[string]*colState),
 		gossipInterval: 2 * time.Second,
 		syncTimeout:    5 * time.Second,
 		quit:           make(chan struct{}),
@@ -216,7 +243,11 @@ func (n *Node) Initialize(plan builder.BuiltPlan) error {
 		return nil
 	}
 	for _, bc := range plan.Collections {
-		n.collections[bc.Name] = bc.Spec.New(n.id)
+		cs := &colState{spec: bc.Spec, key: bc.Key, docs: make(map[string]crdt.CRDT)}
+		if bc.Key == nil {
+			cs.docs[""] = bc.Spec.New(n.id)
+		}
+		n.collections[bc.Name] = cs
 	}
 	n.fingerprint = plan.Fingerprint
 	n.state = Initialized
@@ -231,62 +262,236 @@ func (n *Node) PropagatePlan(plan builder.BuiltPlan) {
 	}
 }
 
-func (n *Node) Apply(collection, action string, payload []any) error {
+// resolveDocument is the sole collection/document boundary. It asserts the
+// singleton-vs-keyed shape and canonicalizes a keyed URL value before any
+// storage, gossip, or sync lookup.
+func (n *Node) resolveDocument(collection, raw string) (documentRef, error) {
 	n.mu.RLock()
-	c, ok := n.collections[collection]
+	cs, ok := n.collections[collection]
 	n.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("collection %q not found", collection)
+		return documentRef{}, fmt.Errorf("collection %q not found", collection)
 	}
-	return c.Apply(action, payload)
+	if cs.key == nil {
+		if raw != "" {
+			return documentRef{}, fmt.Errorf("collection %q is a singleton and does not accept a document key", collection)
+		}
+		return documentRef{collection: collection}, nil
+	}
+	if raw == "" {
+		return documentRef{}, fmt.Errorf("collection %q requires a document key (use the document route)", collection)
+	}
+	key, err := normalizeDocumentKey(*cs.key, raw)
+	if err != nil {
+		return documentRef{}, fmt.Errorf("collection %q document %s: %w", collection, cs.key.Name, err)
+	}
+	return documentRef{collection: collection, document: key}, nil
 }
 
-func (n *Node) Query(collection, queryName string, params []any) (any, error) {
-	n.mu.RLock()
-	c, ok := n.collections[collection]
-	n.mu.RUnlock()
+func normalizeDocumentKey(spec parser.ParamSpec, raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("must not be empty")
+	}
+	if strings.Contains(raw, "/") {
+		return "", fmt.Errorf("must not contain '/'")
+	}
+	if !utf8.ValidString(raw) {
+		return "", fmt.Errorf("must be valid UTF-8")
+	}
+	if spec.Type == "string" {
+		return raw, nil
+	}
+	if !decimalDocumentKey.MatchString(raw) {
+		return "", fmt.Errorf("invalid %s key %q (want a decimal such as 0, -2, or 0.5)", spec.Type, raw)
+	}
+	q, ok := new(big.Rat).SetString(raw)
 	if !ok {
-		return nil, fmt.Errorf("collection %q not found", collection)
+		return "", fmt.Errorf("invalid number %q", raw)
 	}
-	return c.Query(queryName, params)
+	nt, ok := numtype.Parse(spec.Type)
+	if !ok {
+		return "", fmt.Errorf("unknown key type %q", spec.Type)
+	}
+	if !numtype.Allows(nt, q) {
+		return "", fmt.Errorf("value %s is not a valid %s", canonicalDecimal(raw), spec.Type)
+	}
+	return canonicalDecimal(raw), nil
 }
 
-func (n *Node) Snapshot() map[string]any {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	snap := make(map[string]any, len(n.collections))
-	for name, c := range n.collections {
-		snap[name] = c.Snapshot()
+// canonicalDecimal normalizes the accepted finite-decimal spelling without
+// converting it to RatString (which could introduce a slash such as 1/2).
+func canonicalDecimal(raw string) string {
+	neg := strings.HasPrefix(raw, "-")
+	if neg {
+		raw = raw[1:]
 	}
-	return snap
-}
-
-// SnapshotWireAll returns each collection's transport-safe WireSnapshot (scalar
-// or struct slots). It is the public accessor the sandbox uses to render node
-// state — the in-process Snapshot returns an opaque runtime shape, whereas this
-// is the stable wire encoding.
-func (n *Node) SnapshotWireAll() map[string]crdt.WireSnapshot {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	out := make(map[string]crdt.WireSnapshot, len(n.collections))
-	for name, c := range n.collections {
-		out[name] = c.SnapshotWire()
+	whole, frac, hasFrac := strings.Cut(raw, ".")
+	whole = strings.TrimLeft(whole, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	if hasFrac {
+		frac = strings.TrimRight(frac, "0")
+	}
+	out := whole
+	if frac != "" {
+		out += "." + frac
+	}
+	if neg && out != "0" {
+		out = "-" + out
 	}
 	return out
 }
 
-func (n *Node) MergeSnapshot(snap map[string]any) {
+// document returns a stored CRDT, or an unregistered zero-state CRDT on miss.
+// ref has already passed resolveDocument, so its collection is deployed.
+func (n *Node) document(ref documentRef) (crdt.CRDT, bool) {
+	n.mu.RLock()
+	cs := n.collections[ref.collection]
+	c, ok := cs.docs[ref.document]
+	n.mu.RUnlock()
+	if ok {
+		return c, true
+	}
+	return cs.spec.New(n.id), false
+}
+
+func (n *Node) apply(ref documentRef, action string, payload []any) error {
+	n.mu.RLock()
+	cs := n.collections[ref.collection]
+	c, ok := cs.docs[ref.document]
+	n.mu.RUnlock()
+	if ok {
+		return c.Apply(action, payload)
+	}
+
+	// An update cannot safely be applied to a temporary document and later
+	// merged into a concurrent winner: two local Adds would collapse under max.
+	// Serialize only the first touch, and publish the document only on success.
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if c, ok = cs.docs[ref.document]; ok {
+		return c.Apply(action, payload)
+	}
+	c = cs.spec.New(n.id)
+	if err := c.Apply(action, payload); err != nil {
+		return err
+	}
+	cs.docs[ref.document] = c
+	return nil
+}
+
+func (n *Node) query(ref documentRef, queryName string, params []any) (any, error) {
+	c, _ := n.document(ref)
+	return c.Query(queryName, params)
+}
+
+func (n *Node) Apply(collection, action string, payload []any) error {
+	ref, err := n.resolveDocument(collection, "")
+	if err != nil {
+		return err
+	}
+	return n.apply(ref, action, payload)
+}
+
+func (n *Node) ApplyDocument(collection, document, action string, payload []any) error {
+	ref, err := n.resolveDocument(collection, document)
+	if err != nil {
+		return err
+	}
+	return n.apply(ref, action, payload)
+}
+
+func (n *Node) Query(collection, queryName string, params []any) (any, error) {
+	ref, err := n.resolveDocument(collection, "")
+	if err != nil {
+		return nil, err
+	}
+	return n.query(ref, queryName, params)
+}
+
+func (n *Node) QueryDocument(collection, document, queryName string, params []any) (any, error) {
+	ref, err := n.resolveDocument(collection, document)
+	if err != nil {
+		return nil, err
+	}
+	return n.query(ref, queryName, params)
+}
+
+func (n *Node) Snapshot() map[string]map[string]any {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	for name, s := range snap {
-		c, ok := n.collections[name]
-		if !ok {
-			continue
+	snap := make(map[string]map[string]any, len(n.collections))
+	for name, cs := range n.collections {
+		docs := make(map[string]any, len(cs.docs))
+		for document, c := range cs.docs {
+			docs[document] = c.Snapshot()
 		}
-		if err := c.Merge(s); err != nil {
-			log.Printf("[%s] merge error for %s: %v", n.id, name, err)
+		snap[name] = docs
+	}
+	return snap
+}
+
+// SnapshotWireAll returns collection -> canonical document -> transport-safe
+// WireSnapshot. Singleton collections use the reserved empty document key.
+func (n *Node) SnapshotWireAll() map[string]map[string]crdt.WireSnapshot {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make(map[string]map[string]crdt.WireSnapshot, len(n.collections))
+	for name, cs := range n.collections {
+		docs := make(map[string]crdt.WireSnapshot, len(cs.docs))
+		for document, c := range cs.docs {
+			docs[document] = c.SnapshotWire()
+		}
+		out[name] = docs
+	}
+	return out
+}
+
+func (n *Node) MergeSnapshot(snap map[string]map[string]any) {
+	for name, docs := range snap {
+		for document, s := range docs {
+			if snapshotEmpty(s) {
+				continue
+			}
+			ref, err := n.resolveDocument(name, document)
+			if err != nil {
+				continue
+			}
+			if err := n.mergeSnapshot(ref, s); err != nil {
+				log.Printf("[%s] merge error for %s/%s: %v", n.id, name, document, err)
+			}
 		}
 	}
+}
+
+func snapshotEmpty(s any) bool {
+	v := reflect.ValueOf(s)
+	return v.IsValid() && v.Kind() == reflect.Map && v.Len() == 0
+}
+
+func (n *Node) mergeSnapshot(ref documentRef, snap any) error {
+	n.mu.RLock()
+	cs := n.collections[ref.collection]
+	c, ok := cs.docs[ref.document]
+	n.mu.RUnlock()
+	if ok {
+		return c.Merge(snap)
+	}
+
+	temp := cs.spec.New(n.id)
+	if err := temp.Merge(snap); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	winner, exists := cs.docs[ref.document]
+	if !exists {
+		cs.docs[ref.document] = temp
+		n.mu.Unlock()
+		return nil
+	}
+	n.mu.Unlock()
+	return winner.Merge(temp.Snapshot())
 }
 
 func (n *Node) runGossip() {
@@ -348,10 +553,14 @@ func (n *Node) handleSyncPush(m SyncPushMsg) {
 	if !n.fingerprintMatches(m.Fingerprint) {
 		return
 	}
-	if err := n.mergeCollection(m.Collection, m.Snapshot); err != nil {
+	ref, err := n.resolveDocument(m.Collection, m.Document)
+	if err != nil || ref.document != m.Document {
 		return
 	}
-	n.routeAck(m.FromID, SyncAckMsg{FromID: n.id, ReqID: m.ReqID})
+	if err := n.mergeCollection(ref, m.Snapshot); err != nil {
+		return
+	}
+	n.routeAck(m.FromID, SyncAckMsg{FromID: n.id, ReqID: m.ReqID, Document: ref.document})
 }
 
 // handleSyncPull replies with this node's snapshot of the target collection,
@@ -360,11 +569,12 @@ func (n *Node) handleSyncPull(m SyncPullMsg) {
 	if !n.fingerprintMatches(m.Fingerprint) {
 		return
 	}
-	snap, ok := n.snapshotCollection(m.Collection)
-	if !ok {
+	ref, err := n.resolveDocument(m.Collection, m.Document)
+	if err != nil || ref.document != m.Document {
 		return
 	}
-	n.routeAck(m.FromID, SyncAckMsg{FromID: n.id, ReqID: m.ReqID, Snapshot: snap})
+	snap := n.snapshotCollection(ref)
+	n.routeAck(m.FromID, SyncAckMsg{FromID: n.id, ReqID: m.ReqID, Document: ref.document, Snapshot: snap})
 }
 
 // handleSyncAck demuxes a peer's ack into the pending request. Validation and
@@ -384,6 +594,9 @@ func (n *Node) handleSyncAck(m SyncAckMsg) {
 	}
 	if _, dup := pr.seen[m.FromID]; dup {
 		return // duplicate/retried delivery — already counted
+	}
+	if m.Document != pr.document {
+		return // valid peer, wrong document scope
 	}
 	pr.seen[m.FromID] = struct{}{}
 	select {
@@ -419,10 +632,11 @@ func (n *Node) nextReqID() string {
 // register creates pending state for one in-flight sync phase. ch is buffered to
 // len(peers) so every distinct peer can ack without blocking the message loop;
 // cancel removes the entry (a later ack then finds nothing and is dropped).
-func (n *Node) register(reqID string) (*pendingReq, func()) {
+func (n *Node) register(reqID, document string) (*pendingReq, func()) {
 	pr := &pendingReq{
-		ch:   make(chan SyncAckMsg, len(n.peers)),
-		seen: make(map[string]struct{}),
+		ch:       make(chan SyncAckMsg, len(n.peers)),
+		seen:     make(map[string]struct{}),
+		document: document,
 	}
 	n.pendingMu.Lock()
 	n.pending[reqID] = pr
@@ -436,36 +650,62 @@ func (n *Node) register(reqID string) (*pendingReq, func()) {
 
 // ---- collection-scoped helpers -------------------------------------------
 
-func (n *Node) mergeCollection(name string, snap crdt.WireSnapshot) error {
+func (n *Node) mergeCollection(ref documentRef, snap crdt.WireSnapshot) error {
 	n.mu.RLock()
-	c, ok := n.collections[name]
+	cs := n.collections[ref.collection]
+	c, ok := cs.docs[ref.document]
 	n.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("collection %q not found", name)
+	if !ok && len(snap.Slots) == 0 {
+		return nil // a globally untouched document still counts as a successful merge
 	}
-	return c.MergeWire(snap)
+	if ok {
+		return c.MergeWire(snap)
+	}
+
+	temp := cs.spec.New(n.id)
+	if err := temp.MergeWire(snap); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	winner, exists := cs.docs[ref.document]
+	if !exists {
+		cs.docs[ref.document] = temp
+		n.mu.Unlock()
+		return nil
+	}
+	n.mu.Unlock()
+	return winner.MergeWire(temp.SnapshotWire())
 }
 
-func (n *Node) snapshotCollection(name string) (crdt.WireSnapshot, bool) {
+func (n *Node) snapshotCollection(ref documentRef) crdt.WireSnapshot {
 	n.mu.RLock()
-	c, ok := n.collections[name]
+	cs := n.collections[ref.collection]
+	c, ok := cs.docs[ref.document]
 	n.mu.RUnlock()
 	if !ok {
-		return crdt.WireSnapshot{}, false
+		return crdt.WireSnapshot{Slots: map[string]crdt.SlotWire{}}
 	}
-	return c.SnapshotWire(), true
+	return c.SnapshotWire()
 }
 
 // ValidateQuery is the non-evaluating preflight for a synchronous read: it checks
 // the collection and query exist and the params bind, without evaluating the
 // query body (which is state-dependent).
 func (n *Node) ValidateQuery(collection, query string, params []any) error {
-	n.mu.RLock()
-	c, ok := n.collections[collection]
-	n.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("collection %q not found", collection)
+	ref, err := n.resolveDocument(collection, "")
+	if err != nil {
+		return err
 	}
+	c, _ := n.document(ref)
+	return c.ValidateQuery(query, params)
+}
+
+func (n *Node) ValidateDocumentQuery(collection, document, query string, params []any) error {
+	ref, err := n.resolveDocument(collection, document)
+	if err != nil {
+		return err
+	}
+	c, _ := n.document(ref)
 	return c.ValidateQuery(query, params)
 }
 
@@ -499,10 +739,26 @@ func (n *Node) reached(distinct int, ratio float64) bool {
 // and may still converge via gossip — retrying a non-idempotent Add can
 // double-count.
 func (n *Node) ApplySync(ctx context.Context, collection, action string, payload []any, ratio float64) error {
-	if err := n.Apply(collection, action, payload); err != nil {
+	ref, err := n.resolveDocument(collection, "")
+	if err != nil {
 		return err
 	}
-	return n.pushQuorum(ctx, collection, ratio)
+	return n.applySync(ctx, ref, action, payload, ratio)
+}
+
+func (n *Node) ApplyDocumentSync(ctx context.Context, collection, document, action string, payload []any, ratio float64) error {
+	ref, err := n.resolveDocument(collection, document)
+	if err != nil {
+		return err
+	}
+	return n.applySync(ctx, ref, action, payload, ratio)
+}
+
+func (n *Node) applySync(ctx context.Context, ref documentRef, action string, payload []any, ratio float64) error {
+	if err := n.apply(ref, action, payload); err != nil {
+		return err
+	}
+	return n.pushQuorum(ctx, ref, ratio)
 }
 
 // QuerySync performs an ABD-style two-phase read: a non-evaluating preflight (so
@@ -512,35 +768,50 @@ func (n *Node) ApplySync(ctx context.Context, collection, action string, payload
 // quorums overlap, giving linearizability; a weaker ratio only guarantees
 // synchronous replication to that fraction.
 func (n *Node) QuerySync(ctx context.Context, collection, query string, params []any, ratio float64) (any, error) {
-	if err := n.ValidateQuery(collection, query, params); err != nil {
+	ref, err := n.resolveDocument(collection, "")
+	if err != nil {
 		return nil, err
 	}
-	if err := n.pullQuorum(ctx, collection, ratio); err != nil {
+	return n.querySync(ctx, ref, query, params, ratio)
+}
+
+func (n *Node) QueryDocumentSync(ctx context.Context, collection, document, query string, params []any, ratio float64) (any, error) {
+	ref, err := n.resolveDocument(collection, document)
+	if err != nil {
 		return nil, err
 	}
-	if err := n.pushQuorum(ctx, collection, ratio); err != nil {
+	return n.querySync(ctx, ref, query, params, ratio)
+}
+
+func (n *Node) querySync(ctx context.Context, ref documentRef, query string, params []any, ratio float64) (any, error) {
+	c, _ := n.document(ref)
+	if err := c.ValidateQuery(query, params); err != nil {
 		return nil, err
 	}
-	return n.Query(collection, query, params)
+	if err := n.pullQuorum(ctx, ref, ratio); err != nil {
+		return nil, err
+	}
+	if err := n.pushQuorum(ctx, ref, ratio); err != nil {
+		return nil, err
+	}
+	return n.query(ref, query, params)
 }
 
 // pushQuorum broadcasts this node's snapshot of the collection and waits until a
 // quorum fraction of peers ack. Used by writes and the read write-back phase.
-func (n *Node) pushQuorum(ctx context.Context, collection string, ratio float64) error {
+func (n *Node) pushQuorum(ctx context.Context, ref documentRef, ratio float64) error {
 	if n.reached(0, ratio) {
 		return nil // self alone satisfies the ratio (e.g. ratio=0 or single-node)
 	}
-	snap, ok := n.snapshotCollection(collection)
-	if !ok {
-		return fmt.Errorf("collection %q not found", collection)
-	}
+	snap := n.snapshotCollection(ref)
 	rid := n.nextReqID()
-	pr, cancel := n.register(rid)
+	pr, cancel := n.register(rid, ref.document)
 	defer cancel()
 	n.broadcast(SyncPushMsg{
 		FromID:      n.id,
 		ReqID:       rid,
-		Collection:  collection,
+		Collection:  ref.collection,
+		Document:    ref.document,
 		Fingerprint: n.fingerprint,
 		Snapshot:    snap,
 	})
@@ -549,26 +820,27 @@ func (n *Node) pushQuorum(ctx context.Context, collection string, ratio float64)
 
 // pullQuorum broadcasts a pull and merges each peer's returned snapshot until a
 // quorum fraction has responded. Used by the read gather phase.
-func (n *Node) pullQuorum(ctx context.Context, collection string, ratio float64) error {
+func (n *Node) pullQuorum(ctx context.Context, ref documentRef, ratio float64) error {
 	if n.reached(0, ratio) {
 		return nil
 	}
 	rid := n.nextReqID()
-	pr, cancel := n.register(rid)
+	pr, cancel := n.register(rid, ref.document)
 	defer cancel()
 	n.broadcast(SyncPullMsg{
 		FromID:      n.id,
 		ReqID:       rid,
-		Collection:  collection,
+		Collection:  ref.collection,
+		Document:    ref.document,
 		Fingerprint: n.fingerprint,
 	})
 	return n.collectAcks(ctx, pr, ratio, func(ack SyncAckMsg) error {
-		if err := n.mergeCollection(collection, ack.Snapshot); err != nil {
+		if err := n.mergeCollection(ref, ack.Snapshot); err != nil {
 			// A known peer whose returned state we couldn't incorporate (e.g. a
 			// malformed wire rational) must NOT count toward the gather quorum —
 			// otherwise the read could "succeed" without that state and return
 			// stale local data.
-			log.Printf("[%s] pull merge error for %s: %v", n.id, collection, err)
+			log.Printf("[%s] pull merge error for %s/%s: %v", n.id, ref.collection, ref.document, err)
 			return err
 		}
 		return nil

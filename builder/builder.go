@@ -34,6 +34,7 @@ func (m *Model) New(nodeID string) crdt.CRDT {
 
 type BuiltCollection struct {
 	Name string
+	Key  *parser.ParamSpec // nil for singleton; otherwise normalized scalar key metadata
 	Spec CollectionSpec
 }
 
@@ -253,8 +254,16 @@ func Build(plan parser.Plan) (BuiltPlan, error) {
 		if !ok {
 			return BuiltPlan{}, fmt.Errorf("collection %s references unknown type %s", cs.Name, cs.Type)
 		}
+		var key *parser.ParamSpec
+		if cs.Key != nil {
+			keys, err := resolveScalarParams([]parser.ParamSpec{*cs.Key}, types, true)
+			if err != nil {
+				return BuiltPlan{}, fmt.Errorf("collection %s key: %w", cs.Name, err)
+			}
+			key = &keys[0]
+		}
 		seenCollection[cs.Name] = true
-		collections = append(collections, BuiltCollection{Name: cs.Name, Spec: m})
+		collections = append(collections, BuiltCollection{Name: cs.Name, Key: key, Spec: m})
 	}
 
 	return BuiltPlan{
@@ -303,7 +312,7 @@ func validateFnParams(ps []parser.ParamSpec, reg typeReg) error {
 	return nil
 }
 
-// resolveScalarParams validates and NORMALIZES update/query params: names unique
+// resolveScalarParams validates and NORMALIZES method params / collection keys: names unique
 // and each type resolving to a numeric type (not a struct). Update/query params
 // cross the wire via bindParams (scalar-only), and downstream (bindParams, prover,
 // swagger) parses the stored token via numtype.Parse — so a `V.Elem`/alias token
@@ -325,9 +334,9 @@ func resolveScalarParams(ps []parser.ParamSpec, reg typeReg, allowString bool) (
 		}
 		seen[p.Name] = true
 		if et.Str {
-			// A string param is faithful only through the POST update wire (a JSON
-			// string array); the GET query `?params=` contract is comma-split, so
-			// string query params stay rejected (allowString=false there).
+			// Strings are faithful through POST update params and collection path
+			// keys. GET query `?params=` is comma-split, so string query params stay
+			// rejected (allowString=false there).
 			if !allowString {
 				return nil, fmt.Errorf("param %s: string params are not supported here (only update params may be strings)", p.Name)
 			}

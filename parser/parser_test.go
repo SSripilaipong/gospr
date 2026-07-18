@@ -311,7 +311,24 @@ func TestParse_collection(t *testing.T) {
 	require.Len(t, plan.Collections, 1)
 	c := plan.Collections[0]
 	assert.Equal(t, "MyVec", c.Name)
+	assert.Nil(t, c.Key)
 	assert.Equal(t, "T", c.Type)
+}
+
+func TestParse_keyedCollection(t *testing.T) {
+	plan, err := Parse("collection Users[id::string] = T\n")
+	require.NoError(t, err)
+	require.Len(t, plan.Collections, 1)
+	c := plan.Collections[0]
+	assert.Equal(t, "Users", c.Name)
+	require.NotNil(t, c.Key)
+	assert.Equal(t, ParamSpec{Name: "id", Type: "string"}, *c.Key)
+	assert.Equal(t, "T", c.Type)
+}
+
+func TestParse_keyedCollectionRejectsMultipleKeys(t *testing.T) {
+	_, err := Parse("collection Users[id::string, tenant::string] = T\n")
+	require.Error(t, err)
 }
 
 func TestParse_sectionNumberLiteral(t *testing.T) {

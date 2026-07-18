@@ -28,7 +28,8 @@ expressions:
 - **update** — how a node changes its own slot (must be inflationary).
 - **query** — a read over the whole vector.
 
-A `collection` is a named runtime instance of a type. Before deploying, gospr
+A `collection` is a named runtime instance of a type. It may be a singleton or a
+sparse family of documents keyed by one named scalar. Before deploying, gospr
 type-checks your program *and proves* the merge/update pair converges (CvRDT).
 
 ## A first program
@@ -47,6 +48,25 @@ collection Counter = T                 # instantiate it
 
 This is a grow-only counter. Node A does `Add 3`, node B does `Add 5`; after they
 gossip, both hold `{A:3, B:5}` (elementwise max), and `Value` reads `8`.
+
+### Keyed collections
+
+Add one bracketed path key to create an independent document for every valid key:
+
+```
+collection Counters[userId::string] = T
+```
+
+`POST /api/collections/Counters/alice/Add` and
+`GET /api/collections/Counters/alice/Value` address only `alice`. No create or
+initialization request is needed: an untouched key exists as zero/default state,
+and a read does not allocate it. The chosen key name is routing/OpenAPI metadata;
+it is not in scope inside queries or updates.
+
+Keys may use `string` or a numeric scalar type. String keys are non-empty UTF-8.
+Numeric URL keys use the same finite-decimal spelling as source literals (`0`,
+`-2`, `0.5`); fractions (`1/2`) and exponents are rejected. Equivalent decimals
+identify one document (`0.50` = `0.5`). Empty keys and `/` are rejected.
 
 ## Types
 
@@ -310,6 +330,8 @@ typo like `udpate T.Add …` fails loudly rather than being skipped).
 | Deploy | `POST /api/cluster/deploy` (body = DSL source) |
 | Update | `POST /api/collections/{collection}/{action}` |
 | Query | `GET /api/collections/{collection}/{query}?params=...` |
+| Keyed update | `POST /api/collections/{collection}/{document}/{action}` |
+| Keyed query | `GET /api/collections/{collection}/{document}/{query}?params=...` |
 | Docs | `GET /api/docs` · `GET /api/swagger.json` |
 
 Numbers cross the wire as **exact-rational strings** — `"5"`, `"1/2"`, and input
@@ -350,6 +372,7 @@ update Name.Action p::type ... = write fn    # fn :: (X) -> E   (whole vector)
 query  Name.Query  p::type ... = fn          # fn :: X -> result
 
 collection Name = Type               # instantiate a type
+collection Name[key::scalar] = Type  # sparse documents; one string/numeric key
 
 # expressions (prefix application)
 expr    ::= atom | app

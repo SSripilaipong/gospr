@@ -373,7 +373,9 @@ func elemTypeP() Parser[ElemType] {
 	vec := Prefix(Sequence2(StringP("vector"), Spaces1P()), Or(structElem, tokenElem))
 	elemRef := Map(
 		Sequence3(IdentP(), RuneP('.'), IdentP()),
-		func(t Of3[string, rune, string]) ElemType { return ElemType{Kind: KindElemRef, Elem: t.V1 + "." + t.V3} },
+		func(t Of3[string, rune, string]) ElemType {
+			return ElemType{Kind: KindElemRef, Elem: t.V1 + "." + t.V3}
+		},
 	)
 	return Or(structTypeP(), Or(Try(vec), elemRef))
 }
@@ -524,10 +526,20 @@ func updateLineP() Parser[lineResult] {
 
 func collectionLineP() Parser[lineResult] {
 	prefix := Try(Sequence2(StringP("collection"), Spaces1P()))
+	keyP := Or(
+		Try(Map(
+			Sequence3(RuneP('['), paramP(), RuneP(']')),
+			func(t Of3[rune, ParamSpec, rune]) *ParamSpec {
+				p := t.V2
+				return &p
+			},
+		)),
+		Succeed((*ParamSpec)(nil)),
+	)
 	rest := Map(
-		Sequence2(IdentP(), Prefix(eqP(), Suffix(endP(), IdentP()))),
-		func(t Of2[string, string]) lineResult {
-			return lineResult{collection: &CollectionSpec{Name: t.V1, Type: t.V2}}
+		Sequence3(IdentP(), keyP, Prefix(eqP(), Suffix(endP(), IdentP()))),
+		func(t Of3[string, *ParamSpec, string]) lineResult {
+			return lineResult{collection: &CollectionSpec{Name: t.V1, Key: t.V2, Type: t.V3}}
 		},
 	)
 	return Prefix(prefix, rest)
