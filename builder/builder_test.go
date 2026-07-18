@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"gospr/crdt"
 	"gospr/numtype"
 	"gospr/parser"
 )
@@ -152,6 +153,7 @@ func TestBuild_unknownTypeForMerge(t *testing.T) {
 	plan.Merges = append(plan.Merges, parser.MergeDef{TypeName: "Ghost", Body: zip(name("max"))})
 	_, err := Build(plan)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "merge for unknown type Ghost")
 }
 
 func TestBuild_missingMerge(t *testing.T) {
@@ -159,6 +161,7 @@ func TestBuild_missingMerge(t *testing.T) {
 	plan.Merges = nil
 	_, err := Build(plan)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "type T has no merge defined")
 }
 
 func TestBuild_unknownIdentifier(t *testing.T) {
@@ -1010,4 +1013,145 @@ collection C = VX
 	_, err := Build(mustParse(t, src))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a value")
+}
+
+// ---- deterministic ordering / builder invariants -------------------------
+
+func TestResolveTypes_recordsDeclarationOrder(t *testing.T) {
+	types := []parser.TypeDef{
+		{Name: "S", Elem: parser.ElemType{Kind: parser.KindStruct, Fields: []parser.FieldSpec{{Name: "N", Type: "rat"}}}},
+		{Name: "V", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}},
+		{Name: "A", Elem: parser.ElemType{Kind: parser.KindElemRef, Elem: "V.Elem"}},
+		{Name: "W", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}},
+	}
+	reg, err := resolveTypes(types)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"S", "V", "A", "W"}, reg.typeOrder)
+	assert.Equal(t, []string{"S"}, reg.structOrder)
+	assert.Equal(t, []string{"A"}, reg.aliasOrder)
+	assert.Equal(t, []string{"V", "W"}, reg.vectorOrder)
+}
+
+func TestBuild_typeResolutionErrorsFollowDeclarationOrder(t *testing.T) {
+	plan := parser.Plan{Types: []parser.TypeDef{
+		{Name: "First", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "Missing"}},
+		{Name: "Second", Elem: parser.ElemType{Kind: parser.KindStruct, Fields: []parser.FieldSpec{{Name: "Self", Type: "Second"}}}},
+	}}
+	_, err := Build(plan)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "type First")
+}
+
+func TestBuild_missingMergeErrorsFollowVectorDeclarationOrder(t *testing.T) {
+	plan := parser.Plan{Types: []parser.TypeDef{
+		{Name: "First", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}},
+		{Name: "Second", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}},
+	}}
+	_, err := Build(plan)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "type First has no merge defined")
+}
+
+func TestBuild_proofErrorsFollowVectorDeclarationOrder(t *testing.T) {
+	plan := parser.Plan{
+		Types: []parser.TypeDef{
+			{Name: "First", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}},
+			{Name: "Second", Elem: parser.ElemType{Kind: parser.KindVector, Elem: "rat"}},
+		},
+		Merges: []parser.MergeDef{
+			{TypeName: "First", Body: zip(name("+"))},
+			{TypeName: "Second", Body: zip(name("+"))},
+		},
+	}
+	_, err := Build(plan)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "convergence proof failed for type First")
+}
+
+func TestValidateResolvedExpr_findsNamesInEveryChildPosition(t *testing.T) {
+	resolved := parser.Expr{Kind: parser.ExprVar, Name: "x"}
+	ref := parser.Expr{Kind: parser.ExprRef, Name: "+", Ref: parser.RefPrimitive, Arity: 2}
+	unresolved := func() *parser.Expr {
+		e := name("leaked")
+		return &e
+	}
+	value := func() *parser.Expr {
+		e := resolved
+		return &e
+	}
+	fn := func() *parser.Expr {
+		e := ref
+		return &e
+	}
+
+	tests := []struct {
+		name string
+		expr parser.Expr
+	}{
+		{"application head", parser.Expr{Kind: parser.ExprApp, Head: unresolved()}},
+		{"application argument", parser.Expr{Kind: parser.ExprApp, Head: fn(), Args: []*parser.Expr{unresolved()}}},
+		{"guard condition", parser.Expr{Kind: parser.ExprGuards, Cases: []parser.GuardCase{{Cond: unresolved(), Result: value()}}}},
+		{"guard result", parser.Expr{Kind: parser.ExprGuards, Cases: []parser.GuardCase{{Cond: value(), Result: unresolved()}}}},
+		{"struct field", parser.Expr{Kind: parser.ExprStructLit, StructFields: []parser.StructField{{Name: "N", Value: unresolved()}}}},
+		{"field target", parser.Expr{Kind: parser.ExprField, Target: unresolved(), Field: "N"}},
+		{"reduce function", parser.Expr{Kind: parser.ExprReduce, Fn: unresolved(), Init: value(), Vec: value()}},
+		{"reduce init", parser.Expr{Kind: parser.ExprReduce, Fn: fn(), Init: unresolved(), Vec: value()}},
+		{"reduce vector", parser.Expr{Kind: parser.ExprReduce, Fn: fn(), Init: value(), Vec: unresolved()}},
+		{"zip function", parser.Expr{Kind: parser.ExprZip, Fn: unresolved()}},
+		{"local function", parser.Expr{Kind: parser.ExprLocal, Fn: unresolved()}},
+		{"write function", parser.Expr{Kind: parser.ExprWrite, Fn: unresolved()}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateResolvedExpr(test.expr)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `unresolved name "leaked" survived Build`)
+		})
+	}
+}
+
+func TestValidateResolvedExpr_rejectsMalformedAndUnknownKinds(t *testing.T) {
+	tests := []struct {
+		name string
+		expr parser.Expr
+	}{
+		{"numeric literal", parser.Expr{Kind: parser.ExprNumLit}},
+		{"application head", parser.Expr{Kind: parser.ExprApp}},
+		{"guard condition", parser.Expr{Kind: parser.ExprGuards, Cases: []parser.GuardCase{{}}}},
+		{"struct field", parser.Expr{Kind: parser.ExprStructLit, StructFields: []parser.StructField{{Name: "N"}}}},
+		{"field target", parser.Expr{Kind: parser.ExprField}},
+		{"reduce function", parser.Expr{Kind: parser.ExprReduce}},
+		{"combinator function", parser.Expr{Kind: parser.ExprZip}},
+		{"unknown kind", parser.Expr{Kind: parser.ExprKind(999)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateResolvedExpr(test.expr)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "internal:")
+		})
+	}
+}
+
+func TestValidateResolvedExpr_acceptsResolvedTree(t *testing.T) {
+	ref := parser.Expr{Kind: parser.ExprRef, Name: "+", Ref: parser.RefPrimitive, Arity: 2}
+	variable := parser.Expr{Kind: parser.ExprVar, Name: "v"}
+	zero := parser.Expr{Kind: parser.ExprNumLit, Num: new(big.Rat)}
+	expr := parser.Expr{Kind: parser.ExprReduce, Fn: &ref, Init: &zero, Vec: &variable}
+	require.NoError(t, validateResolvedExpr(expr))
+}
+
+func TestCheckerInvariantHelpersReturnErrors(t *testing.T) {
+	chk := newChecker(typeReg{models: map[string]*Model{}, structs: map[string]crdt.ElemT{}, aliases: map[string]crdt.ElemT{}})
+	_, err := chk.paramVtype("Missing")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "internal: parameter type")
+
+	_, err = chk.paramScope([]parser.ParamSpec{{Name: "x", Type: "Missing"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "param x")
+
+	_, err = elemTOf(vBool)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "internal: cannot lower bool")
 }
